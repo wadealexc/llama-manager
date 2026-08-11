@@ -1,0 +1,4 @@
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = git@github.com:wadealexc/llama.cpp
+	branch = feat/reload-runtime

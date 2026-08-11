@@ -1,0 +1,43 @@
+router:
+    # Path to llama-server binary
+    bin: ./llama.cpp/build/bin/llama-server
+
+    # Path to output directory for llama-server logs
+    llama_log_dir: ./logs
+
+    # Path to preset .ini file used to provide model config to llama-server
+    preset: ./router-models.ini
+
+    # Internal listen address for llama-server
+    listen: 127.0.0.1:10000
+
+    # Frequency of pings sent to the router on startup
+    poll_interval_ms: 50
+
+    # How long (total) to wait for the router process to start
+    poll_timeout_ms: 10000
+
+    # How long (total) to wait for the router process to shut down
+    shutdown_grace_period_ms: 10000
+
+# External listen address. OAI interface is exposed here.
+listen: 127.0.0.1:10001
+
+# Seconds of no requests after which current models are unloaded
+idle_timeout: 300
+
+model:
+    # Key into the router's preset — must match a [section] name in router.preset.
+    id: main
+
+    # Minimum ctx the router's preset must allocate
+    min_ctx: 50000
+
+    # Estimated tokens the model's response will use. The planner will attempt to
+    # allocate enough space to cover input tokens + this. If unsuccessful, it will
+    # sequentially apply strategies from `ladder` to make room.
+    expected_response_tokens: 4096
+
+    # Ordered strategies to apply under pressure
+    ladder:
+        - disable-spec

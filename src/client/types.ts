@@ -1,0 +1,136 @@
+import type { ModelId } from "../types.js";
+
+export interface Tokenizeparams {
+    content: string;
+}
+
+export type SpeculativeType = 
+    "none" | "draft-simple" | "draft-eagle3" | "draft-mtp" | "draft-dflash" | (string & {});
+
+export interface ReloadParams {
+    // sizing / batch
+    n_ctx?: number;
+    n_batch?: number;
+    n_ubatch?: number;
+
+    // KV cache precision
+    cache_type_k?: string; // "f32" | "f16" | "bf16" | "q8_0" | "q4_0" | ...
+    cache_type_v?: string;
+
+    // boolean flags
+    offload_kqv?: boolean;
+    op_offload?: boolean;
+    swa_full?: boolean;
+    kv_unified?: boolean;
+
+    // multimodal
+    mmproj?: {
+        path: string;  // empty string unloads mmproj
+        mmproj_offload?: boolean;
+        image_min_tokens?: number;
+        image_max_tokens?: number;
+        mtmd_batch_max_tokens?: number;
+    };
+
+    // speculative decoder
+    speculative?: {
+        types?: SpeculativeType[]; // passing "none" disables
+        draft?: {
+            path: string;
+            n_max?: number;
+            n_min?: number;
+            p_split?: number;
+            p_min?: number;
+            n_gpu_layers?: number;
+        }
+    };
+}
+
+export interface LoadModelParams {
+    model: ModelId;
+}
+
+export interface UnloadModelParams {
+    model: ModelId;
+}
+
+// Requests
+
+export interface CompletionRequest extends AbortableRequest {}
+export interface TokenizeRequest extends AbortableRequest {}
+export interface LoadModelRequest extends AbortableRequest {}
+export interface UnloadModelRequest extends AbortableRequest {}
+export interface ReloadRequest extends AbortableRequest {}
+
+interface AbortableRequest {
+    reqBody: unknown;
+    signal: AbortSignal;
+}
+
+// Responses
+
+export interface TokenizeResponse {
+    tokens: number[];
+}
+
+export interface ModelInfo {
+    id: string;
+    aliases: string[];
+    tags: string[];
+    object: string;
+    owned_by: string;
+    created: number;
+    status: {
+        value: string;
+        args: string[];
+        preset?: unknown;
+        exit_code?: number;
+        failed?: boolean;
+    };
+    architecture: {
+        input_modalities: string[];
+        output_modalities: string[];
+    };
+    source: string;
+    can_remove: boolean;
+}
+
+export interface Slot {
+    id: number;
+    n_ctx: number;
+    speculative: boolean;
+    is_processing: boolean;
+    id_task?: number;
+    n_prompt_tokens?: number;
+    n_prompt_tokens_processed?: number;
+    n_prompt_tokens_cache?: number;
+    params?: unknown;
+    next_token?: {
+        has_next_token: boolean;
+        has_new_line: boolean;
+        n_remain: number;
+        n_decoded: number;
+    }
+}
+
+export interface StatusResponse {
+    success: boolean;
+    message?: string;
+}
+
+export interface HealthResponse {
+    status: string;
+}
+
+// Errors
+
+export class HttpError extends Error {
+    constructor(
+        route: string,
+        message: string,
+        public statusCode: number,
+    ) {
+        super(`${route} failed with: ${message}`);
+        this.name = 'HttpError';
+    }
+}
