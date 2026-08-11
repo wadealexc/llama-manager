@@ -1,8 +1,11 @@
 import loadConfig from "./config/loader.js";
 import { RouterProcess } from "./client/router-process.js";
+import type { ConsolaInstance } from "consola";
+import { logger } from "./logger.js";
+
+const log: ConsolaInstance = logger.withTag('main');
 
 const CONFIG_PATH = process.env.MANAGER_CONFIG ?? "./config.yaml";
-
 const config = await loadConfig(CONFIG_PATH);
 
 const router = new RouterProcess(config.router);
@@ -10,13 +13,13 @@ const router = new RouterProcess(config.router);
 /* -------------------- STOP SERVER -------------------- */
 
 async function shutdown(event: string) {
-    console.log(`shutdown: ${event}`);
+    log.info(`shutdown: ${event}`);
 
     await Promise.allSettled([
         router.shutdown(),
     ]);
 
-    console.log('goodbye!');
+    log.info('goodbye!');
 }
 
 // Shutdown if we receive an interrupt or any uncaught errors

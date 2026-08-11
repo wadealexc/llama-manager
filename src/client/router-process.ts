@@ -1,16 +1,19 @@
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import * as fs from 'fs';
-import * as readline from 'readline';
 import chalk from 'chalk';
 import type { LlamaConfig } from "../config/types.js";
 import { LlamaAPI } from "./llama-api.js";
+import { logger } from '../logger.js';
+import type { ConsolaInstance } from 'consola';
 
 type Instance = {
     url: string;
     proc: ChildProcess;
     exited: Promise<void>;
 }
+
+const log: ConsolaInstance = logger.withTag('router-process');
 
 /**
  * Manages llama-server's router process. Launches the router at startup and
@@ -19,7 +22,6 @@ type Instance = {
 export class RouterProcess {
     
     config: LlamaConfig;
-
     instance: Instance | undefined;
 
     constructor(cfg: LlamaConfig) {
@@ -28,6 +30,8 @@ export class RouterProcess {
 
     // Spawn router and resolve once it's listening
     async start(): Promise<LlamaAPI> {
+        log.info(`start`);
+
         const [log_path, log_stream] = createLogStream(this.config.llama_log_dir);
 
         const [host, port] = this.config.listen.split(':');
@@ -39,12 +43,13 @@ export class RouterProcess {
             '--port', port,
         ];
 
-        // Spawn llama-server
+        log.info(`spawning llama-server process`);
         const proc = spawn(this.config.bin, argv, {
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: true,
         });
 
+        log.info(`piping logs to ${log_path}`);
         proc.stdout?.pipe(log_stream);
         proc.stderr?.pipe(log_stream);
 
@@ -53,8 +58,7 @@ export class RouterProcess {
             proc: proc,
             exited: new Promise<void>((resolve) => {
                 proc.once('exit', (code, signal) => {
-                    console.log(`llama-server exited code=${code} signal=${signal}`);
-                    log_stream.write(`exited: code=${code} signal=${signal}`);
+                    log.info(`llama-server exited code=${code} signal=${signal}`);
                     log_stream.end();
                     resolve();
                 });
@@ -64,18 +68,21 @@ export class RouterProcess {
         // 'error' is emitted in a lot of different scenarios. we just log here and handle
         // process errors/exits elsewhere.
         proc.once('error', (err) => {
-            console.error(`llama-server error: ${err}`);
+            log.error(`llama-server error: ${err}`);
+            log_stream.end();
         });
 
         return new Promise<LlamaAPI>(async (resolve) => {
             const api = new LlamaAPI(this.config.listen);
+
+            log.info(`polling router`);
 
             const poll_start = performance.now();
             await this.#pollRouter(api);
             const poll_end = performance.now();
             const seconds = (poll_end - poll_start) / 1000;
 
-            console.log(chalk.dim.green(`router is active (pid: ${proc.pid}) [elapsed: ${seconds.toFixed(2)}s]`));
+            log.info(`router is active (pid: ${proc.pid}) [elapsed: ${seconds.toFixed(2)}s]`);
             resolve(api);
         });
     }
@@ -104,18 +111,18 @@ export class RouterProcess {
         };
 
         // try a graceful shutdown first (SIGTERM)
-        console.log(chalk.dim(`killing router process (pid ${pid}) (${chalk.yellow('SIGTERM')})...`));
+        log.info(`killing router process (pid ${pid}) (SIGTERM)...`);
         if (await kill('SIGTERM', grace_period_ms)) {
-            console.log(chalk.green('done! (graceful shutdown)'));
+            log.info('done! (graceful shutdown)');
             return;
         }
 
         // grace period's up, now it's business (SIGKILL)
         //
         // *teleports behind you* "nothin personnel, kid"
-        console.log(`failed to stop router process gracefully, sending ${chalk.red('SIGKILL')}...`);
+        log.warn(`killing router process (pid ${pid}) (SIGKILL)...`);
         if (await kill('SIGKILL', grace_period_ms)) {
-            console.log(chalk.yellow(`done! (forced shutdown)`));
+            log.warn(`done! (forced shutdown)`);
             return;
         }
 
