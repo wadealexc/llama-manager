@@ -58,12 +58,19 @@ export interface UnloadModelParams {
 
 export interface CompletionRequest extends AbortableRequest {}
 export interface TokenizeRequest extends AbortableRequest {}
-export interface LoadModelRequest extends AbortableRequest {}
-export interface UnloadModelRequest extends AbortableRequest {}
+
+export interface LoadModelRequest extends AbortableRequest {
+    req_body: LoadModelParams;
+}
+
+export interface UnloadModelRequest extends AbortableRequest {
+    req_body: LoadModelParams;
+}
+
 export interface ReloadRequest extends AbortableRequest {}
 
 interface AbortableRequest {
-    reqBody: unknown;
+    req_body: unknown;
     signal: AbortSignal;
 }
 
@@ -73,6 +80,15 @@ export interface TokenizeResponse {
     tokens: number[];
 }
 
+export type RouterModelStatus = 
+    | 'downloading' 
+    | 'downloaded' 
+    | 'unloaded' 
+    | 'loading'
+    | 'loaded'
+    | 'sleeping'
+    | 'unknown'
+
 export interface ModelInfo {
     id: string;
     aliases: string[];
@@ -81,7 +97,7 @@ export interface ModelInfo {
     owned_by: string;
     created: number;
     status: {
-        value: string;
+        value: RouterModelStatus;
         args: string[];
         preset?: unknown;
         exit_code?: number;

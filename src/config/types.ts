@@ -25,10 +25,16 @@ export interface LlamaConfig {
     shutdown_grace_period_ms: number;
 }
 
+export interface ModelLoadConfig {
+    poll_interval_ms: number;
+    poll_timeout_ms: number;
+}
+
 export interface ManagerConfig {
     router: LlamaConfig;
     listen: string;
     idle_timeout: number;
+    model_load: ModelLoadConfig;
     models: Partial<Record<ModelRole, ModelConfig>>;
 }
 

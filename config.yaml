@@ -18,6 +18,10 @@ listen: 127.0.0.1:10001
 # Seconds of no requests after which current models are unloaded
 idle_timeout: 300
 
+model_load:
+    poll_interval_ms: 100
+    poll_timeout_ms: 50000
+
 models:
     main:
         model: /home/fox/kitsu/models/qwen3.6-dense-mtp/Qwen3.6-27B-UD-Q4_K_XL.gguf

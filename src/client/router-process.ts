@@ -72,19 +72,17 @@ export class RouterProcess {
             log_stream.end();
         });
 
-        return new Promise<LlamaAPI>(async (resolve) => {
-            const api = new LlamaAPI(this.config.listen);
+        const api = new LlamaAPI(this.config.listen);
 
-            log.info(`polling router`);
+        log.info(`polling router`);
 
-            const poll_start = performance.now();
-            await this.#pollRouter(api);
-            const poll_end = performance.now();
-            const seconds = (poll_end - poll_start) / 1000;
+        const poll_start = performance.now();
+        await this.#pollRouter(api);
+        const poll_end = performance.now();
+        const seconds = (poll_end - poll_start) / 1000;
 
-            log.info(`router is active (pid: ${proc.pid}) [elapsed: ${seconds.toFixed(2)}s]`);
-            resolve(api);
-        });
+        log.info(`router is active (pid: ${proc.pid}) [elapsed: ${seconds.toFixed(2)}s]`);
+        return api;
     }
 
     // Gracefully shut down the router (SIGTERM). Use SIGKILL if process does not exit in time.
