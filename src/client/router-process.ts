@@ -29,7 +29,7 @@ export class RouterProcess {
     }
 
     // Spawn router and resolve once it's listening
-    async start(): Promise<LlamaAPI> {
+    async start(preset_path: string): Promise<LlamaAPI> {
         log.info(`start`);
 
         const [log_path, log_stream] = createLogStream(this.config.llama_log_dir);
@@ -37,7 +37,7 @@ export class RouterProcess {
         const [host, port] = this.config.listen.split(':');
 
         let argv = [
-            '--models-preset', this.config.preset,
+            '--models-preset', preset_path,
             '--no-models-autoload',
             '--host', host,
             '--port', port,

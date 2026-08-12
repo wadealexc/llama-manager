@@ -6,10 +6,10 @@ import { logger } from "./logger.js";
 const log: ConsolaInstance = logger.withTag('main');
 
 const CONFIG_PATH = process.env.MANAGER_CONFIG ?? "./config.yaml";
-const config = await loadConfig(CONFIG_PATH);
+const [config, preset_path] = await loadConfig(CONFIG_PATH);
 
 const router = new RouterProcess(config.router);
-await router.start();
+const llama_api = await router.start(preset_path);
 
 /* -------------------- STOP SERVER -------------------- */
 
