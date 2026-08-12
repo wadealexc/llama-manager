@@ -1,7 +1,7 @@
 import type { ConsolaInstance } from "consola";
 import type { ModelLoadConfig } from "../config/types.js";
 import type { ModelId, TokenIds } from "../types.js";
-import { HttpError, type CompletionRequest, type ModelInfo, type ReloadRequest, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type LoadModelParams, type LoadModelRequest, type UnloadModelRequest, type HealthResponse, type MemoryResponse, type RouterModelStatus } from "./types.js";
+import { HttpError, type CompletionRequest, type ModelInfo, type ReloadRequest, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus } from "./types.js";
 import { logger } from "../logger.js";
 
 const log: ConsolaInstance = logger.withTag('llama-api');
@@ -95,21 +95,21 @@ export class LlamaAPI {
         return await res.json() as StatusResponse;
     }
 
-    async loadModel(params: LoadModelRequest): Promise<StatusResponse> {
+    async loadModel(model: ModelId, signal?: AbortSignal): Promise<StatusResponse> {
         const url = this.#buildURL('/models/load');
 
-        log.info(`loading model: ${params.req_body.model}`);
+        log.info(`loading model: ${model}`);
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(params.req_body),
-            signal: params.signal,
+            body: JSON.stringify({ model: model }),
+            signal: signal,
         });
 
         if (!res.ok) {
             const msg = await res.text();
             if (msg.includes("model is already running")) {
-                log.debug(`loadModel: ${params.req_body.model} already running`);
+                log.debug(`loadModel: ${model} already running`);
                 return { success: true }
             }
             
@@ -119,15 +119,15 @@ export class LlamaAPI {
         return await res.json() as StatusResponse;
     }
 
-    async unloadModel(params: UnloadModelRequest): Promise<StatusResponse> {
+    async unloadModel(model: ModelId, signal?: AbortSignal): Promise<StatusResponse> {
         const url = this.#buildURL('/models/unload');
 
-        log.info(`unloading model: ${params.req_body.model}`);
+        log.info(`unloading model: ${model}`);
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(params.req_body),
-            signal: params.signal,
+            body: JSON.stringify({ model: model }),
+            signal: signal,
         });
 
         if (!res.ok) {
@@ -138,9 +138,8 @@ export class LlamaAPI {
         return await res.json() as StatusResponse;
     }
 
-    async loadModelAndWait(params: LoadModelRequest, opts: ModelLoadConfig): Promise<void> {
-        const model = params.req_body.model;
-        const status = await this.loadModel(params);
+    async loadModelAndWait(model: ModelId, opts: ModelLoadConfig, signal?: AbortSignal): Promise<void> {
+        const status = await this.loadModel(model, signal);
         if (!status.success) {
             throw new Error(`loadModelAndWait: loadModel failed with error: ${status.message}`);
         }
@@ -157,9 +156,8 @@ export class LlamaAPI {
         log.info(`loaded ${model} [elapsed: ${seconds.toFixed(2)}s]`);
     }
 
-    async unloadModelAndWait(params: UnloadModelRequest, opts: ModelLoadConfig): Promise<void> {
-        const model = params.req_body.model;
-        const status = await this.unloadModel(params);
+    async unloadModelAndWait(model: ModelId, opts: ModelLoadConfig, signal?: AbortSignal): Promise<void> {
+        const status = await this.unloadModel(model, signal);
         if (!status.success) {
             throw new Error(`unloadModelAndWait: unloadModel failed with error: ${status.message}`);
         }
@@ -213,6 +211,7 @@ export class LlamaAPI {
 
                 if (!found) throw new Error(`info for model ${model} not returned by server`);
             } catch (err) {
+                log.debug(`pollModelStatus err: ${err}`);
                 if (err instanceof Error && err.name === 'AbortError') {
                     // Swallow per-request abort
                 } else {
@@ -242,7 +241,8 @@ export class LlamaAPI {
             throw new HttpError('GET /models', msg, res.status);
         }
 
-        return await res.json() as ModelInfo[];
+        const body = await res.json() as { data: ModelInfo[] };
+        return body.data;
     }
 
     async getMemory(model: ModelId): Promise<MemoryResponse> {

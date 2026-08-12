@@ -1,7 +1,6 @@
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import * as fs from 'fs';
-import chalk from 'chalk';
 import type { LlamaConfig } from "../config/types.js";
 import { LlamaAPI } from "./llama-api.js";
 import { logger } from '../logger.js';
@@ -34,7 +33,7 @@ export class RouterProcess {
 
         const [log_path, log_stream] = createLogStream(this.config.llama_log_dir);
 
-        const [host, port] = this.config.listen.split(':');
+        const [host, port] = this.config.listen.replace(/^https?:\/\//, '').split(':');
 
         let argv = [
             '--models-preset', preset_path,
@@ -58,7 +57,7 @@ export class RouterProcess {
             proc: proc,
             exited: new Promise<void>((resolve) => {
                 proc.once('exit', (code, signal) => {
-                    log.info(`llama-server exited code=${code} signal=${signal}`);
+                    log.info(`llama-server exited pid=${proc.pid} code=${code} signal=${signal}`);
                     log_stream.end();
                     resolve();
                 });
@@ -72,17 +71,18 @@ export class RouterProcess {
             log_stream.end();
         });
 
-        const api = new LlamaAPI(this.config.listen);
+        const base_url = `http://${host}:${port}`;
+        const client = new LlamaAPI(base_url);
 
         log.info(`polling router`);
 
         const poll_start = performance.now();
-        await this.#pollRouter(api);
+        await this.#pollRouter(client);
         const poll_end = performance.now();
         const seconds = (poll_end - poll_start) / 1000;
 
         log.info(`router is active (pid: ${proc.pid}) [elapsed: ${seconds.toFixed(2)}s]`);
-        return api;
+        return client;
     }
 
     // Gracefully shut down the router (SIGTERM). Use SIGKILL if process does not exit in time.
@@ -128,7 +128,7 @@ export class RouterProcess {
         throw new Error(`failed to kill router process (pid ${pid})`);
     }
 
-    async #pollRouter(api: LlamaAPI): Promise<void> {
+    async #pollRouter(client: LlamaAPI): Promise<void> {
         const deadline = Date.now() + this.config.poll_timeout_ms;
 
         while (Date.now() < deadline) {
@@ -139,23 +139,34 @@ export class RouterProcess {
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 100);
 
+            let exited = false;
             try {
                 const healthy = await Promise.race([
-                    this.instance.exited.then(() => false),
-                    api.getHealth(controller.signal),
+                    this.instance.exited.then(() => { exited = true; return false; }),
+                    client.getHealth(controller.signal),
                 ]);
 
                 if (healthy) return;
-            } catch {
-                // Router not ready yet — continue polling
+            } catch (err) {
+                // Router not ready yet - continue polling while the process is alive
+                log.debug(`health poll failed: ${err}`);
             } finally {
                 clearTimeout(timeout);
+            }
+
+            if (exited || !this.isAlive()) {
+                throw new Error(`router exited while polling`);
             }
 
             await new Promise((r) => setTimeout(r, this.config.poll_interval_ms));
         }
 
         throw new Error(`router failed to start within ${this.config.poll_timeout_ms}ms`);
+    }
+
+    isAlive(): boolean {
+        const proc = this.instance?.proc;
+        return proc !== undefined && proc.exitCode === null && proc.signalCode === null;
     }
 }
 

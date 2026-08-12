@@ -46,27 +46,10 @@ export interface ReloadParams {
     };
 }
 
-export interface LoadModelParams {
-    model: ModelId;
-}
-
-export interface UnloadModelParams {
-    model: ModelId;
-}
-
 // Requests
 
 export interface CompletionRequest extends AbortableRequest {}
 export interface TokenizeRequest extends AbortableRequest {}
-
-export interface LoadModelRequest extends AbortableRequest {
-    req_body: LoadModelParams;
-}
-
-export interface UnloadModelRequest extends AbortableRequest {
-    req_body: LoadModelParams;
-}
-
 export interface ReloadRequest extends AbortableRequest {}
 
 interface AbortableRequest {

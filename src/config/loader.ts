@@ -5,10 +5,15 @@ import type { ManagerConfig, ModelRole } from "./types.js";
 // Manager fields on a model entry; everything else is treated as a
 // router preset field and passed to llama-server via a generated .ini.
 const MANAGER_MODEL_FIELDS = new Set([
-    "name", 
-    "expected_response_tokens", 
-    "ladder"
+    "name",
+    "expected_response_tokens",
+    "ladder",
+    "c",
+    "ctx-size",
 ]);
+
+const MIN_CTX = 1024;
+const CTX_KEY = "ctx-size";
 
 const ROLES: ModelRole[] = ["main", "task"];
 
@@ -44,6 +49,9 @@ export class ConfigLoader {
 
             const name = entry.name ?? role;
             const lines = [`[${name}]`];
+            // Generate model config with bare minimum allowed ctx
+            lines.push(`${CTX_KEY} = ${MIN_CTX}`);
+
             for (const [key, value] of Object.entries(entry)) {
                 if (MANAGER_MODEL_FIELDS.has(key)) continue;
                 lines.push(`${key} = ${this.#iniValue(value)}`);
