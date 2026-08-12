@@ -1,5 +1,5 @@
 import type { ModelId, TokenIds } from "../types.js";
-import { HttpError, type CompletionRequest, type ModelInfo, type ReloadRequest, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type LoadModelParams, type LoadModelRequest, type UnloadModelRequest, type HealthResponse } from "./types.js";
+import { HttpError, type CompletionRequest, type ModelInfo, type ReloadRequest, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type LoadModelParams, type LoadModelRequest, type UnloadModelRequest, type HealthResponse, type MemoryResponse } from "./types.js";
 
 /**
  * HTTP API wrapper around llama-server
@@ -140,6 +140,22 @@ export class LlamaAPI {
         }
 
         return await res.json() as ModelInfo[];
+    }
+
+    async getMemory(model: ModelId): Promise<MemoryResponse> {
+        const url = this.#buildURL('/memory', model);
+
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: { 'content-type': 'application/json' },
+        });
+
+        if (!res.ok) {
+            const msg = await res.text();
+            throw new HttpError('GET /memory', msg, res.status);
+        }
+
+        return await res.json() as MemoryResponse;
     }
 
     async getHealth(signal: AbortSignal): Promise<boolean> {

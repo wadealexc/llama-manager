@@ -9,6 +9,7 @@ const CONFIG_PATH = process.env.MANAGER_CONFIG ?? "./config.yaml";
 const config = await loadConfig(CONFIG_PATH);
 
 const router = new RouterProcess(config.router);
+await router.start();
 
 /* -------------------- STOP SERVER -------------------- */
 

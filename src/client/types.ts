@@ -122,6 +122,32 @@ export interface HealthResponse {
     status: string;
 }
 
+export interface MemoryResponse {
+    devices: {
+        name: string;
+        type: string;
+        total: number;
+        free: number;
+        components: {
+            main?: {
+                model: number;
+                context: number;
+                compute: number;
+            },
+            spec?: {
+                model: number;
+                context: number;
+                compute: number;
+            },
+            mmproj?: {
+                model: number;
+                context: number;
+                compute: number;
+            },
+        }
+    }[]
+}
+
 // Errors
 
 export class HttpError extends Error {
