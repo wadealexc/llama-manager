@@ -33,7 +33,7 @@ export interface ReloadParams {
     };
 
     // speculative decoder
-    speculative?: {
+    spec?: {
         types?: SpeculativeType[]; // passing "none" disables
         draft?: {
             path: string;
