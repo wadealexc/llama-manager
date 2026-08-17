@@ -33,7 +33,8 @@ export class Planner {
     config: ManagerConfig;
 
     models: Partial<Record<ModelRole, ModelConfig>>;
-    max_ctx: Map<ModelId, Map<StrategyId[], number>> = new Map();
+    // Map model -> number of strategies applied from ladder -> measured max ctx
+    max_ctx: Map<ModelId, Map<number, number>> = new Map();
 
     printer: PrintMemory;
 
@@ -95,7 +96,7 @@ export class Planner {
             if (slots.length === 0) throw new Error(`expected nonzero slots`);
 
             const n_ctx_seq = slots[0].n_ctx;
-            this.max_ctx.set(model_task.name, new Map([[strategies, n_ctx_seq]]));
+            this.max_ctx.set(model_task.name, new Map([[strategies.length, n_ctx_seq]]));
 
             await this.printer.print(`Task model @ ${n_ctx_seq.toLocaleString()} ctx`, this.models, strategies);
 
@@ -115,7 +116,7 @@ export class Planner {
         if (slots.length === 0) throw new Error(`expected nonzero slots`);
 
         const n_ctx_seq = slots[0].n_ctx;
-        this.max_ctx.set(model_main.name, new Map([[strategies, n_ctx_seq]]));
+        this.max_ctx.set(model_main.name, new Map([[strategies.length, n_ctx_seq]]));
 
         await this.printer.print(`Main model @ ${n_ctx_seq.toLocaleString()} ctx`, this.models, strategies);
 
@@ -136,7 +137,7 @@ export class Planner {
             if (slots.length === 0) throw new Error(`expected nonzero slots`);
 
             const n_ctx_seq = slots[0].n_ctx;
-            this.max_ctx.set(model_main.name, new Map([[strategies, n_ctx_seq]]));
+            this.max_ctx.set(model_main.name, new Map([[strategies.length, n_ctx_seq]]));
 
             log.info(`max-ctx: ${main_cur} | n_ctx_seq: ${n_ctx_seq}`);
 
@@ -165,7 +166,7 @@ export class Planner {
             if (slots.length === 0) throw new Error(`expected nonzero slots`);
 
             const n_ctx_seq = slots[0].n_ctx;
-            this.max_ctx.set(model_main.name, new Map([[strategies, n_ctx_seq]]));
+            this.max_ctx.set(model_main.name, new Map([[strategies.length, n_ctx_seq]]));
 
             log.info(`max-ctx: ${main_cur} | n_ctx_seq: ${n_ctx_seq}`);
             await this.printer.print(`Main model @ ${n_ctx_seq.toLocaleString()} ctx`, this.models, strategies);
@@ -192,7 +193,7 @@ export class Planner {
             if (slots.length === 0) throw new Error(`expected nonzero slots`);
 
             const n_ctx_seq = slots[0].n_ctx;
-            this.max_ctx.set(model_main.name, new Map([[strategies, n_ctx_seq]]));
+            this.max_ctx.set(model_main.name, new Map([[strategies.length, n_ctx_seq]]));
 
             log.info(`max-ctx: ${main_cur} | n_ctx_seq: ${n_ctx_seq}`);
             await this.printer.print(`Main model @ ${n_ctx_seq.toLocaleString()} ctx`, this.models, strategies);
