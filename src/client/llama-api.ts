@@ -1,7 +1,7 @@
 import type { ConsolaInstance } from "consola";
 import type { ModelLoadConfig } from "../config/types.js";
 import type { ModelId, TokenIds } from "../types.js";
-import { HttpError, type CompletionRequest, type ModelInfo, type ReloadRequest, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus } from "./types.js";
+import { HttpError, type CompletionRequest, type ModelInfo, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams } from "./types.js";
 import { logger } from "../logger.js";
 
 const log: ConsolaInstance = logger.withTag('llama-api');
@@ -22,12 +22,12 @@ export class LlamaAPI {
     }
 
     async completions(params: CompletionRequest, model: ModelId): Promise<void> {
-        const url = this.#buildURL('/chat/completions', model);
+        const url = this.#buildURL('/chat/completions');
 
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(params.req_body),
+            body: JSON.stringify({ ...params.req_body as {}, model: model}),
             signal: params.signal,
         });
 
@@ -40,12 +40,12 @@ export class LlamaAPI {
     }
 
     async tokenize(params: TokenizeRequest, model: ModelId): Promise<TokenIds> {
-        const url = this.#buildURL('/tokenize', model);
+        const url = this.#buildURL('/tokenize');
 
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(params.req_body),
+            body: JSON.stringify({ ...params.req_body as {}, model: model}),
             signal: params.signal,
         });
 
@@ -57,12 +57,13 @@ export class LlamaAPI {
         return (await res.json() as TokenizeResponse).tokens;
     }
 
-    async getSlots(model: ModelId): Promise<Slot[]> {
+    async getSlots(model: ModelId, signal?: AbortSignal): Promise<Slot[]> {
         const url = this.#buildURL('/slots', model);
 
         const res = await fetch(url, {
             method: 'GET',
             headers: { 'content-type': 'application/json' },
+            signal: signal,
         });
 
         if (!res.ok) {
@@ -77,14 +78,14 @@ export class LlamaAPI {
     //     return Promise.reject(); TODO
     // }
 
-    async reloadModel(params: ReloadRequest, model: ModelId): Promise<StatusResponse> {
-        const url = this.#buildURL('/reload', model);
+    async reloadModel(params: ReloadParams, model: ModelId, signal?: AbortSignal): Promise<StatusResponse> {
+        const url = this.#buildURL('/reload');
 
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(params.req_body),
-            signal: params.signal,
+            body: JSON.stringify({ ...params, model: model}),
+            signal: signal,
         });
 
         if (!res.ok) {

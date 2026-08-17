@@ -50,7 +50,6 @@ export interface ReloadParams {
 
 export interface CompletionRequest extends AbortableRequest {}
 export interface TokenizeRequest extends AbortableRequest {}
-export interface ReloadRequest extends AbortableRequest {}
 
 interface AbortableRequest {
     req_body: unknown;
@@ -92,6 +91,18 @@ export interface ModelInfo {
     };
     source: string;
     can_remove: boolean;
+
+    // Child supplies this to router once running
+    meta?: {
+        vocab_type: number;
+        n_vocab: number;
+        n_ctx: number;
+        n_ctx_train: number;
+        n_embd: number;
+        n_params: number;
+        size: number;
+        ftype: string;
+    }
 }
 
 export interface Slot {
