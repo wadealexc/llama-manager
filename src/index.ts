@@ -9,7 +9,7 @@ const log: ConsolaInstance = logger.withTag('main');
 const CONFIG_PATH = process.env.MANAGER_CONFIG ?? "./config.yaml";
 const [config, preset_path] = await loadConfig(CONFIG_PATH);
 
-const router = new RouterProcess(config.router);
+const router = new RouterProcess(config.router, config.model_load);
 
 // Shutdown if we receive an interrupt or any uncaught errors
 for (const evt of ['SIGINT', 'SIGTERM', 'SIGHUP', 'uncaughtException', 'unhandledRejection'] as const) {

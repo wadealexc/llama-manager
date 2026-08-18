@@ -16,9 +16,11 @@ const log: ConsolaInstance = logger.withTag('llama-api');
 export class LlamaAPI {
 
     base_url: string;
+    config: ModelLoadConfig;
 
-    constructor(base_url: string) {
+    constructor(base_url: string, config: ModelLoadConfig) {
         this.base_url = base_url;
+        this.config = config;
     }
 
     async completions(params: CompletionRequest, model: ModelId): Promise<void> {
@@ -139,7 +141,7 @@ export class LlamaAPI {
         return await res.json() as StatusResponse;
     }
 
-    async loadModelAndWait(model: ModelId, opts: ModelLoadConfig, signal?: AbortSignal): Promise<void> {
+    async loadModelAndWait(model: ModelId, signal?: AbortSignal): Promise<void> {
         const status = await this.loadModel(model, signal);
         if (!status.success) {
             throw new Error(`loadModelAndWait: loadModel failed with error: ${status.message}`);
@@ -148,7 +150,7 @@ export class LlamaAPI {
         log.info(`polling load status: ${model}`);
 
         const poll_start = performance.now();
-        await this.#pollModelStatus(model, opts, 'loaded', (status: string) => {
+        await this.#pollModelStatus(model, 'loaded', (status: string) => {
             log.debug(`${model} status: ${status}`);
         });
         const poll_end = performance.now();
@@ -157,7 +159,7 @@ export class LlamaAPI {
         log.info(`loaded ${model} [elapsed: ${seconds.toFixed(2)}s]`);
     }
 
-    async unloadModelAndWait(model: ModelId, opts: ModelLoadConfig, signal?: AbortSignal): Promise<void> {
+    async unloadModelAndWait(model: ModelId, signal?: AbortSignal): Promise<void> {
         const status = await this.unloadModel(model, signal);
         if (!status.success) {
             throw new Error(`unloadModelAndWait: unloadModel failed with error: ${status.message}`);
@@ -166,7 +168,7 @@ export class LlamaAPI {
         log.info(`polling unload status: ${model}`);
 
         const poll_start = performance.now();
-        await this.#pollModelStatus(model, opts, 'unloaded', (status: string) => {
+        await this.#pollModelStatus(model, 'unloaded', (status: string) => {
             log.debug(`${model} status: ${status}`);
         });
         const poll_end = performance.now();
@@ -175,8 +177,8 @@ export class LlamaAPI {
         log.info(`unloaded ${model} [elapsed: ${seconds.toFixed(2)}s]`);
     }
 
-    async #pollModelStatus(model: ModelId, opts: ModelLoadConfig, success: RouterModelStatus, on_change: (status: string) => void): Promise<void> {
-        const deadline = Date.now() + opts.poll_timeout_ms;
+    async #pollModelStatus(model: ModelId, success: RouterModelStatus, on_change: (status: string) => void): Promise<void> {
+        const deadline = Date.now() + this.config.poll_timeout_ms;
         let last_status: RouterModelStatus = 'unknown';
 
         while (Date.now() < deadline) {
@@ -222,10 +224,10 @@ export class LlamaAPI {
                 clearTimeout(timeout);
             }
 
-            await new Promise((r) => setTimeout(r, opts.poll_interval_ms));
+            await new Promise((r) => setTimeout(r, this.config.poll_interval_ms));
         }
 
-        throw new Error(`model ${model} did not reach status ${success} (timeout elapsed: ${opts.poll_timeout_ms} ms)`);
+        throw new Error(`model ${model} did not reach status ${success} (timeout elapsed: ${this.config.poll_timeout_ms} ms)`);
     }
 
     async getModels(signal?: AbortSignal): Promise<ModelInfo[]> {

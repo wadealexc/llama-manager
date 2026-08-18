@@ -1,6 +1,6 @@
 import type { ModelId } from "../types.js";
 
-export interface Tokenizeparams {
+export interface TokenizeParams {
     content: string;
 }
 

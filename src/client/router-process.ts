@@ -1,7 +1,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import * as fs from 'fs';
-import type { LlamaConfig } from "../config/types.js";
+import type { LlamaConfig, ModelLoadConfig } from "../config/types.js";
 import { LlamaAPI } from "./llama-api.js";
 import { logger } from '../logger.js';
 import type { ConsolaInstance } from 'consola';
@@ -21,10 +21,14 @@ const log: ConsolaInstance = logger.withTag('router-process');
 export class RouterProcess {
     
     config: LlamaConfig;
+    model_load_cfg: ModelLoadConfig;
+
+
     instance: Instance | undefined;
 
-    constructor(cfg: LlamaConfig) {
+    constructor(cfg: LlamaConfig, model_load_cfg: ModelLoadConfig) {
         this.config = cfg;
+        this.model_load_cfg = model_load_cfg;
     }
 
     // Spawn router and resolve once it's listening
@@ -72,7 +76,7 @@ export class RouterProcess {
         });
 
         const base_url = `http://${host}:${port}`;
-        const client = new LlamaAPI(base_url);
+        const client = new LlamaAPI(base_url, this.model_load_cfg);
 
         log.info(`polling router`);
 

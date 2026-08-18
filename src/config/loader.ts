@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
-import type { ManagerConfig, ModelRole } from "./types.js";
+import type { ManagerConfig, ModelConfig, ModelRole } from "./types.js";
+import { DEFAULT_FIT_OVERHEAD_MIB } from "../llama-cpp-constants.js";
 
 // Manager fields on a model entry; everything else is treated as a
 // router preset field and passed to llama-server via a generated .ini.
@@ -10,6 +11,10 @@ const MANAGER_MODEL_FIELDS = new Set([
     "ladder",
     "c",
     "ctx-size",
+    "has_spec",
+    "has_mmproj",
+    "fit_target_mib",
+    "kv_unified",
 ]);
 
 const MIN_CTX = 1024;
@@ -30,11 +35,26 @@ export class ConfigLoader {
         }
 
         const config = raw as ManagerConfig;
+        this.#deriveModelFields(config);
         mkdirSync(config.router.llama_log_dir, { recursive: true });
 
         writeFileSync(PRESET_OUT_PATH, this.#buildIni(config), "utf8");
 
         return [config, PRESET_OUT_PATH];
+    }
+
+    #deriveModelFields(config: ManagerConfig): void {
+        for (const role of ROLES) {
+            const entry = config.models[role] as (ModelConfig & Record<string, unknown>) | undefined;
+            if (!entry) continue;
+
+            entry.has_spec = getHasSpec(entry);
+            entry.has_mmproj = getHasMmproj(entry);
+            entry.kv_unified = getKvUnified(entry);
+
+            const fit = entry['fit-target'] ?? entry['fitt'];
+            entry.fit_target_mib = typeof fit === 'number' ? fit : DEFAULT_FIT_OVERHEAD_MIB;
+        }
     }
 
     // Strip manager fields from each model entry and write the rest to a
@@ -68,6 +88,44 @@ export class ConfigLoader {
         if (Array.isArray(v)) return v.map(String).join(", ");
         return JSON.stringify(v);
     }
+}
+
+function getHasSpec(entry: Record<string, unknown>): boolean {
+    const spec = entry['spec-type'];
+    let types: string[];
+    if (typeof spec === 'string') {
+        types = spec.split(',').map(t => t.trim().toLowerCase()).filter(t => t !== '');
+    } else if (Array.isArray(spec)) {
+        types = spec.map(t => String(t).trim().toLowerCase()).filter(t => t !== '');
+    } else {
+        return false;
+    }
+    return types.length > 0 && !types.includes('none');
+}
+
+// TODO: missing `no-mmproj`
+// TODO: assumes mmproj is on GPU
+function getHasMmproj(entry: Record<string, unknown>): boolean {
+    const path = entry['mmproj'] ?? entry['mm'];
+    const url = entry['mmproj-url'] ?? entry['mmu'];
+    const auto = entry['mmproj-auto'];
+
+    return (typeof path === 'string' && path.length > 0)
+        || (typeof url === 'string' && url.length > 0)
+        || (typeof auto === 'boolean' && auto);
+}
+
+function getKvUnified(entry: Record<string, unknown>): boolean {
+    const pos = entry['kv-unified'] ?? entry['kvu'];
+    const neg = entry['no-kv-unified'] ?? entry['no-kvu'];
+
+    if (typeof pos === 'boolean') return pos;
+    if (typeof neg === 'boolean') return !neg;
+
+    const par = entry['parallel'] ?? entry['np'];
+    if (typeof par === 'number') return par === -1;
+
+    return true;
 }
 
 export default async function loadConfig(path: string): Promise<[ManagerConfig, string]> {

@@ -1,11 +1,6 @@
-export type ModelId = string;
+import type { StrategyId } from "../planner/types.js";
 
-export type StrategyId =
-    | "evict-task-model"
-    | "disable-spec"
-    | "quantize-kv-q8"
-    | "quantize-kv-q4"
-    | "mmproj-on-demand";
+export type ModelId = string;
 
 export type ModelRole = "main" | "task";
 
@@ -14,6 +9,10 @@ export interface ModelConfig {
     name: ModelId;
     expected_response_tokens: number;
     ladder: StrategyId[];
+    has_spec: boolean;
+    has_mmproj: boolean;
+    kv_unified: boolean;
+    fit_target_mib: number;
 }
 
 export interface LlamaConfig {

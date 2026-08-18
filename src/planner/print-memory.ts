@@ -1,8 +1,9 @@
 import type { ConsolaInstance } from "consola";
-import type { ModelConfig, ModelRole, StrategyId } from "../config/types.js";
+import type { ModelConfig, ModelRole } from "../config/types.js";
 import type { LlamaAPI } from "../client/llama-api.js";
 import type { ModelId } from "../types.js";
 import type { MemoryResponse } from "../client/types.js";
+import type { StrategyId } from "./types.js";
 
 const GIB = 1024 ** 3;
 
@@ -31,19 +32,24 @@ export class PrintMemory {
         const models_mem: Map<ModelId, MemoryResponse> = new Map();
 
         try {
-            let res = await this.client.getMemory(model_main.name);
+            const res = await this.client.getMemory(model_main.name);
             models_mem.set(model_main.name, res);
-            
-            if (model_task) {
-                let res = await this.client.getMemory(model_task.name);
-                models_mem.set(model_task.name, res);
-            }
         } catch (err) {
-            this.log.error(`PrintMemory.print: failed to fetch memory: ${err}`);
-            return;
+            // Assume model is not loaded, and zero out mem
+            models_mem.set(model_main.name, { devices: [] });
         }
 
-        const fmt = (b: number): string => b <= 0 ? "0.00 GiB" : `${(b / GIB).toFixed(2)} GiB`;        
+        if (model_task) {
+            try {
+                const res = await this.client.getMemory(model_task.name);
+                models_mem.set(model_task.name, res);
+            } catch (err) {
+                // Assume model is not loaded, and zero out mem
+                models_mem.set(model_task.name, { devices: [] });
+            }
+        }
+
+        const fmt = (b: number): string => b <= 0 ? "0.00 GiB" : `${(b / GIB).toFixed(2)} GiB`;
 
         type Component = { model: number; context: number; compute: number };
 
