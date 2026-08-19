@@ -7,6 +7,10 @@ export interface TokenizeParams {
 export type SpeculativeType = 
     "none" | "draft-simple" | "draft-eagle3" | "draft-mtp" | "draft-dflash" | (string & {});
 
+// TODO: more exhaustive
+export type KVPrecision = 
+    "f16" | "q8_0" | "q4_0";
+
 export interface ReloadParams {
     // sizing / batch
     n_ctx?: number;
@@ -14,8 +18,8 @@ export interface ReloadParams {
     n_ubatch?: number;
 
     // KV cache precision
-    cache_type_k?: string; // "f32" | "f16" | "bf16" | "q8_0" | "q4_0" | ...
-    cache_type_v?: string;
+    cache_type_k?: KVPrecision;
+    cache_type_v?: KVPrecision;
 
     // boolean flags
     offload_kqv?: boolean;

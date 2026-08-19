@@ -1,9 +1,9 @@
 import type { ConsolaInstance } from "consola";
-import type { ModelConfig, ModelRole } from "../config/types.js";
+import type { ModelRole } from "../config/types.js";
 import type { LlamaAPI } from "../client/llama-api.js";
 import type { ModelId } from "../types.js";
 import type { MemoryResponse } from "../client/types.js";
-import type { StrategyId } from "./types.js";
+import type { ModelEntry, StrategyId } from "../config/types.js";
 
 const GIB = 1024 ** 3;
 
@@ -23,8 +23,8 @@ export class PrintMemory {
 
     async print(
         title: string,
-        models: Partial<Record<ModelRole, ModelConfig>>,
-        strategies?: StrategyId[]
+        models: Partial<Record<ModelRole, ModelEntry>>,
+        strategies?: StrategyId[],
     ): Promise<void> {
         const model_main = models['main']!;
         const model_task = models['task'];

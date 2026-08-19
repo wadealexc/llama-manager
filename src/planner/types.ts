@@ -1,20 +1,14 @@
-import type { ModelConfig, ModelRole } from "../config/types.js";
-
-export type StrategyId =
-    | "evict-task-model"
-    | "disable-spec"
-    | "quantize-kv-q8"
-    | "quantize-kv-q4"
-    | "mmproj-on-demand";
+import type { ModelEntry, ModelRole, StrategyId, Tokens } from "../config/types.js";
 
 export interface StrategyContext {
     target: ModelRole;
-    models: Partial<Record<ModelRole, ModelConfig>>;
+    models: Partial<Record<ModelRole, ModelEntry>>;
 }
 
 export interface Strategy {
     id: StrategyId;
     canApply(ctx: StrategyContext): boolean;
-    apply(ctx: StrategyContext): Promise<void>;
+    apply(ctx: StrategyContext, n_ctx: Tokens): Promise<void>;
     applyNoSave(ctx: StrategyContext): Promise<void>;
+    beforeRequest?(ctx: StrategyContext, req: unknown): Promise<unknown | void>;
 }

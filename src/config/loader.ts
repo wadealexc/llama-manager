@@ -1,79 +1,106 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
-import type { ManagerConfig, ModelConfig, ModelRole } from "./types.js";
-import { DEFAULT_FIT_OVERHEAD_MIB } from "../llama-cpp-constants.js";
+import type { ManagerConfig, ModelEntry, ModelRole, ModelState, StrategyId } from "./types.js";
+import { DEFAULT_FIT_OVERHEAD_MIB, DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 
-// Manager fields on a model entry; everything else is treated as a
-// router preset field and passed to llama-server via a generated .ini.
-const MANAGER_MODEL_FIELDS = new Set([
+const CTX_KEY = "ctx-size";
+
+const MANAGER_FIELDS = new Set([
     "name",
     "expected_response_tokens",
     "ladder",
-    "c",
     "ctx-size",
-    "has_spec",
-    "has_mmproj",
-    "fit_target_mib",
-    "kv_unified",
+    "c",
+    "cache-type-k",
+    "ctk",
+    "cache-type-v",
+    "ctv",
 ]);
-
-const MIN_CTX = 1024;
-const CTX_KEY = "ctx-size";
 
 const ROLES: ModelRole[] = ["main", "task"];
 
 const PRESET_OUT_PATH = "./generated-preset.ini";
 
+type RawModel = Record<string, unknown>;
+type RawModels = Partial<Record<ModelRole, RawModel>>;
+
 export class ConfigLoader {
 
     async load(path: string): Promise<[ManagerConfig, string]> {
-        let raw: unknown;
+        let raw: Record<string, unknown>;
         try {
-            raw = yamlLoad(readFileSync(path, "utf8"));
+            raw = yamlLoad(readFileSync(path, "utf8")) as Record<string, unknown>;
         } catch (e) {
             throw new Error(`failed to parse config: ${(e as Error).message}`);
         }
 
-        const config = raw as ManagerConfig;
-        this.#deriveModelFields(config);
-        mkdirSync(config.router.llama_log_dir, { recursive: true });
+        const raw_models: RawModels = (raw.models as RawModels) ?? {};
+        const config: ManagerConfig = {
+            router: raw.router as ManagerConfig["router"],
+            listen: raw.listen as string,
+            idle_timeout: raw.idle_timeout as number,
+            model_load: raw.model_load as ManagerConfig["model_load"],
+            models: this.#buildEntries(raw_models),
+        };
 
-        writeFileSync(PRESET_OUT_PATH, this.#buildIni(config), "utf8");
+        mkdirSync(config.router.llama_log_dir, { recursive: true });
+        writeFileSync(PRESET_OUT_PATH, this.#buildIni(raw_models), "utf8");
 
         return [config, PRESET_OUT_PATH];
     }
 
-    #deriveModelFields(config: ManagerConfig): void {
+    #buildEntries(raw: RawModels): Partial<Record<ModelRole, ModelEntry>> {
+        const entries: Partial<Record<ModelRole, ModelEntry>> = {};
         for (const role of ROLES) {
-            const entry = config.models[role] as (ModelConfig & Record<string, unknown>) | undefined;
-            if (!entry) continue;
-
-            entry.has_spec = getHasSpec(entry);
-            entry.has_mmproj = getHasMmproj(entry);
-            entry.kv_unified = getKvUnified(entry);
-
-            const fit = entry['fit-target'] ?? entry['fitt'];
-            entry.fit_target_mib = typeof fit === 'number' ? fit : DEFAULT_FIT_OVERHEAD_MIB;
+            const r = raw[role];
+            if (!r) continue;
+            entries[role] = this.#buildEntry(role, r);
         }
+        return entries;
     }
 
-    // Strip manager fields from each model entry and write the rest to a
-    // .ini for llama-server's router mode
-    #buildIni(config: ManagerConfig): string {
-        const models = config.models;
+    #buildEntry(role: ModelRole, raw: RawModel): ModelEntry {
+        const name = typeof raw['name'] === 'string' ? raw['name'] : role;
+
+        const initial_state: ModelState = {
+            n_ctx: MIN_ALLOWED_CTX,
+            mmproj_loaded: getHasMmproj(raw),
+            spec_loaded: getHasSpec(raw),
+            kv_unified: getKvUnified(raw),
+            cache_type_k: DEFAULT_KV_PRECISION,
+            cache_type_v: DEFAULT_KV_PRECISION,
+        };
+
+        return {
+            role,
+            name,
+            expected_response_tokens: raw['expected_response_tokens'] as number,
+            fit_target_mib: getFitTarget(raw),
+            is_loaded: false,
+            ladder: (raw['ladder'] as StrategyId[]) ?? [],
+            applied: [],
+            initial_state,
+            current_state: { ...initial_state },
+        };
+    }
+
+    #buildIni(raw: RawModels): string {
         const sections: string[] = [];
 
         for (const role of ROLES) {
-            const entry = models[role];
+            const entry = raw[role];
             if (!entry) continue;
 
-            const name = entry.name ?? role;
-            const lines = [`[${name}]`];
-            // Generate model config with bare minimum allowed ctx
-            lines.push(`${CTX_KEY} = ${MIN_CTX}`);
+            const name = typeof entry['name'] === 'string' ? entry['name'] : role;
+            const lines = [
+                `[${name}]`,
+                `${CTX_KEY} = ${MIN_ALLOWED_CTX}`,
+                `cache-type-k = ${DEFAULT_KV_PRECISION}`,
+                `cache-type-v = ${DEFAULT_KV_PRECISION}`,
+            ];
 
             for (const [key, value] of Object.entries(entry)) {
-                if (MANAGER_MODEL_FIELDS.has(key)) continue;
+                if (MANAGER_FIELDS.has(key)) continue;
                 lines.push(`${key} = ${this.#iniValue(value)}`);
             }
             sections.push(lines.join("\n"));
@@ -90,7 +117,12 @@ export class ConfigLoader {
     }
 }
 
-function getHasSpec(entry: Record<string, unknown>): boolean {
+function getFitTarget(entry: RawModel): number {
+    const fit = entry['fit-target'] ?? entry['fitt'];
+    return typeof fit === 'number' ? fit : DEFAULT_FIT_OVERHEAD_MIB;
+}
+
+function getHasSpec(entry: RawModel): boolean {
     const spec = entry['spec-type'];
     let types: string[];
     if (typeof spec === 'string') {
@@ -105,7 +137,7 @@ function getHasSpec(entry: Record<string, unknown>): boolean {
 
 // TODO: missing `no-mmproj`
 // TODO: assumes mmproj is on GPU
-function getHasMmproj(entry: Record<string, unknown>): boolean {
+function getHasMmproj(entry: RawModel): boolean {
     const path = entry['mmproj'] ?? entry['mm'];
     const url = entry['mmproj-url'] ?? entry['mmu'];
     const auto = entry['mmproj-auto'];
@@ -115,7 +147,7 @@ function getHasMmproj(entry: Record<string, unknown>): boolean {
         || (typeof auto === 'boolean' && auto);
 }
 
-function getKvUnified(entry: Record<string, unknown>): boolean {
+function getKvUnified(entry: RawModel): boolean {
     const pos = entry['kv-unified'] ?? entry['kvu'];
     const neg = entry['no-kv-unified'] ?? entry['no-kvu'];
 

@@ -1,18 +1,19 @@
 import type { LlamaAPI } from "../../client/llama-api.js";
-import type { Strategy, StrategyContext, StrategyId } from "../types.js";
+import type { StrategyId, Tokens } from "../../config/types.js";
+import type { Strategy, StrategyContext } from "../types.js";
 
 export class MmprojOnDemand implements Strategy {
 
     id: StrategyId = 'mmproj-on-demand';
 
     client: LlamaAPI;
-    
+
     constructor(client: LlamaAPI) {
         this.client = client;
     }
 
     canApply(ctx: StrategyContext): boolean {
-        return !!ctx.models[ctx.target]?.has_mmproj;
+        return !!ctx.models[ctx.target]?.current_state.mmproj_loaded;
     }
 
     /**
@@ -25,21 +26,34 @@ export class MmprojOnDemand implements Strategy {
      * - Otherwise, we handle the request normally, because we don't need the mmproj
      * 
      * (This probably requires llama.cpp changes, so for now we just disable.)
+     * 
+     * TODO: also implement save/restore
      */
-    async apply(ctx: StrategyContext): Promise<void> {
-        await this.applyNoSave(ctx); // TODO - implement save/restore
+    async apply(ctx: StrategyContext, n_ctx: Tokens): Promise<void> {
+        await this.#apply(ctx, n_ctx);
     }
 
     async applyNoSave(ctx: StrategyContext): Promise<void> {
+        await this.#apply(ctx);
+    }
+
+    // TODO
+    async beforeRequest(ctx: StrategyContext, req: unknown): Promise<unknown> {
+        return req;
+    }
+
+    async #apply(ctx: StrategyContext, n_ctx?: Tokens): Promise<void> {
         const target = ctx.models[ctx.target];
         if (!target) {
-            throw new Error(`MmprojOnDemand.applyNoSave: target not found`);
+            throw new Error(`MmprojOnDemand.#apply: target not found`);
         }
 
-        // TODO - new max ctx
-        await this.client.reloadModel({ 
-            n_ctx: 1, 
-            mmproj: { path: "" } 
+        await this.client.reloadModel({
+            n_ctx: n_ctx,
+            mmproj: { path: "" }
         }, target.name);
+
+        if (n_ctx !== undefined) target.current_state.n_ctx = n_ctx;
+        target.current_state.mmproj_loaded = false;
     }
 }

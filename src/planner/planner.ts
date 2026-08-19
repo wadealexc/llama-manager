@@ -1,12 +1,13 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import type { ManagerConfig, ModelConfig, ModelRole } from "../config/types.js";
+import type { ManagerConfig, ModelRole } from "../config/types.js";
 import type { MemoryResponse } from "../client/types.js";
 import type { ModelId } from "../types.js";
 import { logger } from "../logger.js";
 import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { PrintMemory } from "./print-memory.js";
-import type { Strategy, StrategyContext, StrategyId } from "./types.js";
+import type { ModelEntry, StrategyId } from "../config/types.js";
+import type { Strategy, StrategyContext } from "./types.js";
 import { createStrategies } from "./strategies/index.js";
 
 const log: ConsolaInstance = logger.withTag('planner');
@@ -30,7 +31,7 @@ export class Planner {
     client: LlamaAPI;
     config: ManagerConfig;
 
-    models: Partial<Record<ModelRole, ModelConfig>>;
+    models: Partial<Record<ModelRole, ModelEntry>>;
     // Map model -> number of strategies applied from ladder -> measured max ctx
     max_ctx: Map<ModelId, Map<number, number>> = new Map();
 
@@ -81,8 +82,6 @@ export class Planner {
             throw err;
         }
 
-        const st_applied: StrategyId[] = [];
-
         await this.printer.print("Weights only", this.models);
 
         // If we have a task model, calculate its max context while the main model is loaded
@@ -92,9 +91,9 @@ export class Planner {
             const find_sec = ((performance.now() - t) / 1000).toFixed(2);
             log.debug(`time elapsed: (find max: ${find_sec} sec)`);
 
-            this.max_ctx.set(model_task.name, new Map([[st_applied.length, task_max]]));
+            this.max_ctx.set(model_task.name, new Map([[model_main.applied.length, task_max]]));
 
-            await this.printer.print(`Task model @ ${task_max.toLocaleString()} ctx`, this.models, st_applied);
+            await this.printer.print(`Task model @ ${task_max.toLocaleString()} ctx`, this.models, model_task.applied);
 
             // Reset task model ctx
             await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, model_task.name);
@@ -106,9 +105,9 @@ export class Planner {
         const find_sec = ((performance.now() - t) / 1000).toFixed(2);
         log.debug(`time elapsed: (find max: ${find_sec} sec)`);
 
-        this.max_ctx.set(model_main.name, new Map([[st_applied.length, main_cur_ctx]]));
+        this.max_ctx.set(model_main.name, new Map([[model_main.applied.length, main_cur_ctx]]));
 
-        await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, st_applied);
+        await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, model_main.applied);
 
         const st_context: StrategyContext = {
             target: 'main',
@@ -146,17 +145,18 @@ export class Planner {
             }
 
             // Update max ctx for this point in the strategy ladder
-            st_applied.push(strat_id);
-            this.max_ctx.set(model_main.name, new Map([[st_applied.length, main_cur_ctx]]));
+            model_main.applied.push(strat_id);
+            this.max_ctx.set(model_main.name, new Map([[model_main.applied.length, main_cur_ctx]]));
 
             log.info(`applying strategy: ${strat.id} yields ctx gain of ${ctx_gain} tokens`);
             log.debug(`time elapsed: (apply: ${timings.apply_sec} sec | find max: ${timings.find_sec} sec)`);
 
-            await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, st_applied);
+            await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, model_main.applied);
         }
 
         // Update in case we skipped some strategies
-        model_main.ladder = st_applied;
+        model_main.ladder = model_main.applied;
+        model_main.applied = [];
 
         log.info('waiting 20 seconds');
         await new Promise<void>((resolve) => setTimeout(resolve, 20000));
@@ -184,7 +184,7 @@ export class Planner {
      * - reduce iterations by interpolating fit from two good points
      * - this is generally inefficient; better would be exposing llama.cpp's fit via HTTP
      */
-    async #findMaxCtx(cur: number, model: ModelConfig): Promise<number> {
+    async #findMaxCtx(cur: number, model: ModelEntry): Promise<number> {
         log.info(`finding max ctx for ${model.name}`);
 
         const models = await this.client.getModels();
