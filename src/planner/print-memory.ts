@@ -1,7 +1,6 @@
 import type { ConsolaInstance } from "consola";
-import type { ModelRole } from "../config/types.js";
+import type { ModelId, ModelRole } from "../config/types.js";
 import type { LlamaAPI } from "../client/llama-api.js";
-import type { ModelId } from "../types.js";
 import type { MemoryResponse } from "../client/types.js";
 import type { ModelEntry, StrategyId } from "../config/types.js";
 

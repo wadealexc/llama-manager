@@ -1,4 +1,4 @@
-import type { ModelId } from "../types.js";
+export type TokenIds = number[];
 
 export interface TokenizeParams {
     content: string;

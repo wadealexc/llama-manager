@@ -1,8 +1,7 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import type { ManagerConfig, ModelRole } from "../config/types.js";
+import type { ManagerConfig, ModelId, ModelRole } from "../config/types.js";
 import type { MemoryResponse } from "../client/types.js";
-import type { ModelId } from "../types.js";
 import { logger } from "../logger.js";
 import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { PrintMemory } from "./print-memory.js";
