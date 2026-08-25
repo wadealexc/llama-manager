@@ -3,6 +3,9 @@ import { load as yamlLoad } from "js-yaml";
 import type { ManagerConfig, ModelEntry, ModelRole, ModelState, StrategyId } from "./types.js";
 import { DEFAULT_FIT_OVERHEAD_MIB, DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 
+const DEFAULT_LOG_DIR = './logs/';
+const DEFAULT_SLOT_SAVE_DIR = './slots/';
+
 const CTX_KEY = "ctx-size";
 
 const MANAGER_FIELDS = new Set([
@@ -15,6 +18,7 @@ const MANAGER_FIELDS = new Set([
     "ctk",
     "cache-type-v",
     "ctv",
+    "slot-save-path",
 ]);
 
 const ROLES: ModelRole[] = ["main", "task"];
@@ -35,8 +39,20 @@ export class ConfigLoader {
         }
 
         const raw_models: RawModels = (raw.models as RawModels) ?? {};
+        const raw_router = (raw.router ?? {}) as Record<string, unknown>;
+        const llama_log_dir = normalizeDir((raw_router['llama_log_dir'] as string) ?? DEFAULT_LOG_DIR);
+        const slot_save_path = normalizeDir((raw_router['slot-save-path'] as string) ?? DEFAULT_SLOT_SAVE_DIR);
+
         const config: ManagerConfig = {
-            router: raw.router as ManagerConfig["router"],
+            router: {
+                bin: raw_router['bin'] as string,
+                llama_log_dir,
+                slot_save_path,
+                listen: raw_router['listen'] as string,
+                poll_interval_ms: raw_router['poll_interval_ms'] as number,
+                poll_timeout_ms: raw_router['poll_timeout_ms'] as number,
+                shutdown_grace_period_ms: raw_router['shutdown_grace_period_ms'] as number,
+            },
             listen: raw.listen as string,
             idle_timeout: raw.idle_timeout as number,
             model_load: raw.model_load as ManagerConfig["model_load"],
@@ -44,7 +60,8 @@ export class ConfigLoader {
         };
 
         mkdirSync(config.router.llama_log_dir, { recursive: true });
-        writeFileSync(PRESET_OUT_PATH, this.#buildIni(raw_models), "utf8");
+        mkdirSync(config.router.slot_save_path, { recursive: true });
+        writeFileSync(PRESET_OUT_PATH, this.#buildIni(raw_models, config.router.slot_save_path), "utf8");
 
         return [config, PRESET_OUT_PATH];
     }
@@ -84,7 +101,7 @@ export class ConfigLoader {
         };
     }
 
-    #buildIni(raw: RawModels): string {
+    #buildIni(raw: RawModels, slot_save_path: string): string {
         const sections: string[] = [];
 
         for (const role of ROLES) {
@@ -97,6 +114,7 @@ export class ConfigLoader {
                 `${CTX_KEY} = ${MIN_ALLOWED_CTX}`,
                 `cache-type-k = ${DEFAULT_KV_PRECISION}`,
                 `cache-type-v = ${DEFAULT_KV_PRECISION}`,
+                `slot-save-path = ${slot_save_path}`,
             ];
 
             for (const [key, value] of Object.entries(entry)) {
@@ -115,6 +133,10 @@ export class ConfigLoader {
         if (Array.isArray(v)) return v.map(String).join(", ");
         return JSON.stringify(v);
     }
+}
+
+function normalizeDir(p: string): string {
+    return p.endsWith('/') ? p : p + '/';
 }
 
 function getFitTarget(entry: RawModel): number {

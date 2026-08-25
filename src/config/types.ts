@@ -41,6 +41,7 @@ export interface ModelEntry {
 export interface LlamaConfig {
     bin: string;
     llama_log_dir: string;
+    slot_save_path: string;
     listen: string;
     poll_interval_ms: number;
     poll_timeout_ms: number;
