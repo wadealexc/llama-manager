@@ -1,6 +1,6 @@
 import type { ConsolaInstance } from "consola";
 import type { ModelId, ModelLoadConfig } from "../config/types.js";
-import { HttpError, type ModelInfo, type StatusResponse, type Slot, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type TokenIds } from "./types.js";
+import { HttpError, type ModelInfo, type StatusResponse, type Slot, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type TokenIds, type SlotSave, type SlotRestore } from "./types.js";
 import { logger } from "../logger.js";
 
 const log: ConsolaInstance = logger.withTag('llama-api');
@@ -28,7 +28,7 @@ export class LlamaAPI {
         return await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...body as {}, model: model}),
+            body: JSON.stringify({ ...body as {}, model: model }),
             signal: signal,
         });
     }
@@ -39,7 +39,7 @@ export class LlamaAPI {
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...body as {}, model: model}),
+            body: JSON.stringify({ ...body as {}, model: model }),
             signal: signal,
         });
 
@@ -68,9 +68,51 @@ export class LlamaAPI {
         return await res.json() as Slot[];
     }
 
-    // async setSlots(): Promise<void> {
-    //     return Promise.reject(); TODO
-    // }
+    async saveAllSlots(model: ModelId, signal?: AbortSignal): Promise<SlotSave[]> {
+        const slots = await this.getSlots(model, signal);
+        const url = this.#buildURL('/slots', model) + '&action=save';
+
+        return await Promise.all(slots.map(async (slot) => {
+            const filename = `slot-${model}-${slot.id}.bin`;
+            const slot_url = url + `&id_slot=${slot.id}`;
+
+            const res = await fetch(slot_url, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ filename }),
+                signal,
+            });
+
+            if (!res.ok) {
+                const msg = await res.text();
+                throw new HttpError('POST /slots?action=save', msg, res.status);
+            }
+
+            return await res.json() as SlotSave; 
+        }));
+    }
+
+    async restoreAllSlots(model: ModelId, saves: SlotSave[], signal?: AbortSignal): Promise<SlotRestore[]> {
+        const url = this.#buildURL('/slots', model) + '&action=restore';
+
+        return await Promise.all(saves.map(async (save) => {
+            const slot_url = url + `&id_slot=${save.id_slot}`;
+
+            const res = await fetch(slot_url, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ filename: save.filename }),
+                signal,
+            });
+
+            if (!res.ok) {
+                const msg = await res.text();
+                throw new HttpError('POST /slots?action=restore', msg, res.status);
+            }
+
+            return await res.json() as SlotRestore; 
+        }));
+    }
 
     async reloadModel(params: ReloadParams, model: ModelId, signal?: AbortSignal): Promise<StatusResponse> {
         const url = this.#buildURL('/reload');
@@ -78,7 +120,7 @@ export class LlamaAPI {
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...params, model: model}),
+            body: JSON.stringify({ ...params, model: model }),
             signal: signal,
         });
 
@@ -107,7 +149,7 @@ export class LlamaAPI {
                 log.debug(`loadModel: ${model} already running`);
                 return { success: true }
             }
-            
+
             throw new HttpError('POST /models/load', msg, res.status);
         }
 
@@ -138,7 +180,7 @@ export class LlamaAPI {
         if (!status.success) {
             throw new Error(`loadModelAndWait: loadModel failed with error: ${status.message}`);
         }
-        
+
         log.info(`polling load status: ${model}`);
 
         const poll_start = performance.now();

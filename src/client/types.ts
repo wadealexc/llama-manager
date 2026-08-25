@@ -113,6 +113,26 @@ export interface Slot {
     }
 }
 
+export interface SlotSave {
+    id_slot: number;
+    filename: string;
+    n_saved: number;
+    n_written: number;
+    timings: {
+        save_ms: number;
+    }
+}
+
+export interface SlotRestore {
+    id_slot: number;
+    filename: string;
+    n_restored: number;
+    n_read: number;
+    timings: {
+        restore_ms: number;
+    }
+}
+
 export interface StatusResponse {
     success: boolean;
     message?: string;
