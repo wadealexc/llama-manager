@@ -1,6 +1,6 @@
 import type { ConsolaInstance } from "consola";
 import type { ModelId, ModelLoadConfig } from "../config/types.js";
-import { HttpError, type CompletionRequest, type ModelInfo, type StatusResponse, type Slot, type TokenizeRequest, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type TokenIds } from "./types.js";
+import { HttpError, type ModelInfo, type StatusResponse, type Slot, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type TokenIds } from "./types.js";
 import { logger } from "../logger.js";
 
 const log: ConsolaInstance = logger.withTag('llama-api');
@@ -22,32 +22,25 @@ export class LlamaAPI {
         this.config = config;
     }
 
-    async completions(params: CompletionRequest, model: ModelId): Promise<void> {
+    async completions(body: unknown, model: ModelId, signal?: AbortSignal): Promise<Response> {
         const url = this.#buildURL('/chat/completions');
 
-        const res = await fetch(url, {
+        return await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...params.req_body as {}, model: model}),
-            signal: params.signal,
+            body: JSON.stringify({ ...body as {}, model: model}),
+            signal: signal,
         });
-
-        if (!res.ok) {
-            const msg = await res.text();
-            throw new HttpError('POST /chat/completions', msg, res.status);
-        }
-
-        return Promise.reject();
     }
 
-    async tokenize(params: TokenizeRequest, model: ModelId): Promise<TokenIds> {
+    async tokenize(body: unknown, model: ModelId, signal?: AbortSignal): Promise<TokenIds> {
         const url = this.#buildURL('/tokenize');
 
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...params.req_body as {}, model: model}),
-            signal: params.signal,
+            body: JSON.stringify({ ...body as {}, model: model}),
+            signal: signal,
         });
 
         if (!res.ok) {

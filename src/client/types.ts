@@ -1,9 +1,5 @@
 export type TokenIds = number[];
 
-export interface TokenizeParams {
-    content: string;
-}
-
 export type SpeculativeType = 
     "none" | "draft-simple" | "draft-eagle3" | "draft-mtp" | "draft-dflash" | (string & {});
 
@@ -48,16 +44,6 @@ export interface ReloadParams {
             n_gpu_layers?: number;
         }
     };
-}
-
-// Requests
-
-export interface CompletionRequest extends AbortableRequest {}
-export interface TokenizeRequest extends AbortableRequest {}
-
-interface AbortableRequest {
-    req_body: unknown;
-    signal: AbortSignal;
 }
 
 // Responses

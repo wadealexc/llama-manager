@@ -3,6 +3,7 @@ import { RouterProcess } from "./client/router-process.js";
 import type { ConsolaInstance } from "consola";
 import { logger } from "./logger.js";
 import { Planner } from "./planner/planner.js";
+import { ApiServer } from "./api/server.js";
 
 const log: ConsolaInstance = logger.withTag('main');
 
@@ -26,7 +27,11 @@ try {
     await planner.buildCostModel();
 } catch (err) {
     log.error(`buildCostModel error: ${err}`);
+    await shutdown('error');
 }
+
+const api = new ApiServer(planner, config);
+await api.start();
 
 await shutdown('debuggin');
 log.info('done!');
@@ -37,7 +42,9 @@ async function shutdown(event: string) {
     log.info(`shutdown: ${event}`);
 
     await Promise.allSettled([
-        router.shutdown(),
+        api?.shutdown(),
+        router?.shutdown(),
+        planner?.shutdown(),
     ]);
 
     log.info('goodbye!');
