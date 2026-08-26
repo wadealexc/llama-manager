@@ -14,7 +14,13 @@ const router = new RouterProcess(config.router, config.model_load);
 
 // Shutdown if we receive an interrupt or any uncaught errors
 for (const evt of ['SIGINT', 'SIGTERM', 'SIGHUP', 'uncaughtException', 'unhandledRejection'] as const) {
-    process.once(evt, async () => {
+    process.once(evt, async (err?: unknown) => {
+        if (err instanceof Error) {
+            log.error(`${evt}: ${err.message}`);
+            if (err.stack) log.error(err.stack);
+        } else if (err !== undefined) {
+            log.error(`${evt}: ${String(err)}`);
+        }
         await shutdown(evt);
         process.exit();
     });
@@ -33,9 +39,6 @@ try {
     log.error(`startup error: ${err}`);
     await shutdown('error');
 }
-
-await shutdown('debuggin');
-log.info('done!');
 
 /* -------------------- STOP SERVER -------------------- */
 

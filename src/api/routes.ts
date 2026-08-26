@@ -10,7 +10,16 @@ export function registerRoutes(app: Express, server: ApiServer): void {
 }
 
 async function listModels(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
-    throw new Error('unimplemented');
+    const data = Object.values(server.planner.models)
+        .filter((e): e is NonNullable<typeof e> => !!e)
+        .map(e => ({
+            id: e.name,
+            object: 'model',
+            created: 0,
+            owned_by: 'llama-manager',
+        }));
+
+    res.json({ object: 'list', data });
 }
 
 async function completions(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
@@ -21,25 +30,60 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         return;
     }
 
+    const is_stream = body?.stream === true;
+
     const ac = new AbortController();
-    req.on('close', () => { if (!res.writableEnded) ac.abort(); });
+    res.on('close', () => ac.abort());
+    req.on('aborted', () => ac.abort());
 
     await server.planner.decide(body, model, ac.signal, async (body: unknown, client: Client, signal: AbortSignal) => {
-        const upstream = await client.completions(body, model, signal);
-        res.status(upstream.status);
+        if (res.writableEnded) return;
 
-        const ct = upstream.headers.get('content-type');
-        if (ct) res.setHeader('content-type', ct);
+        if (is_stream) {
+            res.setHeader('content-type', 'text/event-stream');
+            res.setHeader('cache-control', 'no-cache');
+            res.setHeader('connection', 'keep-alive');
+        } else {
+            res.setHeader('content-type', 'application/json');    
+        }
 
-        if (!upstream.ok || !upstream.body) {
-            res.send(await upstream.text());
+        res.status(200);
+        res.flushHeaders();
+
+        let upstream: Response;
+        try {
+            upstream = await client.completions(body, model, signal);
+        } catch (err) {
+            sendUpstreamError(res, is_stream, err);
             return;
         }
 
-        await pipeline(Readable.fromWeb(upstream.body), res);
+        if (!upstream.ok || !upstream.body) {
+            const text = await upstream.text().catch(() => '');
+            sendUpstreamError(res, is_stream, text || `upstream returned ${upstream.status}`);
+            return;
+        }
+
+        try {
+            await pipeline(Readable.fromWeb(upstream.body), res);
+        } catch (err) {
+            if (res.writableEnded) return;
+            sendUpstreamError(res, is_stream, err);
+        }
     });
 }
 
 function sendError(res: ExpressResponse, status: number, type: string, message: string): void {
     res.status(status).json({ error: { message, type } });
+}
+
+function sendUpstreamError(res: ExpressResponse, is_stream: boolean, err: unknown): void {
+    const message = err instanceof Error ? (err.message || '(no message)') : String(err);
+    const payload = JSON.stringify({ error: { message, type: 'upstream' } });
+    if (is_stream) {
+        res.write(`data: ${payload}\n\ndata: [DONE]\n\n`);
+    } else {
+        res.write(payload);
+    }
+    res.end();
 }

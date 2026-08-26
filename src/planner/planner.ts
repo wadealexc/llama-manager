@@ -220,6 +220,8 @@ export class Planner {
     async decide(body: unknown, model: ModelId, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
 
+        log.info(`decide: ${model}, tokenizing...`);
+
         // tokenize input and estimate required tokens
         const req = await this.#withModel(model, { tokens_in: 0 }, async (entry: ModelEntry) => {
             const token_ids = await this.client.tokenize(body, model, signal);
@@ -234,6 +236,8 @@ export class Planner {
         if (req.tokens_in > max_tokens_possible) {
             throw new Error(`unable to serve request for ${model}; tokens in: ${req.tokens_in} | max tokens: ${max_tokens_possible}`);
         }
+
+        log.info(`decide: ${model}, completions...`);
 
         // stream from model when token requirement is met
         await this.#withModel(model, req, async (entry: ModelEntry) => {
@@ -303,8 +307,7 @@ export class Planner {
 
             const idx = this.#largestRequestForModel(model.name);
             if (idx === undefined) {
-                log.warn(`#maybeTransition expected request for ${model.name}`);
-                return;
+                throw new Error(`#maybeTransition: could not find request for ${model.name}`);
             }
 
             const largest = this.waiting.at(idx)!;
@@ -540,18 +543,18 @@ export class Planner {
     }
 
     #largestRequestForModel(model: ModelId): number | undefined {
-        let max: Waiter | undefined;
-        let idx: number = 0;
+        let max = -1;
+        let idx: number = -1;
         for (const [i, waiter] of this.waiting.entries()) {
             if (waiter.model !== model) continue;
 
-            if (waiter.req.tokens_in > (max?.req.tokens_in ?? 0)) {
-                max = waiter;
+            if (waiter.req.tokens_in > max) {
+                max = waiter.req.tokens_in;
                 idx = i;
             }
         }
 
-        return max ? idx : undefined;
+        return idx === -1 ? undefined : idx;
     }
 
     // get the fewest additional strategies on top of currently-applied that will serve the request

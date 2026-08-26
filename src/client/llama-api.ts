@@ -70,16 +70,15 @@ export class LlamaAPI {
 
     async saveAllSlots(model: ModelId, signal?: AbortSignal): Promise<SlotSave[]> {
         const slots = await this.getSlots(model, signal);
-        const url = this.#buildURL('/slots', model) + '&action=save';
 
         return await Promise.all(slots.map(async (slot) => {
             const filename = `slot-${model}-${slot.id}.bin`;
-            const slot_url = url + `&id_slot=${slot.id}`;
+            const slot_url = this.#buildURL(`/slots/${slot.id}`) + '?action=save';
 
             const res = await fetch(slot_url, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ filename }),
+                body: JSON.stringify({ filename, model: model }),
                 signal,
             });
 
@@ -93,15 +92,13 @@ export class LlamaAPI {
     }
 
     async restoreAllSlots(model: ModelId, saves: SlotSave[], signal?: AbortSignal): Promise<SlotRestore[]> {
-        const url = this.#buildURL('/slots', model) + '&action=restore';
-
         return await Promise.all(saves.map(async (save) => {
-            const slot_url = url + `&id_slot=${save.id_slot}`;
+            const slot_url = this.#buildURL(`/slots/${save.id_slot}`) + '?action=restore';
 
             const res = await fetch(slot_url, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ filename: save.filename }),
+                body: JSON.stringify({ filename: save.filename, model: model }),
                 signal,
             });
 
