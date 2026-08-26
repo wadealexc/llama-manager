@@ -23,15 +23,16 @@ for (const evt of ['SIGINT', 'SIGTERM', 'SIGHUP', 'uncaughtException', 'unhandle
 const llama_api = await router.start(preset_path);
 
 const planner = new Planner(llama_api, config);
+const api = new ApiServer(planner, config);
+
 try {
     await planner.buildCostModel();
+    await planner.serveDefault();
+    await api.start();
 } catch (err) {
-    log.error(`buildCostModel error: ${err}`);
+    log.error(`startup error: ${err}`);
     await shutdown('error');
 }
-
-const api = new ApiServer(planner, config);
-await api.start();
 
 await shutdown('debuggin');
 log.info('done!');

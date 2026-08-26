@@ -1,13 +1,16 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import type { ManagerConfig, ModelId, ModelRole, Tokens } from "../config/types.js";
-import type { MemoryResponse } from "../client/types.js";
+import { LoadStatus, type ManagerConfig, type ModelId, type ModelRole } from "../config/types.js";
+import type { ReloadParams, SlotSave } from "../client/types.js";
 import { logger } from "../logger.js";
 import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { PrintMemory } from "./print-memory.js";
 import type { ModelEntry, StrategyId } from "../config/types.js";
 import type { Strategy, StrategyContext } from "./types.js";
 import { createStrategies } from "./strategies/index.js";
+import { CostModel } from "./cost-model.js";
+import { readdir, unlink } from "node:fs/promises";
+import { join } from "node:path";
 
 const log: ConsolaInstance = logger.withTag('planner');
 
@@ -40,16 +43,14 @@ type Waiter = {
 }
 
 type Plan = {
-    strategy: StrategyId;
+    strategies: StrategyId[];
     n_ctx: number;
-}[]
+}
 
-// TODO - currently assuming 1 GPU
-function calcFreeBytes(mem: MemoryResponse): number {
-    for (const dev of mem.devices) {
-        if (dev.type !== "cpu") return dev.free;
-    }
-    return 0;
+type RestorePoint = {
+    n_ctx: number;
+    strategies: StrategyId[];
+    slots?: SlotSave[];
 }
 
 export class Planner {
@@ -63,7 +64,7 @@ export class Planner {
     model_to_role: Map<ModelId, ModelRole> = new Map();
 
     // TODO: reset on idle
-    previous_state: Map<ModelId, ModelEntry> = new Map();
+    restore_points: Map<ModelId, RestorePoint> = new Map();
 
     // Map model -> number of strategies applied from ladder -> measured max ctx
     max_ctx: Map<ModelId, Map<number, number>> = new Map();
@@ -84,13 +85,11 @@ export class Planner {
         // only main model is required
         if (!model_main) throw new Error(`Planner: expected main model`);
         this.model_to_role.set(model_main.name, 'main');
-        this.previous_state.set(model_main.name, structuredClone(model_main));
-
         this.max_ctx.set(model_main.name, new Map());
+
         if (model_task) {
             this.max_ctx.set(model_task.name, new Map());
             this.model_to_role.set(model_task.name, 'task');
-            this.previous_state.set(model_task.name, structuredClone(model_task));
         }
 
         this.strategies = createStrategies(client);
@@ -106,13 +105,17 @@ export class Planner {
      */
     async buildCostModel(): Promise<void> {
         log.info('building cost model');
+        const t = performance.now();
+
+        const cm = new CostModel(this.client);
+
         const model_main = this.models['main']!;
         const model_task = this.models['task'];
 
         // Load main and task model sequentially
         try {
-            await this.#loadModel(model_main);
-            if (model_task) await this.#loadModel(model_task);
+            await this.#loadWeights(model_main);
+            if (model_task) await this.#loadWeights(model_task);
         } catch (err) {
             log.error(`buildCostModel: error loading models: ${err}`);
             throw err;
@@ -122,15 +125,11 @@ export class Planner {
 
         // If we have a task model, calculate its max context while the main model is loaded
         if (model_task) {
-            const t = performance.now();
-            const task_max = await this.#findMaxCtx(MIN_ALLOWED_CTX, model_task);
-            const find_sec = ((performance.now() - t) / 1000).toFixed(2);
-            log.debug(`time elapsed: (find max: ${find_sec} sec)`);
+            const task_max = await cm.findMaxCtx(MIN_ALLOWED_CTX, model_task);
 
             model_task.initial_state.n_ctx = task_max;
             model_task.current_state.n_ctx = task_max;
             this.max_ctx.set(model_task.name, new Map([[model_main.applied.length, task_max]]));
-            this.previous_state.set(model_task.name, model_task);
 
             await this.printer.print(`Task model @ ${task_max.toLocaleString()} ctx`, this.models, model_task.applied);
 
@@ -139,15 +138,12 @@ export class Planner {
         }
 
         // Calculate main model max context with no strategies
-        const t = performance.now();
-        let main_cur_ctx = await this.#findMaxCtx(MIN_ALLOWED_CTX, model_main);
-        const find_sec = ((performance.now() - t) / 1000).toFixed(2);
-        log.debug(`time elapsed: (find max: ${find_sec} sec)`);
+        let main_cur_ctx = await cm.findMaxCtx(MIN_ALLOWED_CTX, model_main);
 
         model_main.initial_state.n_ctx = main_cur_ctx;
         model_main.current_state.n_ctx = main_cur_ctx;
         this.max_ctx.set(model_main.name, new Map([[model_main.applied.length, main_cur_ctx]]));
-        this.previous_state.set(model_main.name, model_main);
+        this.restore_points.set(model_main.name, { n_ctx: main_cur_ctx, strategies: [] });
 
         await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, model_main.applied);
 
@@ -164,34 +160,25 @@ export class Planner {
                 continue;
             }
 
+            // Apply strategy
+            const t = performance.now();
+            await strat.apply(st_context);
+            const find_sec = ((performance.now() - t) / 1000).toFixed(2);
+
+            // Find new max ctx
             const prev_max = main_cur_ctx;
-            const timings = { apply_sec: '', find_sec: '' };
-
-            {
-                // Apply strategy
-                const t = performance.now();
-                await strat.applyNoSave(st_context);
-                timings.apply_sec = ((performance.now() - t) / 1000).toFixed(2);
-            }
-
-            {
-                // Find new max ctx
-                const t = performance.now();
-                main_cur_ctx = await this.#findMaxCtx(main_cur_ctx, model_main);
-                timings.find_sec = ((performance.now() - t) / 1000).toFixed(2);
-            }
+            main_cur_ctx = await cm.findMaxCtx(main_cur_ctx, model_main);
 
             const ctx_gain = main_cur_ctx - prev_max;
             if (ctx_gain < 0) {
                 throw new Error(`buildCostModel: applying ${strat.id} results in ctx decrease of ${ctx_gain}`);
             }
 
+            log.info(`strategy ${strat.id} applied in ${find_sec} sec for a gain of ${ctx_gain} tokens`);
+
             // Update max ctx for this point in the strategy ladder
             model_main.applied.push(strat_id);
             this.max_ctx.set(model_main.name, new Map([[model_main.applied.length, main_cur_ctx]]));
-
-            log.info(`applying strategy: ${strat.id} yields ctx gain of ${ctx_gain} tokens`);
-            log.debug(`time elapsed: (apply: ${timings.apply_sec} sec | find max: ${timings.find_sec} sec)`);
 
             await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, model_main.applied);
         }
@@ -200,16 +187,34 @@ export class Planner {
         model_main.ladder = model_main.applied;
         model_main.applied = [];
 
-        log.info('waiting 20 seconds');
-        await new Promise<void>((resolve) => setTimeout(resolve, 20000));
+        const build_sec = ((performance.now() - t) / 1000).toFixed(2);
+        log.info(`finished cost model in ${build_sec} sec`);
 
-        log.info('unloading models');
-        await Promise.allSettled([
-            this.#unloadModel(model_main),
-            model_task ? this.#unloadModel(model_task) : Promise.resolve(),
+        await this.#unloadAllModels();
+    }
+
+    async serveDefault(): Promise<void> {
+        const model_main = this.models['main']!;
+        const model_task = this.models['task'];
+
+        if (model_main.status !== LoadStatus.UNLOADED) throw new Error(`expected main model to be unloaded`);
+        if (model_task?.status !== LoadStatus.UNLOADED) throw new Error(`expected task model to be unloaded`);
+
+        const count = model_task ? 2 : 1;
+
+        const t = performance.now();
+        await Promise.all([
+            this.#loadAndRestore(model_main),
+            model_task ? this.#loadWeights(model_task) : Promise.resolve()
         ]);
+        const load_sec = ((performance.now() - t) / 1000).toFixed(2);
+        log.info(`loaded ${count} models in ${load_sec} sec`);
 
-        log.info('done!');
+        this.active = {
+            pending: false,
+            model: model_main.name,
+            readers: 0,
+        };
     }
 
     async decide(body: unknown, model: ModelId, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
@@ -271,7 +276,7 @@ export class Planner {
                     this.active.readers--;
                     if (this.active.readers !== 0) return;
                 }
-                
+
                 this.#maybeTransition();
             }
         }
@@ -283,7 +288,10 @@ export class Planner {
         }
 
         let model: ModelEntry;
-        let plan: Plan | undefined = [];
+        let plan: Plan | undefined = {
+            n_ctx: 0,
+            strategies: [],
+        };
 
         while (true) {
             if (this.waiting.length === 0) {
@@ -301,7 +309,7 @@ export class Planner {
 
             const largest = this.waiting.at(idx)!;
             plan = this.#getMinAddtlStrategies(model.name, largest.req);
-            if (plan) {
+            if (plan !== undefined) {
                 break;
             }
 
@@ -319,10 +327,6 @@ export class Planner {
             );
         }
 
-        if (plan.length !== 0) {
-            log.info(`applying strategies to ${model.name}: ${plan}`);
-        }
-
         /**
          * TODO: there needs to be a clearer distinction between:
          * - can serve a request: "weights are loaded and kvcache is loaded"
@@ -335,29 +339,32 @@ export class Planner {
             this.active = { pending: true, model: model.name, readers: 0 };
         }
 
-        const prior_active = this.active.model;
+        const prior_active = this.entry(this.active.model)!;
         this.active.pending = true;
         this.active.model = model.name;
 
-        if (prior_active !== model.name) {
-            await this.#popKV(prior_active);
+        if (prior_active.name !== model.name) {
+            await this.#stashKV(prior_active);
         }
 
-        if (!model.is_loaded) {
-            await this.#loadModel(model);
+        if (model.status === LoadStatus.UNLOADED) {
+            await this.#loadWeights(model);
         }
 
-        for (const step of plan) {
-            const impl = this.strategies.get(step.strategy)!;
+        const restore_point = this.#getOrCreateRestore(model);
 
-            try {
-                await impl.apply({ target: this.model_to_role.get(model.name)!, models: this.models }, step.n_ctx);
-                model.applied.push(step.strategy);
-            } catch (err: any) {
-                log.error(`#maybeTransition: error applying strategy ${step.strategy} to model ${model.name}: err`);
-                break;
+        if (plan.strategies.length > 0) {
+            restore_point.n_ctx = plan.n_ctx;
+            restore_point.strategies = [...restore_point.strategies, ...plan.strategies];
+
+            // if the model has a kvcache, save it
+            if (model.status === LoadStatus.LOADED) {
+                restore_point.slots = await this.client.saveAllSlots(model.name, this.shutdown_ctrl.signal);
             }
         }
+
+        await this.#applyRestore(model, restore_point);
+        this.restore_points.delete(model.name);
 
         this.active.pending = false;
 
@@ -380,161 +387,146 @@ export class Planner {
     async shutdown(): Promise<void> {
         this.shutdown_ctrl.abort('shutdown request received');
 
+        log.info(`canceling ${this.waiting.length} jobs`);
         const waiting = this.waiting.splice(0, this.waiting.length);
         for (const w of waiting) {
             try {
                 w.reject('shutting down');
             } catch { }
         }
+
+        await this.#unloadAllModels();
+        await this.#cleanupSlots();
     }
 
-    /**
-     * TODO: 
-     * - Math.ceil padding approach assumes kvunified. Needs fix for non-unified
-     * - reduce iterations by interpolating fit from two good points
-     * - this is generally inefficient; better would be exposing llama.cpp's fit via HTTP
-     */
-    async #findMaxCtx(cur: number, model: ModelEntry): Promise<number> {
-        log.info(`finding max ctx for ${model.name}`);
-
-        const models = await this.client.getModels();
-        const model_info = models.find((m) => m.id === model.name);
-        if (!model_info) throw new Error(`model not found: ${model.name}`);
-        if (!model_info.meta) throw new Error(`model info did not contain 'meta' key: ${model.name}`);
-
-        // Reload model context, using binary search to find  the highest non-failing value
-        let lo = cur;
-        let hi = model_info.meta.n_ctx_train;
-        let iterations = 0;
-
-        while (lo <= hi) {
-            // llama.cpp pads context lengths up to the nearest multiple of 256
-            let mid = lo + Math.trunc((hi - lo) / 2);
-            mid = Math.ceil(mid / 256) * 256;
-
-            let success = false;
-            try {
-                const status = await this.client.reloadModel({ n_ctx: mid }, model.name);
-                success = status.success;
-            } catch { }
-
-            // We reloaded, but we may not be meeting our overhead target
-            if (success) {
-                // TODO: would be nice to have the bar fill here
-                try {
-                    const mem = await this.client.getMemory(model.name);
-                    if (calcFreeBytes(mem) < model.fit_target_mib * 1024 * 1024) {
-                        success = false;
-                    }
-                } catch { }
-            }
-
-            if (success) {
-                cur = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 256;
-            }
-
-            iterations++;
-            // TODO: remove paranoid check
-            if (iterations > 100) throw new Error(`findMaxCtx reached 100 iterations`);
-        }
-
-        // reload to known good max ctx since a failure leaves context unusable
+    async #cleanupSlots(): Promise<void> {
+        const dir = this.config.router.slot_save_path;
+        let names: string[];
         try {
-            await this.client.reloadModel({ n_ctx: cur }, model.name);
-        } catch (err) {
-            throw new Error(`final reload to known-good max failed with err: ${err}`);
+            names = await readdir(dir);
+        } catch (err: any) {
+            log.warn(`#cleanupSlots: failed to read ${dir}: ${err}`);
+            return;
         }
 
-        // use n_ctx_seq as max ctx
-        const slots = await this.client.getSlots(model.name);
-        if (slots.length === 0) throw new Error(`expected nonzero slots`);
-        const max = slots[0].n_ctx;
+        const targets = names.filter(n => n.endsWith('.bin'));
 
-        log.info(`max ctx for ${model} found after ${iterations} iterations: ${max}`);
-        return max;
+        await Promise.allSettled(targets.map(n => unlink(join(dir, n))));
     }
 
-    // Load model and restore to previous state
-    // TODO: restore kvcache and use fewer reloadModel calls
-    async #loadModel(model: ModelEntry): Promise<void> {
-        if (model.is_loaded) return;
+    async #unloadAllModels(): Promise<void> {
+        const model_main = this.models['main']!;
+        const model_task = this.models['task'];
+
+        let count = 0;
+        if (model_main.status !== LoadStatus.UNLOADED) count++;
+        if (model_task?.status !== LoadStatus.UNLOADED) count++;
+
+        log.info(`unloading ${count} models`);
+        const t = performance.now();
+        await Promise.all([
+            this.#unloadWeights(model_main),
+            model_task ? this.#unloadWeights(model_task) : Promise.resolve(),
+        ]);
+        const unload_sec = ((performance.now() - t) / 1000).toFixed(2);
+        log.info(`unloaded ${count} models in ${unload_sec} sec`);
+    }
+
+    // fresh load model weights
+    async #loadWeights(model: ModelEntry): Promise<void> {
+        if (model.status !== LoadStatus.UNLOADED) return;
+        model.status = LoadStatus.WEIGHTS_ONLY;
 
         await this.client.loadModelAndWait(model.name, this.shutdown_ctrl.signal);
-        model.is_loaded = true;
-
-        const prev_state = this.previous_state.get(model.name);
-        if (prev_state) {
-            log.info(
-                `#loadModel: restoring applied strategies: ${JSON.stringify(prev_state.applied)} |`,
-                `ctx: ${prev_state.current_state.n_ctx}`,
-            );
-            await this.#applyStrategies(model, prev_state.applied);
-            await this.client.reloadModel(
-                { n_ctx: prev_state.current_state.n_ctx },
-                model.name,
-                this.shutdown_ctrl.signal,
-            );
-            model.current_state.n_ctx = prev_state.current_state.n_ctx;
-        }
     }
 
-    // Unload model and cache previous state
-    // TODO: save kvcache
-    async #unloadModel(model: ModelEntry): Promise<void> {
-        if (!model.is_loaded) return;
+    // unload model weights and kvcache. does not save restore point
+    async #unloadWeights(model: ModelEntry): Promise<void> {
+        if (model.status === LoadStatus.UNLOADED) return;
+        model.status = LoadStatus.UNLOADED;
 
         await this.client.unloadModelAndWait(model.name, this.shutdown_ctrl.signal);
 
-        // checkpoint current state
-        const prev = structuredClone(model);
-        this.previous_state.set(model.name, prev);
-
-        // reset model
-        model.is_loaded = false;
         model.applied = [];
         model.current_state = model.initial_state;
     }
 
-    // TODO: save kvcache
-    async #popKV(model: ModelId): Promise<void> {
-        const entry = this.entry(model)!;
-        if (!entry.is_loaded) return;
+    // restore a model to its last-seen state. loads weights if needed
+    async #loadAndRestore(model: ModelEntry): Promise<void> {
+        if (model.status === LoadStatus.LOADED) return;
 
-        // checkpoint current state
-        const prev = structuredClone(entry);
-        this.previous_state.set(entry.name, prev);
-
-        try {
-            await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, entry.name, this.shutdown_ctrl.signal);
-        } catch (err: any) {
-            log.error(`#stashKV: error reloading model: ${err}`);
+        if (model.status === LoadStatus.UNLOADED) {
+            await this.#loadWeights(model);
         }
 
-        entry.current_state.n_ctx = MIN_ALLOWED_CTX;
+        const restore_point = this.#getOrCreateRestore(model);
+
+        await this.#applyRestore(model, restore_point);
+        this.restore_points.delete(model.name);
     }
 
-    async #applyStrategies(model: ModelEntry, strategies: StrategyId[]): Promise<void> {
-        for (const strategy of strategies) {
-            if (model.applied.includes(strategy)) {
-                log.info(`#applyStrategies: ${strategy} already applied; skipping`);
-                continue;
-            }
-
-            const impl = this.strategies.get(strategy);
-            if (!impl) throw new Error(`implementation not found for strategy: ${strategy}`);
-
-            const strategy_context = { target: model.role, models: this.models };
-            if (!impl.canApply(strategy_context)) {
-                log.error(`#applyStrategies: model ${model.name} incompatible with strategy ${strategy}; skipping`);
-                break;
-            }
-
-            await impl.applyNoSave(strategy_context);
-            model.applied.push(strategy);
+    async #applyRestore(model: ModelEntry, point: RestorePoint): Promise<void> {
+        if (model.status === LoadStatus.UNLOADED) {
+            throw new Error(`#applyRestore: expected model weights for ${model.name}`);
         }
+
+        model.status = LoadStatus.LOADED;
+
+        let params: ReloadParams = { n_ctx: point.n_ctx };
+        log.info(
+            `#applyRestore: ${model.name} applying ${point.strategies.length} strategies; `,
+            `n_ctx: ${point.n_ctx}`
+        );
+
+        for (const strategy of point.strategies) {
+            const impl = this.strategies.get(strategy)!;
+
+            const ctx = { 
+                target: this.model_to_role.get(model.name)!, 
+                models: this.models 
+            };
+
+            try {
+                params = await impl.applyNoSend(ctx, params, point.slots);
+            } catch (err: any) {
+                throw new Error(`#applyRestore: error applying ${strategy} to ${model.name}: ${err}`);
+            }
+        }
+
+        // reload model with new params and restore slot info
+        await this.client.reloadModel(params, model.name, this.shutdown_ctrl.signal);
+        if (point.slots) {
+            log.info(`#applyRestore: ${model.name} restoring slots`);
+            await this.client.restoreAllSlots(model.name, point.slots, this.shutdown_ctrl.signal);
+        }
+
+        model.applied = [...point.strategies];
+        model.current_state.n_ctx = point.n_ctx;
+    }
+
+    // unload a model's kvcache and save a restore point for later
+    async #stashKV(model: ModelEntry): Promise<void> {
+        if (model.status !== LoadStatus.LOADED) return;
+        model.status = LoadStatus.WEIGHTS_ONLY;
+
+        const restore: RestorePoint = {
+            n_ctx: model.current_state.n_ctx,
+            strategies: [...model.applied],
+        };
+
+        // we only save kvcaches from main models
+        if (model.role === 'main') {
+            restore.slots = await this.client.saveAllSlots(model.name, this.shutdown_ctrl.signal);
+        }
+
+        try {
+            await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, model.name, this.shutdown_ctrl.signal);
+        } catch (err: any) {
+            throw new Error(`#stashKV: error setting ${model.name} to min ctx: ${err}`);
+        }
+
+        this.restore_points.set(model.name, restore);
+        model.current_state.n_ctx = MIN_ALLOWED_CTX;
     }
 
     #maxTokensForModel(model: ModelId): number {
@@ -566,17 +558,20 @@ export class Planner {
     // evaluates using previous_state if model is not active
     // return undefined if unable to serve
     #getMinAddtlStrategies(model: ModelId, req: TokenRequirement): Plan | undefined {
-        const plan: Plan = [];
+        const plan: Plan = { strategies: [], n_ctx: 0 };
         const entry = this.entry(model)!;
         const ctx_per_strats = this.max_ctx.get(model)!;
         const ctx_required = req.est_tokens_out ?? req.tokens_in;
 
         // get currently applied, or load from previous state
-        let applied: StrategyId[];
-        if (entry.is_loaded) {
+        let applied: StrategyId[] = [];
+        if (entry.status !== LoadStatus.UNLOADED) {
             applied = entry.applied;
         } else {
-            applied = this.previous_state.get(model)!.applied;
+            const restore = this.restore_points.get(model);
+            if (restore) {
+                applied = restore.strategies;
+            }
         }
 
         // no additional strategies needed
@@ -586,24 +581,23 @@ export class Planner {
         }
 
         // add strategies until request is satisfied
-        let n_ctx = 0;
         for (const [i, strategy] of entry.ladder.entries()) {
             if (applied.includes(strategy)) {
                 continue;
             }
 
-            n_ctx = ctx_per_strats.get(i + 1)!;
-            plan.push({ strategy, n_ctx });
+            plan.strategies.push(strategy);
+            plan.n_ctx = ctx_per_strats.get(i + 1)!;
 
-            if (n_ctx >= ctx_required) {
+            if (plan.n_ctx >= ctx_required) {
                 break;
             }
         }
 
-        if (n_ctx >= ctx_required) {
+        if (plan.n_ctx >= ctx_required) {
             return plan;
-        } else if (n_ctx >= req.tokens_in) {
-            log.warn(`unable to guarantee requested tokens ${ctx_required} for ${model}; serving ${n_ctx} instead`);
+        } else if (plan.n_ctx >= req.tokens_in) {
+            log.warn(`unable to guarantee requested tokens ${ctx_required} for ${model}; serving ${plan.n_ctx} instead`);
             return plan;
         }
 
@@ -611,15 +605,31 @@ export class Planner {
         return undefined;
     }
 
+    #getOrCreateRestore(model: ModelEntry): RestorePoint {
+        let restore_point = this.restore_points.get(model.name);
+        if (!restore_point) {
+            restore_point = {
+                n_ctx: model.current_state.n_ctx,
+                strategies: [...model.applied],
+            }
+        }
+
+        return restore_point;
+    }
+
     entry(model: ModelId): ModelEntry | undefined {
         const role = this.model_to_role.get(model);
         return role ? this.models[role] : undefined;
     }
 
+    role(model: ModelId): ModelRole | undefined {
+        return this.model_to_role.get(model);
+    }
+
     canServeImmediately(model: ModelId, req: TokenRequirement): boolean {
         const entry = this.entry(model);
         if (!entry) return false;
-        if (!entry.is_loaded) return false;
+        if (entry.status !== LoadStatus.LOADED) return false;
 
         const ctx_cap_reached = entry.applied.length === entry.ladder.length;
         const meets_token_req = ctx_cap_reached

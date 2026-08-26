@@ -11,7 +11,7 @@ export type StrategyId =
     | "disable-spec"
     | "quantize-kv-q8"
     | "quantize-kv-q4"
-    | "mmproj-on-demand";
+    | "disable-mmproj";
 
 export interface ModelState {
     n_ctx: Tokens;
@@ -24,13 +24,20 @@ export interface ModelState {
     cache_type_v: KVPrecision;
 }
 
+export enum LoadStatus {
+    UNLOADED,
+    WEIGHTS_ONLY,
+    LOADED,
+}
+
 export interface ModelEntry {
     role: ModelRole;
     name: ModelId;
     expected_response_tokens: number;
     fit_target_mib: number;
 
-    is_loaded: boolean;
+    status: LoadStatus;
+
     ladder: StrategyId[];
     applied: StrategyId[];
 

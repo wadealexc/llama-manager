@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
-import type { ManagerConfig, ModelEntry, ModelRole, ModelState, StrategyId } from "./types.js";
+import { LoadStatus, type ManagerConfig, type ModelEntry, type ModelRole, type ModelState, type StrategyId } from "./types.js";
 import { DEFAULT_FIT_OVERHEAD_MIB, DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 
 const DEFAULT_LOG_DIR = './logs/';
@@ -93,7 +93,7 @@ export class ConfigLoader {
             name,
             expected_response_tokens: raw['expected_response_tokens'] as number,
             fit_target_mib: getFitTarget(raw),
-            is_loaded: false,
+            status: LoadStatus.UNLOADED,
             ladder: (raw['ladder'] as StrategyId[]) ?? [],
             applied: [],
             initial_state,
