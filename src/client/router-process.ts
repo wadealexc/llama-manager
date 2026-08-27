@@ -93,6 +93,7 @@ export class RouterProcess {
     async shutdown(): Promise<void> {
         if (!this.instance) return;
 
+        log.debug(`shutdown`);
         const exited = this.instance.exited;
         const pid = this.instance.proc.pid!;
         const grace_period_ms = this.config.shutdown_grace_period_ms;

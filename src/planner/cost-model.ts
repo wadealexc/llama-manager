@@ -157,6 +157,13 @@ export class CostModel {
             await strat.apply(st_context);
             const find_sec = ((performance.now() - strat_t) / 1000).toFixed(2);
 
+            log.debug(`checking free memory after applying ${strat_id}:`);
+            const mem = await this.client.getMemory(model_main.name);
+            for (const dev of mem.devices) {
+                const free = dev.free / (1024 ** 3);
+                log.debug(`- ${dev.name}: ${free.toFixed(2)} GiB`);
+            }
+
             const prev_max = main_cur_ctx;
             main_cur_ctx = await this.findMaxCtx(main_cur_ctx, model_main);
 

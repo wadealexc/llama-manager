@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 
 const BASE = process.env.MANAGER_URL ?? "http://127.0.0.1:10001";
-const MAIN = "qwen3.6-27b";
+const MAIN = "qwen3.8-27b";
 const TASK = "qwen3.5-9b";
 
 interface Usage {

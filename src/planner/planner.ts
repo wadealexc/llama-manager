@@ -340,11 +340,13 @@ export class Planner {
             try { w.reject('shutting down') } catch {}
         }
 
+        log.info(`shutdown: cleaning up slot cache`);
         await this.#cleanupSlots().catch(err => {
             log.warn(`shutdown: cleanupSlots error: ${err}`);
         });
 
         this.shutdown_ctrl.abort('shutdown request received');
+        log.info(`shutdown: done`);
     }
 
     async #cleanupSlots(): Promise<void> {

@@ -13,7 +13,7 @@ router:
     shutdown_grace_period_ms: 10000
     
 # External listen address. OAI interface is exposed here.
-listen: 127.0.0.1:10001
+listen: 192.168.87.30:10001
 
 # Seconds of no requests after which current models are unloaded
 idle_timeout: 300
@@ -24,8 +24,8 @@ model_load:
 
 models:
     main:
-        model: /home/fox/kitsu/models/qwen3.6-dense-mtp/Qwen3.6-27B-UD-Q4_K_XL.gguf
-        mmproj: /home/fox/kitsu/models/qwen3.6-dense-mtp/mmproj-BF16.gguf
+        model: /home/fox/kitsu/models/qwen3.8-dense-mtp/Qwen3.8-27B-UD-Q4_K_XL.gguf
+        mmproj: /home/fox/kitsu/models/qwen3.8-dense-mtp/mmproj-BF16.gguf
 
         spec-type: draft-mtp
         spec-draft-n-max: 2
@@ -34,7 +34,7 @@ models:
         n-gpu-layers: 99
 
         # Manager-specific config
-        name: qwen3.6-27b
+        name: qwen3.8-27b
         expected_response_tokens: 16000
         ladder: [evict-task-model, disable-spec, mmproj-to-cpu]
     task:

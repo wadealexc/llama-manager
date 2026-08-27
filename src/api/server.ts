@@ -3,6 +3,10 @@ import type { Server } from "node:http";
 import type { ManagerConfig } from "../config/types.js";
 import type { Planner } from "../planner/planner.js";
 import { registerRoutes } from "./routes.js";
+import type { ConsolaInstance } from "consola";
+import { logger } from "../logger.js";
+
+const log: ConsolaInstance = logger.withTag('api-server');
 
 export class ApiServer {
 
@@ -26,6 +30,13 @@ export class ApiServer {
     }
 
     async shutdown(): Promise<void> {
-        return new Promise(resolve => this.server?.close(() => resolve()));
+        log.debug(`shutdown`);
+        return new Promise(resolve => {
+            if (!this.server) {
+                resolve();
+            }
+
+            this.server?.close(() => resolve());
+        });
     }
 }

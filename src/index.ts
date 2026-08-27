@@ -46,9 +46,11 @@ try {
 async function shutdown(event: string) {
     log.info(`shutdown: ${event}`);
 
-    await planner?.shutdown().catch(err => log.warn(`planner shutdown error: ${err}`));
-    await api?.shutdown().catch(err => log.warn(`api shutdown error: ${err}`));
-    await router?.shutdown().catch(err => log.warn(`router shutdown error: ${err}`));
+    await Promise.allSettled([
+        planner?.shutdown().catch(err => log.warn(`planner shutdown error: ${err}`)),
+        router?.shutdown().catch(err => log.warn(`router shutdown error: ${err}`)),
+        api?.shutdown().catch(err => log.warn(`api shutdown error: ${err}`)),
+    ]);
 
     log.info('goodbye!');
 }
