@@ -170,7 +170,7 @@ export class Planner {
     async decide(body: unknown, model: ModelId, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
 
-        log.info(`decide: ${model}, tokenizing...`);
+        log.debug(`decide: ${model}, tokenizing`);
 
         // tokenize input and estimate required tokens
         const req = await this.#withModel(model, { tokens_in: 0 }, async (entry: ModelEntry) => {
@@ -187,7 +187,7 @@ export class Planner {
             throw new Error(`unable to serve request for ${model}; tokens in: ${req.tokens_in} | max tokens: ${max_tokens_possible}`);
         }
 
-        log.info(`decide: ${model}, completions...`);
+        log.debug(`decide: ${model}, completions`);
 
         // stream from model when token requirement is met
         await this.#withModel(model, req, async (entry: ModelEntry) => {
@@ -280,14 +280,6 @@ export class Planner {
             );
         }
 
-        /**
-         * TODO: there needs to be a clearer distinction between:
-         * - can serve a request: "weights are loaded and kvcache is loaded"
-         * - can't serve a request (needs kvcache): "weights are loaded"
-         * - can't serve a request (needs kvcache AND weights): "nothing is loaded"
-         * 
-         * currently we only have `this.active` and `ModelEntry.is_loaded`
-         */
         if (!this.active) {
             this.active = { pending: true, model: model.name, readers: 0 };
         }
@@ -365,7 +357,7 @@ export class Planner {
             return;
         }
 
-        const targets = names.filter(n => n.endsWith('.bin'));
+        const targets = names.filter(n => n.endsWith('.bin') || n.endsWith('.ckpt'));
 
         await Promise.allSettled(targets.map(n => unlink(join(dir, n))));
     }
