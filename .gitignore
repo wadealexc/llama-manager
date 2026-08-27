@@ -4,3 +4,5 @@
 **/slots/
 
 *.ini
+
+generated-cost-model.json

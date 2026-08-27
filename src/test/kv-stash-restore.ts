@@ -11,11 +11,11 @@ interface Usage {
 }
 
 interface ChatResponse {
-    choices: { message: { content: string } }[];
+    choices: { message: { content: string; reasoning_content?: string } }[];
     usage: Usage;
 }
 
-async function chat(model: string, messages: unknown[], signal?: AbortSignal): Promise<{ content: string; usage: Usage }> {
+async function chat(model: string, messages: unknown[], signal?: AbortSignal): Promise<{ content: string; reasoning: string; usage: Usage }> {
     const res = await fetch(`${BASE}/v1/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -34,14 +34,20 @@ async function chat(model: string, messages: unknown[], signal?: AbortSignal): P
     }
 
     const body = await res.json() as ChatResponse;
+    const msg = body.choices[0].message;
     return {
-        content: body.choices[0].message.content,
+        content: msg.content,
+        reasoning: msg.reasoning_content ?? "",
         usage: body.usage,
     };
 }
 
 function fmt_ms(ms: number): string {
     return `${(ms / 1000).toFixed(2)}s`;
+}
+
+function truncate(s: string, n: number): string {
+    return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 async function timed<T>(label: string, fn: () => Promise<T>): Promise<{ result: T; ms: number }> {
@@ -74,8 +80,13 @@ async function main(): Promise<void> {
     console.log("[main] turn 1 (codeword set)");
     const t1 = await timed("chat", () => chat(MAIN, conv));
     console.log(`    reply: ${JSON.stringify(t1.result.content)}`);
+    if (t1.result.reasoning) console.log(`    reasoning: ${JSON.stringify(truncate(t1.result.reasoning, 120))}`);
     report_usage("main #1", t1.result.usage);
-    conv.push({ role: "assistant", content: t1.result.content });
+    conv.push({
+        role: "assistant",
+        content: t1.result.content,
+        reasoning_content: t1.result.reasoning || undefined,
+    });
 
     // 2. Switch to the task model. This forces the planner to stash the
     //    main model's KV cache, load the task model, serve, and on the
@@ -101,6 +112,7 @@ async function main(): Promise<void> {
     conv.push({ role: "user", content: "What was the codeword I told you? Reply with just the codeword." });
     const t3 = await timed("chat", () => chat(MAIN, conv));
     console.log(`    reply: ${JSON.stringify(t3.result.content)}`);
+    if (t3.result.reasoning) console.log(`    reasoning: ${JSON.stringify(truncate(t3.result.reasoning, 120))}`);
     report_usage("main #2", t3.result.usage);
 
     const ok = t3.result.content.toLowerCase().includes(secret);

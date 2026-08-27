@@ -11,7 +11,7 @@ export type StrategyId =
     | "disable-spec"
     | "quantize-kv-q8"
     | "quantize-kv-q4"
-    | "disable-mmproj";
+    | "mmproj-to-cpu";
 
 export interface ModelState {
     n_ctx: Tokens;

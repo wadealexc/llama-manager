@@ -8,6 +8,7 @@ import { ApiServer } from "./api/server.js";
 const log: ConsolaInstance = logger.withTag('main');
 
 const CONFIG_PATH = process.env.MANAGER_CONFIG ?? "./config.yaml";
+const FORCE_COST_MODEL = process.argv.includes('--build-cost-model');
 const [config, preset_path] = await loadConfig(CONFIG_PATH);
 
 const router = new RouterProcess(config.router, config.model_load);
@@ -32,7 +33,7 @@ const planner = new Planner(llama_api, config);
 const api = new ApiServer(planner, config);
 
 try {
-    await planner.buildCostModel();
+    await planner.initCostModel(CONFIG_PATH, FORCE_COST_MODEL);
     await planner.serveDefault();
     await api.start();
 } catch (err) {
@@ -45,11 +46,9 @@ try {
 async function shutdown(event: string) {
     log.info(`shutdown: ${event}`);
 
-    await Promise.allSettled([
-        api?.shutdown(),
-        router?.shutdown(),
-        planner?.shutdown(),
-    ]);
+    await planner?.shutdown().catch(err => log.warn(`planner shutdown error: ${err}`));
+    await api?.shutdown().catch(err => log.warn(`api shutdown error: ${err}`));
+    await router?.shutdown().catch(err => log.warn(`router shutdown error: ${err}`));
 
     log.info('goodbye!');
 }

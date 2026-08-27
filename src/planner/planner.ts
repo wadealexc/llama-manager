@@ -4,13 +4,14 @@ import { LoadStatus, type ManagerConfig, type ModelId, type ModelRole } from "..
 import type { ReloadParams, SlotSave } from "../client/types.js";
 import { logger } from "../logger.js";
 import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
-import { PrintMemory } from "./print-memory.js";
 import type { ModelEntry, StrategyId } from "../config/types.js";
-import type { Strategy, StrategyContext } from "./types.js";
+import type { Strategy } from "./types.js";
 import { createStrategies } from "./strategies/index.js";
 import { CostModel } from "./cost-model.js";
+import type { CostModelCache } from "./cost-model.js";
 import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+
 
 const log: ConsolaInstance = logger.withTag('planner');
 
@@ -47,7 +48,7 @@ type Plan = {
     n_ctx: number;
 }
 
-type RestorePoint = {
+export type RestorePoint = {
     n_ctx: number;
     strategies: StrategyId[];
     slots?: SlotSave[];
@@ -57,6 +58,7 @@ export class Planner {
 
     client: LlamaAPI;
     config: ManagerConfig;
+    cm: CostModel;
 
     shutdown_ctrl: AbortController = new AbortController();
 
@@ -73,7 +75,6 @@ export class Planner {
     waiting: Waiter[] = [];
 
     strategies: Map<StrategyId, Strategy>;
-    printer: PrintMemory;
 
     constructor(client: LlamaAPI, config: ManagerConfig) {
         this.client = client;
@@ -94,103 +95,52 @@ export class Planner {
 
         this.strategies = createStrategies(client);
 
-        this.printer = new PrintMemory(log, this.client);
+        this.cm = new CostModel(this.client);
     }
 
-    /**
-     * TODO think about:
-     * - Locking model loads/inference while building cost model
-     * - "trying" to load both models, and failing gracefully if they won't fit
-     *   - maybe evaluating whether we think a model load will succeed
-     */
-    async buildCostModel(): Promise<void> {
-        log.info('building cost model');
-        const t = performance.now();
-
-        const cm = new CostModel(this.client);
-
-        const model_main = this.models['main']!;
-        const model_task = this.models['task'];
-
-        // Load main and task model sequentially
-        try {
-            await this.#loadWeights(model_main);
-            if (model_task) await this.#loadWeights(model_task);
-        } catch (err) {
-            log.error(`buildCostModel: error loading models: ${err}`);
-            throw err;
-        }
-
-        await this.printer.print("Weights only", this.models);
-
-        // If we have a task model, calculate its max context while the main model is loaded
-        if (model_task) {
-            const task_max = await cm.findMaxCtx(MIN_ALLOWED_CTX, model_task);
-
-            model_task.initial_state.n_ctx = task_max;
-            model_task.current_state.n_ctx = task_max;
-            this.max_ctx.set(model_task.name, new Map([[model_main.applied.length, task_max]]));
-
-            await this.printer.print(`Task model @ ${task_max.toLocaleString()} ctx`, this.models, model_task.applied);
-
-            // Reset task model ctx
-            await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, model_task.name);
-        }
-
-        // Calculate main model max context with no strategies
-        let main_cur_ctx = await cm.findMaxCtx(MIN_ALLOWED_CTX, model_main);
-
-        model_main.initial_state.n_ctx = main_cur_ctx;
-        model_main.current_state.n_ctx = main_cur_ctx;
-        this.max_ctx.set(model_main.name, new Map([[model_main.applied.length, main_cur_ctx]]));
-        this.restore_points.set(model_main.name, { n_ctx: main_cur_ctx, strategies: [] });
-
-        await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, model_main.applied);
-
-        const st_context: StrategyContext = {
-            target: 'main',
+    async initCostModel(config_path: string, force_build: boolean): Promise<void> {
+        const cache = await this.cm.initCostModel({ 
+            config_path, 
+            force_build,
             models: this.models,
-        }
+            strategies: this.strategies,
+            signal: this.shutdown_ctrl.signal,
+        });
 
-        // Apply each configured strategy sequentially and find the main model's new max at each step
-        for (const strat_id of model_main.ladder) {
-            const strat = this.strategies.get(strat_id)!;
-            if (!strat.canApply(st_context)) {
-                log.info(`Model ${model_main.name} incompatible with strategy ${strat.id}; skipping`);
+        this.#applyCostModelCache(cache);
+        await this.#unloadAllModels();
+    }
+
+    #applyCostModelCache(cache: CostModelCache): void {
+        const model_main = this.models['main']!;
+
+        for (const [name, data] of Object.entries(cache.models)) {
+            const entry = this.entry(name);
+            if (!entry) {
+                log.warn(`cost model cache: model ${name} not in config; ignoring`);
                 continue;
             }
 
-            // Apply strategy
-            const t = performance.now();
-            await strat.apply(st_context);
-            const find_sec = ((performance.now() - t) / 1000).toFixed(2);
-
-            // Find new max ctx
-            const prev_max = main_cur_ctx;
-            main_cur_ctx = await cm.findMaxCtx(main_cur_ctx, model_main);
-
-            const ctx_gain = main_cur_ctx - prev_max;
-            if (ctx_gain < 0) {
-                throw new Error(`buildCostModel: applying ${strat.id} results in ctx decrease of ${ctx_gain}`);
+            const max_ctx = new Map<number, number>();
+            for (const [k, v] of Object.entries(data.max_ctx)) {
+                max_ctx.set(Number(k), v);
             }
+            this.max_ctx.set(name, max_ctx);
 
-            log.info(`strategy ${strat.id} applied in ${find_sec} sec for a gain of ${ctx_gain} tokens`);
+            entry.ladder = data.ladder;
+            entry.applied = [];
 
-            // Update max ctx for this point in the strategy ladder
-            model_main.applied.push(strat_id);
-            this.max_ctx.set(model_main.name, new Map([[model_main.applied.length, main_cur_ctx]]));
-
-            await this.printer.print(`Main model @ ${main_cur_ctx.toLocaleString()} ctx`, this.models, model_main.applied);
+            const baseline = max_ctx.get(0);
+            if (baseline !== undefined) {
+                entry.initial_state.n_ctx = baseline;
+                entry.current_state = { ...entry.initial_state };
+            }
         }
 
-        // Update in case we skipped some strategies
-        model_main.ladder = model_main.applied;
-        model_main.applied = [];
-
-        const build_sec = ((performance.now() - t) / 1000).toFixed(2);
-        log.info(`finished cost model in ${build_sec} sec`);
-
-        await this.#unloadAllModels();
+        const main_baseline = this.max_ctx.get(model_main.name)?.get(0);
+        if (main_baseline !== undefined) {
+            this.restore_points.set(model_main.name, { n_ctx: main_baseline, strategies: [] });
+        }
     }
 
     async serveDefault(): Promise<void> {
@@ -388,18 +338,21 @@ export class Planner {
     }
 
     async shutdown(): Promise<void> {
-        this.shutdown_ctrl.abort('shutdown request received');
+        await this.#unloadAllModels().catch(err => {
+            log.warn(`shutdown: unloadAllModels error: ${err}`);
+        });
 
-        log.info(`canceling ${this.waiting.length} jobs`);
+        log.info(`shutdown: canceling ${this.waiting.length} jobs`);
         const waiting = this.waiting.splice(0, this.waiting.length);
         for (const w of waiting) {
-            try {
-                w.reject('shutting down');
-            } catch { }
+            try { w.reject('shutting down') } catch {}
         }
 
-        await this.#unloadAllModels();
-        await this.#cleanupSlots();
+        await this.#cleanupSlots().catch(err => {
+            log.warn(`shutdown: cleanupSlots error: ${err}`);
+        });
+
+        this.shutdown_ctrl.abort('shutdown request received');
     }
 
     async #cleanupSlots(): Promise<void> {
@@ -424,6 +377,7 @@ export class Planner {
         let count = 0;
         if (model_main.status !== LoadStatus.UNLOADED) count++;
         if (model_task?.status !== LoadStatus.UNLOADED) count++;
+        if (count === 0) return;
 
         log.info(`unloading ${count} models`);
         const t = performance.now();
@@ -484,9 +438,9 @@ export class Planner {
         for (const strategy of point.strategies) {
             const impl = this.strategies.get(strategy)!;
 
-            const ctx = { 
-                target: this.model_to_role.get(model.name)!, 
-                models: this.models 
+            const ctx = {
+                target: this.model_to_role.get(model.name)!,
+                models: this.models
             };
 
             try {

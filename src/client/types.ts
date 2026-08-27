@@ -25,7 +25,7 @@ export interface ReloadParams {
 
     // multimodal
     mmproj?: {
-        path: string;  // empty string unloads mmproj
+        path?: string;  // empty string unloads mmproj
         mmproj_offload?: boolean;
         image_min_tokens?: number;
         image_max_tokens?: number;
