@@ -293,14 +293,16 @@ export class Planner {
         this.active.pending = true;
         this.active.model = model.name;
 
-        const t = new Timer();
+        const t = new Timer(`maybeTransition: serve ${model.name}`);
 
         if (prior_active.name !== model.name) {
-            await this.#stashKV(prior_active, t);
+            let label = `${prior_active.name}: stashKV`;
+            await this.#stashKV(prior_active, t.child(label));
         }
 
         if (model.status === LoadStatus.UNLOADED) {
-            await this.#loadWeights(model, t);
+            let label = `${model.name}: loadWeights`;
+            await this.#loadWeights(model, t.child(label));
         }
 
         const restore_point = this.#getOrCreateRestore(model);
@@ -320,12 +322,13 @@ export class Planner {
             }
         }
 
-        await this.#applyRestore(model, restore_point, t);
+        let label = `${model.name}: applyRestore`;
+        await this.#applyRestore(model, restore_point, t.child(label));
         this.restore_points.delete(model.name);
 
         this.active.pending = false;
 
-        print(`serve ${model.name}`, t);
+        print(t);
 
         // fire any waiters satisfied by new active state
         const ready = this.waiting.filter((w) =>
@@ -628,8 +631,7 @@ export class Planner {
     }
 }
 
-function print(label: string, t?: Timer) {
+function print(t?: Timer) {
     if (!t) return;
-    log.info(`${label} elapsed: ${t.fmtTotal()}`);
-    log.debug(`segments: ${t.fmtSegments()}`);
+    log.info(t.fmt());
 }
