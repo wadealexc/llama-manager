@@ -1,4 +1,7 @@
-export type TokenIds = number[];
+export interface InputTokensResponse {
+    input_tokens: number;
+    object: string;
+}
 
 export type SpeculativeType = 
     "none" | "draft-simple" | "draft-eagle3" | "draft-mtp" | "draft-dflash" | (string & {});
@@ -47,10 +50,6 @@ export interface ReloadParams {
 }
 
 // Responses
-
-export interface TokenizeResponse {
-    tokens: number[];
-}
 
 export type RouterModelStatus = 
     | 'downloading' 

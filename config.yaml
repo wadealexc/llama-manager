@@ -35,8 +35,8 @@ models:
 
         # Manager-specific config
         name: qwen3.8-27b
-        expected_response_tokens: 16000
-        ladder: [evict-task-model, disable-spec, mmproj-to-cpu]
+        expected_response_tokens: 65000
+        ladder: [disable-spec, evict-task-model]
     task:
         model: /home/fox/kitsu/models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf
         mmproj: /home/fox/kitsu/models/qwen3.5-9b/mmproj-BF16.gguf

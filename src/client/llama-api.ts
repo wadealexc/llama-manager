@@ -1,6 +1,6 @@
 import type { ConsolaInstance } from "consola";
 import type { ModelId, ModelLoadConfig } from "../config/types.js";
-import { HttpError, type ModelInfo, type StatusResponse, type Slot, type TokenizeResponse, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type TokenIds, type SlotSave, type SlotRestore } from "./types.js";
+import { HttpError, type ModelInfo, type StatusResponse, type Slot, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type SlotSave, type SlotRestore, type InputTokensResponse } from "./types.js";
 import { logger } from "../logger.js";
 
 const log: ConsolaInstance = logger.withTag('llama-api');
@@ -33,8 +33,8 @@ export class LlamaAPI {
         });
     }
 
-    async tokenize(body: unknown, model: ModelId, signal?: AbortSignal): Promise<TokenIds> {
-        const url = this.#buildURL('/tokenize');
+    async countTokens(body: unknown, model: ModelId, signal?: AbortSignal): Promise<number> {
+        const url = this.#buildURL('/v1/chat/completions/input_tokens');
 
         const res = await fetch(url, {
             method: 'POST',
@@ -45,10 +45,10 @@ export class LlamaAPI {
 
         if (!res.ok) {
             const msg = await res.text();
-            throw new HttpError('POST /tokenize', msg, res.status);
+            throw new HttpError('POST /v1/chat/completions/input_tokens', msg, res.status);
         }
 
-        return (await res.json() as TokenizeResponse).tokens;
+        return (await res.json() as InputTokensResponse).input_tokens;
     }
 
     async getSlots(model: ModelId, signal?: AbortSignal): Promise<Slot[]> {

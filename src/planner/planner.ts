@@ -11,6 +11,7 @@ import { CostModel } from "./cost-model.js";
 import type { CostModelCache } from "./cost-model.js";
 import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { Timer } from "./timer.js";
 
 
 const log: ConsolaInstance = logger.withTag('planner');
@@ -170,14 +171,16 @@ export class Planner {
     async decide(body: unknown, model: ModelId, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
 
-        log.debug(`decide: ${model}, tokenizing`);
-
         // tokenize input and estimate required tokens
         const req = await this.#withModel(model, { tokens_in: 0 }, async (entry: ModelEntry) => {
-            const token_ids = await this.client.tokenize(body, model, signal);
+            const tokens_in = await this.client.countTokens(body, model, signal);
+            const est_tokens_out = tokens_in + entry.expected_response_tokens;
+            const n_ctx = entry.current_state.n_ctx;
+            log.debug(`req ${model} (cur ctx: ${n_ctx} | in: ${tokens_in}, out_estimate: ${est_tokens_out})`);
+
             return {
-                tokens_in: token_ids.length,
-                est_tokens_out: token_ids.length + entry.expected_response_tokens,
+                tokens_in,
+                est_tokens_out: est_tokens_out,
             };
         });
 
@@ -187,10 +190,12 @@ export class Planner {
             throw new Error(`unable to serve request for ${model}; tokens in: ${req.tokens_in} | max tokens: ${max_tokens_possible}`);
         }
 
-        log.debug(`decide: ${model}, completions`);
+        if (!this.canServeImmediately(model, req)) {
+            log.debug(`req ${model}: can't serve immediately, queuing`);
+        }
 
         // stream from model when token requirement is met
-        await this.#withModel(model, req, async (entry: ModelEntry) => {
+        await this.#withModel(model, req, async (entry: ModelEntry) => {            
             const n_ctx = entry.current_state.n_ctx;
             if (n_ctx < req.est_tokens_out) {
                 log.warn(
@@ -288,12 +293,14 @@ export class Planner {
         this.active.pending = true;
         this.active.model = model.name;
 
+        const t = new Timer();
+
         if (prior_active.name !== model.name) {
-            await this.#stashKV(prior_active);
+            await this.#stashKV(prior_active, t);
         }
 
         if (model.status === LoadStatus.UNLOADED) {
-            await this.#loadWeights(model);
+            await this.#loadWeights(model, t);
         }
 
         const restore_point = this.#getOrCreateRestore(model);
@@ -302,16 +309,23 @@ export class Planner {
             restore_point.n_ctx = plan.n_ctx;
             restore_point.strategies = [...restore_point.strategies, ...plan.strategies];
 
+            log.info(`${model.name}: applying ${plan.strategies.length} strategies to increase ctx to ${plan.n_ctx}`);
+
             // if the model has a kvcache, save it
             if (model.status === LoadStatus.LOADED) {
+                log.debug(`${model.name}: caching slots`);
+                t.start(`saveAllSlots`);
                 restore_point.slots = await this.client.saveAllSlots(model.name, this.shutdown_ctrl.signal);
+                t.stop();
             }
         }
 
-        await this.#applyRestore(model, restore_point);
+        await this.#applyRestore(model, restore_point, t);
         this.restore_points.delete(model.name);
 
         this.active.pending = false;
+
+        print(`serve ${model.name}`, t);
 
         // fire any waiters satisfied by new active state
         const ready = this.waiting.filter((w) =>
@@ -384,11 +398,13 @@ export class Planner {
     }
 
     // fresh load model weights
-    async #loadWeights(model: ModelEntry): Promise<void> {
+    async #loadWeights(model: ModelEntry, t?: Timer): Promise<void> {
         if (model.status !== LoadStatus.UNLOADED) return;
         model.status = LoadStatus.WEIGHTS_ONLY;
 
+        t?.start(`loadWeights`);
         await this.client.loadModelAndWait(model.name, this.shutdown_ctrl.signal);
+        t?.stop();
     }
 
     // unload model weights and kvcache. does not save restore point
@@ -416,7 +432,7 @@ export class Planner {
         this.restore_points.delete(model.name);
     }
 
-    async #applyRestore(model: ModelEntry, point: RestorePoint): Promise<void> {
+    async #applyRestore(model: ModelEntry, point: RestorePoint, t?: Timer): Promise<void> {
         if (model.status === LoadStatus.UNLOADED) {
             throw new Error(`#applyRestore: expected model weights for ${model.name}`);
         }
@@ -430,6 +446,10 @@ export class Planner {
         );
 
         for (const strategy of point.strategies) {
+            if (model.applied.includes(strategy)) {
+                continue;
+            }
+            
             const impl = this.strategies.get(strategy)!;
 
             const ctx = {
@@ -438,25 +458,33 @@ export class Planner {
             };
 
             try {
+                log.debug(`applying strategy: ${strategy}`);
+                t?.start(`${strategy}`);
                 params = await impl.applyNoSend(ctx, params, point.slots);
+                t?.stop();
             } catch (err: any) {
                 throw new Error(`#applyRestore: error applying ${strategy} to ${model.name}: ${err}`);
             }
         }
 
         // reload model with new params and restore slot info
+        t?.start(`reloadModel`);
         await this.client.reloadModel(params, model.name, this.shutdown_ctrl.signal);
+        t?.stop();
         if (point.slots) {
             log.info(`#applyRestore: ${model.name} restoring slots`);
+            t?.start(`restoreAllSlots`);
             await this.client.restoreAllSlots(model.name, point.slots, this.shutdown_ctrl.signal);
+            t?.stop();
         }
 
         model.applied = [...point.strategies];
         model.current_state.n_ctx = point.n_ctx;
+        log.debug(`#applyRestore: done; serving ${model.name} at ${point.n_ctx} ctx`);
     }
 
     // unload a model's kvcache and save a restore point for later
-    async #stashKV(model: ModelEntry): Promise<void> {
+    async #stashKV(model: ModelEntry, t?: Timer): Promise<void> {
         if (model.status !== LoadStatus.LOADED) return;
         model.status = LoadStatus.WEIGHTS_ONLY;
 
@@ -467,14 +495,18 @@ export class Planner {
 
         // we only save kvcaches from main models
         if (model.role === 'main') {
+            t?.start('saveAllSlots');
             restore.slots = await this.client.saveAllSlots(model.name, this.shutdown_ctrl.signal);
+            t?.stop();
         }
 
+        t?.start('reloadModel');
         try {
             await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, model.name, this.shutdown_ctrl.signal);
         } catch (err: any) {
             throw new Error(`#stashKV: error setting ${model.name} to min ctx: ${err}`);
         }
+        t?.stop();
 
         this.restore_points.set(model.name, restore);
         model.current_state.n_ctx = MIN_ALLOWED_CTX;
@@ -594,4 +626,10 @@ export class Planner {
             && meets_token_req
         );
     }
+}
+
+function print(label: string, t?: Timer) {
+    if (!t) return;
+    log.info(`${label} elapsed: ${t.fmtTotal()}`);
+    log.debug(`segments: ${t.fmtSegments()}`);
 }
