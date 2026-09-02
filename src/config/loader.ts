@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
-import { LoadStatus, type ManagerConfig, type ModelEntry, type ModelRole, type ModelState, type StrategyId } from "./types.js";
-import { DEFAULT_FIT_OVERHEAD_MIB, DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
+import { type ManagerConfig, type ModelConfig, type ModelState, type StrategyId } from "./types.js";
+import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 
 const DEFAULT_LOG_DIR = './logs/';
 const DEFAULT_SLOT_SAVE_DIR = './slots/';
@@ -9,8 +9,6 @@ const DEFAULT_SLOT_SAVE_DIR = './slots/';
 const CTX_KEY = "ctx-size";
 
 const MANAGER_FIELDS = new Set([
-    "name",
-    "expected_response_tokens",
     "ladder",
     "ctx-size",
     "c",
@@ -21,12 +19,9 @@ const MANAGER_FIELDS = new Set([
     "slot-save-path",
 ]);
 
-const ROLES: ModelRole[] = ["main", "task"];
-
 const PRESET_OUT_PATH = "./generated-preset.ini";
 
 type RawModel = Record<string, unknown>;
-type RawModels = Partial<Record<ModelRole, RawModel>>;
 
 export class ConfigLoader {
 
@@ -38,10 +33,31 @@ export class ConfigLoader {
             throw new Error(`failed to parse config: ${(e as Error).message}`);
         }
 
-        const raw_models: RawModels = (raw.models as RawModels) ?? {};
+        const raw_models: Record<string, RawModel> = (raw.models as Record<string, RawModel>) ?? {};
         const raw_router = (raw.router ?? {}) as Record<string, unknown>;
         const llama_log_dir = normalizeDir((raw_router['llama_log_dir'] as string) ?? DEFAULT_LOG_DIR);
         const slot_save_path = normalizeDir((raw_router['slot-save-path'] as string) ?? DEFAULT_SLOT_SAVE_DIR);
+
+        const models: Record<string, ModelConfig> = {};
+        if (Object.keys(raw_models).length === 0) {
+            throw new Error(`no models found in config`);
+        }
+
+        for (const [key, raw_entry] of Object.entries(raw_models)) {
+            models[key] = this.#buildEntry(key, raw_entry);
+        }
+
+        const raw_defaults = raw.default_models as string[] | undefined;
+        const model_keys = Object.keys(models);
+        const default_models = (raw_defaults && raw_defaults.length > 0)
+            ? raw_defaults
+            : [model_keys[0]];
+
+        for (const id of default_models) {
+            if (!models[id]) {
+                throw new Error(`default_model '${id}' not found in models`);
+            }
+        }
 
         const config: ManagerConfig = {
             router: {
@@ -56,7 +72,8 @@ export class ConfigLoader {
             listen: raw.listen as string,
             idle_timeout: raw.idle_timeout as number,
             model_load: raw.model_load as ManagerConfig["model_load"],
-            models: this.#buildEntries(raw_models),
+            models,
+            default_models,
         };
 
         mkdirSync(config.router.llama_log_dir, { recursive: true });
@@ -66,21 +83,8 @@ export class ConfigLoader {
         return [config, PRESET_OUT_PATH];
     }
 
-    #buildEntries(raw: RawModels): Partial<Record<ModelRole, ModelEntry>> {
-        const entries: Partial<Record<ModelRole, ModelEntry>> = {};
-        for (const role of ROLES) {
-            const r = raw[role];
-            if (!r) continue;
-            entries[role] = this.#buildEntry(role, r);
-        }
-        return entries;
-    }
-
-    #buildEntry(role: ModelRole, raw: RawModel): ModelEntry {
-        const name = typeof raw['name'] === 'string' ? raw['name'] : role;
-
+    #buildEntry(name: string, raw: RawModel): ModelConfig {
         const initial_state: ModelState = {
-            n_ctx: MIN_ALLOWED_CTX,
             mmproj_loaded: getHasMmproj(raw),
             spec_loaded: getHasSpec(raw),
             kv_unified: getKvUnified(raw),
@@ -89,26 +93,16 @@ export class ConfigLoader {
         };
 
         return {
-            role,
             name,
-            expected_response_tokens: raw['expected_response_tokens'] as number,
-            fit_target_mib: getFitTarget(raw),
-            status: LoadStatus.UNLOADED,
             ladder: (raw['ladder'] as StrategyId[]) ?? [],
-            applied: [],
             initial_state,
-            current_state: { ...initial_state },
         };
     }
 
-    #buildIni(raw: RawModels, slot_save_path: string): string {
+    #buildIni(raw: Record<string, RawModel>, slot_save_path: string): string {
         const sections: string[] = [];
 
-        for (const role of ROLES) {
-            const entry = raw[role];
-            if (!entry) continue;
-
-            const name = typeof entry['name'] === 'string' ? entry['name'] : role;
+        for (const [name, entry] of Object.entries(raw)) {
             const lines = [
                 `[${name}]`,
                 `${CTX_KEY} = ${MIN_ALLOWED_CTX}`,
@@ -137,11 +131,6 @@ export class ConfigLoader {
 
 function normalizeDir(p: string): string {
     return p.endsWith('/') ? p : p + '/';
-}
-
-function getFitTarget(entry: RawModel): number {
-    const fit = entry['fit-target'] ?? entry['fitt'];
-    return typeof fit === 'number' ? fit : DEFAULT_FIT_OVERHEAD_MIB;
 }
 
 function getHasSpec(entry: RawModel): boolean {

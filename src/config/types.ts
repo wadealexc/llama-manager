@@ -4,45 +4,16 @@ export type ModelId = string;
 
 export type Tokens = number;
 
-export type ModelRole = "main" | "task";
-
 export type StrategyId =
-    | "evict-task-model"
     | "disable-spec"
     | "quantize-kv-q8"
     | "quantize-kv-q4"
     | "mmproj-to-cpu";
 
-export interface ModelState {
-    n_ctx: Tokens;
-
-    mmproj_loaded: boolean;
-    spec_loaded: boolean;
-
-    kv_unified: boolean;
-    cache_type_k: KVPrecision;
-    cache_type_v: KVPrecision;
-}
-
 export enum LoadStatus {
     UNLOADED,
     WEIGHTS_ONLY,
     LOADED,
-}
-
-export interface ModelEntry {
-    role: ModelRole;
-    name: ModelId;
-    expected_response_tokens: number;
-    fit_target_mib: number;
-
-    status: LoadStatus;
-
-    ladder: StrategyId[];
-    applied: StrategyId[];
-
-    initial_state: ModelState;
-    current_state: ModelState;
 }
 
 export interface LlamaConfig {
@@ -60,12 +31,27 @@ export interface ModelLoadConfig {
     poll_timeout_ms: number;
 }
 
+export interface ModelState {
+    mmproj_loaded: boolean;
+    spec_loaded: boolean;
+    kv_unified: boolean;
+    cache_type_k: KVPrecision;
+    cache_type_v: KVPrecision;
+}
+
+export interface ModelConfig {
+    name: ModelId;
+    ladder: StrategyId[];
+    initial_state: ModelState;
+}
+
 export interface ManagerConfig {
     router: LlamaConfig;
     listen: string;
     idle_timeout: number;
     model_load: ModelLoadConfig;
-    models: Partial<Record<ModelRole, ModelEntry>>;
+    models: Record<ModelId, ModelConfig>;
+    default_models: ModelId[];
 }
 
 export class ConfigError extends Error {

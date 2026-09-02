@@ -1,6 +1,6 @@
 import type { ConsolaInstance } from "consola";
 import type { ModelId, ModelLoadConfig } from "../config/types.js";
-import { HttpError, type ModelInfo, type StatusResponse, type Slot, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type SlotSave, type SlotRestore, type InputTokensResponse } from "./types.js";
+import { HttpError, type ModelInfo, type StatusResponse, type Slot, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type SlotSave, type SlotRestore, type InputTokensResponse, type FitResponse } from "./types.js";
 import { logger } from "../logger.js";
 
 const log: ConsolaInstance = logger.withTag('llama-api');
@@ -109,6 +109,24 @@ export class LlamaAPI {
 
             return await res.json() as SlotRestore; 
         }));
+    }
+
+    async fitModel(model: ModelId, signal?: AbortSignal): Promise<number> {
+        const url = this.#buildURL('/fit');
+
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: model }),
+            signal: signal,
+        });
+
+        if (!res.ok) {
+            const msg = await res.text();
+            throw new HttpError('POST /fit', msg, res.status);
+        }
+
+        return (await res.json() as FitResponse).n_ctx;
     }
 
     async reloadModel(params: ReloadParams, model: ModelId, signal?: AbortSignal): Promise<StatusResponse> {
@@ -279,12 +297,13 @@ export class LlamaAPI {
         return body.data;
     }
 
-    async getMemory(model: ModelId): Promise<MemoryResponse> {
+    async getMemory(model: ModelId, signal?: AbortSignal): Promise<MemoryResponse> {
         const url = this.#buildURL('/memory', model);
 
         const res = await fetch(url, {
             method: 'GET',
             headers: { 'content-type': 'application/json' },
+            signal,
         });
 
         if (!res.ok) {

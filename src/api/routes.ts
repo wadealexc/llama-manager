@@ -1,8 +1,8 @@
-import { Readable } from "node:stream";
 import type { Express, Request, Response as ExpressResponse } from "express";
 import type { ApiServer } from "./server.js";
 import type { Client } from "../planner/planner.js";
-import { pipeline } from "node:stream/promises";
+import { SSERelay } from "./sse-relay.js";
+import type { CompletionChunk, CompletionRequest, ContinuedRequest, ToolCall } from "./types.js";
 
 export function registerRoutes(app: Express, server: ApiServer): void {
     app.get('/v1/models', (req, res) => listModels(server, req, res));
@@ -10,7 +10,7 @@ export function registerRoutes(app: Express, server: ApiServer): void {
 }
 
 async function listModels(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
-    const data = Object.values(server.planner.models)
+    const data = [...server.planner.models.values()]
         .filter((e): e is NonNullable<typeof e> => !!e)
         .map(e => ({
             id: e.name,
@@ -23,54 +23,364 @@ async function listModels(server: ApiServer, req: Request, res: ExpressResponse)
 }
 
 async function completions(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
-    const body = req.body as Record<string, unknown> | undefined;
-    const model = body?.model;
-    if (typeof model !== 'string') {
+    const body = req.body as CompletionRequest | undefined;
+    if (body === undefined) {
+        sendError(res, 400, 'invalid_request', 'expected request body');
+        return;
+    }
+
+    const model_name = body.model;
+    if (typeof model_name !== 'string') {
         sendError(res, 400, 'invalid_request', 'missing or invalid "model" field');
         return;
     }
 
-    const is_stream = body?.stream === true;
+    const model = server.planner.resolve(model_name);
+    if (!model) {
+        sendError(res, 400, 'invalid_request', `unable to resolve model ${model_name}`);
+        return;
+    }
+
+    const is_stream = body.stream === true;
 
     const ac = new AbortController();
     res.on('close', () => ac.abort());
     req.on('aborted', () => ac.abort());
 
-    await server.planner.decide(body, model, ac.signal, async (body: unknown, client: Client, signal: AbortSignal) => {
-        if (res.writableEnded) return;
+    let headers_set = false;
+    let continued_body: ContinuedRequest | null = null;
+    let completion_tokens_total = 0;
 
+    await server.planner.serveModel(body, model, ac.signal, async (_body: unknown, client: Client, signal: AbortSignal, isFinal: boolean) => {
+        if (res.writableEnded) return true;
+
+        const req_body = continued_body ?? body;
+
+        if (!headers_set) {
+            if (is_stream) {
+                res.setHeader('content-type', 'text/event-stream');
+                res.setHeader('cache-control', 'no-cache');
+                res.setHeader('connection', 'keep-alive');
+            } else {
+                res.setHeader('content-type', 'application/json');
+            }
+            res.status(200);
+            res.flushHeaders();
+            headers_set = true;
+        }
+
+        // generate model response, returning `false` if response was cut off due to truncation
+        // `serveModel` will attempt to expand context window and call this callback again to continue.
+        // if isFinal === true, this indicates expanding context window was not possible and response 
+        // should be flushed.
         if (is_stream) {
-            res.setHeader('content-type', 'text/event-stream');
-            res.setHeader('cache-control', 'no-cache');
-            res.setHeader('connection', 'keep-alive');
+            return await streamCompletion(req_body, model.name, client, signal, res, body, isFinal, (cont, tokens) => {
+                continued_body = cont;
+                completion_tokens_total += tokens;
+            }, completion_tokens_total);
         } else {
-            res.setHeader('content-type', 'application/json');    
-        }
-
-        res.status(200);
-        res.flushHeaders();
-
-        let upstream: Response;
-        try {
-            upstream = await client.completions(body, model, signal);
-        } catch (err) {
-            sendUpstreamError(res, is_stream, err);
-            return;
-        }
-
-        if (!upstream.ok || !upstream.body) {
-            const text = await upstream.text().catch(() => '');
-            sendUpstreamError(res, is_stream, text || `upstream returned ${upstream.status}`);
-            return;
-        }
-
-        try {
-            await pipeline(Readable.fromWeb(upstream.body), res);
-        } catch (err) {
-            if (res.writableEnded) return;
-            sendUpstreamError(res, is_stream, err);
+            return await nonStreamCompletion(req_body, model.name, client, signal, res, body, isFinal, (cont, tokens) => {
+                continued_body = cont;
+                completion_tokens_total += tokens;
+            }, completion_tokens_total);
         }
     });
+}
+
+type PartialToolCall = {
+    id: string;
+    type: string;
+    function_name: string;
+    function_args: string;
+}
+
+async function streamCompletion(
+    req_body: unknown,
+    model_name: string,
+    client: Client,
+    signal: AbortSignal,
+    res: ExpressResponse,
+    original_body: CompletionRequest,
+    isFinal: boolean,
+    onTruncated: (continued_body: ContinuedRequest, completion_tokens: number) => void,
+    completion_tokens_total: number,
+): Promise<boolean> {
+    let upstream: Response;
+    try {
+        upstream = await client.completions({ ...(req_body as {}), stream_options: { include_usage: true } }, model_name, signal);
+    } catch (err) {
+        sendUpstreamError(res, true, err);
+        return true;
+    }
+
+    if (!upstream.ok || !upstream.body) {
+        const text = upstream.ok ? '' : await upstream.text().catch(() => '');
+        sendUpstreamError(res, true, text || `upstream returned ${upstream.status}`);
+        return true;
+    }
+
+    let partial_content = "";
+    let partial_reasoning = "";
+    const partial_tool_calls = new Map<number, PartialToolCall>();
+
+    try {
+        let pending_frame: { raw: string; json: CompletionChunk } | null = null;
+
+        const relay = new SSERelay(upstream.body);
+        for await (const frame of relay) {
+            if (frame.done) {
+                if (pending_frame) {
+                    res.write(`data: ${pending_frame.raw}\n\n`);
+                }
+                res.write("data: [DONE]\n\n");
+                return true;
+            }
+
+            const json = frame.data as CompletionChunk;
+            const raw = JSON.stringify(json);
+
+            // handle truncated response due to context window length
+            if (pending_frame) {
+                const completion_tokens = json.usage?.completion_tokens ?? 0;
+                const finish_reason = pending_frame.json.choices[0]?.finish_reason;
+
+                // unable to expand ctx window, send what we have
+                if (isFinal) {
+                    res.write(`data: ${pending_frame.raw}\n\n`);
+                    res.write(`data: ${raw}\n\n`);
+                    res.write("data: [DONE]\n\n");
+                    return true;
+                }
+
+                if (completion_tokens_total > 0 && json.usage) {
+                    json.usage.completion_tokens += completion_tokens_total;
+                    json.usage.total_tokens += completion_tokens_total;
+                }
+
+                // build continuation response
+                if (isTruncated(completion_tokens, finish_reason, original_body.max_tokens)) {
+                    const cont = buildContinuation(
+                        original_body,
+                        partial_content,
+                        partial_reasoning || undefined,
+                        collapseToolCalls(partial_tool_calls),
+                        completion_tokens,
+                    );
+                    onTruncated(cont, completion_tokens);
+                    return false;
+                }
+
+                res.write(`data: ${pending_frame.raw}\n\n`);
+                res.write(`data: ${JSON.stringify(json)}\n\n`);
+                pending_frame = null;
+                continue;
+            }
+
+            const choice = json.choices[0];
+            if (!choice) continue;
+
+            const delta = choice.delta;
+            const finish_reason = choice.finish_reason;
+
+            // if we get a finish reason, add it as a pending frame so we can detect truncation
+            if (finish_reason) {
+                pending_frame = { raw, json };
+                continue;
+            }
+
+            res.write(`data: ${raw}\n\n`);
+
+            if (delta?.content) {
+                partial_content += delta.content;
+            }
+
+            if (delta?.reasoning_content) {
+                partial_reasoning += delta.reasoning_content;
+            }
+
+            if (delta?.tool_calls) {
+                for (const tc of delta.tool_calls) {
+                    mergeToolCall(partial_tool_calls, tc.index ?? 0, tc);
+                }
+            }
+        }
+
+        res.write("data: [DONE]\n\n");
+        return true;
+    } catch (err) {
+        if (res.writableEnded) return true;
+        sendUpstreamError(res, true, err);
+        return true;
+    }
+}
+
+async function nonStreamCompletion(
+    req_body: unknown,
+    model_name: string,
+    client: Client,
+    signal: AbortSignal,
+    res: ExpressResponse,
+    original_body: CompletionRequest,
+    isFinal: boolean,
+    onTruncated: (continued_body: ContinuedRequest, completion_tokens: number) => void,
+    completion_tokens_total: number,
+): Promise<boolean> {
+    let upstream: Response;
+    try {
+        upstream = await client.completions(req_body, model_name, signal);
+    } catch (err) {
+        sendUpstreamError(res, false, err);
+        return true;
+    }
+
+    if (!upstream.ok) {
+        const text = await upstream.text().catch(() => '');
+        sendUpstreamError(res, false, text || `upstream returned ${upstream.status}`);
+        return true;
+    }
+
+    let json: CompletionChunk;
+    try {
+        json = await upstream.json() as CompletionChunk;
+    } catch (err) {
+        sendUpstreamError(res, false, err);
+        return true;
+    }
+
+    const choice = json.choices[0];
+    const finish_reason = choice?.finish_reason;
+    const completion_tokens = json.usage?.completion_tokens ?? 0;
+
+    // if response was truncated due to context window length, create a continuation
+    // response we can send after ctx expansion
+    if (!isFinal && isTruncated(completion_tokens, finish_reason, original_body.max_tokens)) {
+        const message = choice?.message;
+        const content = message?.content ?? "";
+        const reasoning = message?.reasoning_content;
+        const tool_calls = message?.tool_calls;
+        const cont = buildContinuation(original_body, content, reasoning, tool_calls, completion_tokens);
+        onTruncated(cont, completion_tokens);
+        return false;
+    }
+
+    if (completion_tokens_total > 0 && json.usage) {
+        json.usage.completion_tokens += completion_tokens_total;
+        json.usage.total_tokens += completion_tokens_total;
+    }
+
+    res.write(JSON.stringify(json));
+    res.end();
+    return true;
+}
+
+function mergeToolCall(tool_calls: Map<number, PartialToolCall>, idx: number, tc: ToolCall): void {
+    let cur = tool_calls.get(idx);
+    if (!cur) {
+        cur = { id: "", type: "function", function_name: "", function_args: "" };
+        tool_calls.set(idx, cur);
+    }
+
+    if (tc.id) cur.id = tc.id;
+    if (tc.type) cur.type = tc.type;
+
+    if (tc.function) {
+        if (tc.function.name) cur.function_name = tc.function.name;
+        if (tc.function.arguments) cur.function_args += tc.function.arguments;
+    }
+}
+
+function collapseToolCalls(tool_calls: Map<number, PartialToolCall>): ToolCall[] {
+    if (tool_calls.size === 0) return [];
+
+    const result: ToolCall[] = [];
+    for (const [, tc] of [...tool_calls.entries()].sort(([a], [b]) => a - b)) {
+        result.push({
+            id: tc.id,
+            type: tc.type,
+            function: {
+                name: tc.function_name,
+                arguments: tc.function_args,
+            },
+        });
+    }
+    return result;
+}
+
+function mergeToolCallLists(prev: ToolCall[] | undefined, next: ToolCall[] | undefined): ToolCall[] | undefined {
+    if (!prev || prev.length === 0) return next;
+    if (!next || next.length === 0) return prev;
+
+    const merged = new Map<number, ToolCall>();
+    for (const tc of prev) merged.set(tc.index ?? 0, tc);
+    for (const tc of next) {
+        const idx = tc.index ?? 0;
+        const existing = merged.get(idx);
+        if (existing && existing.function && tc.function) {
+            merged.set(idx, {
+                ...tc,
+                function: {
+                    name: tc.function.name ?? existing.function.name,
+                    arguments: (existing.function.arguments ?? "") + (tc.function.arguments ?? ""),
+                },
+            });
+        } else {
+            merged.set(idx, tc);
+        }
+    }
+    return [...merged.values()];
+}
+
+// A response is truncated due to context window size if the pending frame
+// contains finish_reason === 'length'.
+//
+// If the original request specified a max_tokens, we also evaluate whether
+// completion_tokens < max_tokens
+function isTruncated(completion_tokens: number, finish_reason?: string, max_tokens?: number): boolean {
+    if (finish_reason !== "length") return false;
+    return max_tokens === undefined || completion_tokens < max_tokens;
+}
+
+function buildContinuation(
+    original_body: CompletionRequest,
+    content: string,
+    reasoning?: string,
+    tool_calls?: ToolCall[],
+    completion_tokens?: number,
+): ContinuedRequest {
+    const messages = [...original_body.messages];
+
+    const msg: Record<string, unknown> = { role: "assistant", content };
+    if (reasoning) {
+        msg.reasoning_content = reasoning;
+    }
+    if (tool_calls && tool_calls.length > 0) {
+        msg.tool_calls = tool_calls;
+    }
+
+    const last = messages[messages.length - 1];
+    if (last && last.role === "assistant") {
+        msg.content = (last.content ?? "") + content;
+        msg.reasoning_content = (last.reasoning_content ?? "") + (reasoning ?? "");
+        msg.tool_calls = mergeToolCallLists(last.tool_calls as ToolCall[] | undefined, tool_calls);
+        messages[messages.length - 1] = msg as any;
+    } else {
+        messages.push(msg as any);
+    }
+
+    const { max_tokens, ...rest } = original_body;
+
+    // if the original request specified max_tokens, calc a new max_tokens for the continuation
+    const continued_max_tokens = max_tokens !== undefined && completion_tokens !== undefined
+        ? max_tokens - completion_tokens
+        : undefined;
+
+    return {
+        ...rest,
+        messages,
+        continue_final_message: true,
+        add_generation_prompt: false,
+        max_tokens: continued_max_tokens,
+    };
 }
 
 function sendError(res: ExpressResponse, status: number, type: string, message: string): void {

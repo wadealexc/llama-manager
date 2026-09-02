@@ -1,15 +1,16 @@
 import type { ReloadParams, SlotSave } from "../client/types.js";
-import type { ModelEntry, ModelRole, StrategyId } from "../config/types.js";
+import type { ModelState, StrategyId } from "../config/types.js";
 
-export interface StrategyContext {
-    target: ModelRole;
-    models: Partial<Record<ModelRole, ModelEntry>>;
+export interface ActionContext {
+    slots?: SlotSave[];
+    signal: AbortSignal;
 }
 
 export interface Strategy {
     id: StrategyId;
-    canApply(ctx: StrategyContext): boolean;
-    applyNoSend(ctx: StrategyContext, params: ReloadParams, saves?: SlotSave[]): Promise<ReloadParams>;
-    apply(ctx: StrategyContext): Promise<void>;
-    beforeRequest?(ctx: StrategyContext, req: unknown): Promise<unknown | void>;
+    canApply(state: ModelState): boolean;
+    getNewState(cur: ModelState): ModelState;
+    getNewParams(params: ReloadParams): ReloadParams;
+
+    action?(ctx: ActionContext): Promise<void>;
 }

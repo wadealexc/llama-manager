@@ -23,7 +23,7 @@ model_load:
     poll_timeout_ms: 50000
 
 models:
-    main:
+    qwen3.8-27b:
         model: /home/fox/kitsu/models/qwen3.8-dense-mtp/Qwen3.8-27B-UD-Q4_K_XL.gguf
         mmproj: /home/fox/kitsu/models/qwen3.8-dense-mtp/mmproj-BF16.gguf
 
@@ -33,14 +33,11 @@ models:
         fit-target: 512
         n-gpu-layers: 99
 
-        # Manager-specific config
-        name: qwen3.8-27b
-        expected_response_tokens: 65000
-        ladder: [disable-spec, evict-task-model]
-    task:
+        ladder: [disable-spec, mmproj-to-cpu]
+    qwen3.5-9b:
         model: /home/fox/kitsu/models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf
         mmproj: /home/fox/kitsu/models/qwen3.5-9b/mmproj-BF16.gguf
 
-        # Manager-specific config
-        name: qwen3.5-9b
-        expected_response_tokens: 16000
+        ladder: []
+
+default_models: [qwen3.8-27b, qwen3.5-9b]

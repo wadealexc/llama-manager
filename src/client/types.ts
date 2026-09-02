@@ -3,6 +3,10 @@ export interface InputTokensResponse {
     object: string;
 }
 
+export interface FitResponse {
+    n_ctx: number;
+}
+
 export type SpeculativeType = 
     "none" | "draft-simple" | "draft-eagle3" | "draft-mtp" | "draft-dflash" | (string & {});
 

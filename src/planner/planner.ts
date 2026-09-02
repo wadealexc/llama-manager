@@ -1,17 +1,12 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import { LoadStatus, type ManagerConfig, type ModelId, type ModelRole } from "../config/types.js";
-import type { ReloadParams, SlotSave } from "../client/types.js";
+import { LoadStatus, type ManagerConfig, type ModelId } from "../config/types.js";
 import { logger } from "../logger.js";
-import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
-import type { ModelEntry, StrategyId } from "../config/types.js";
-import type { Strategy } from "./types.js";
-import { createStrategies } from "./strategies/index.js";
-import { CostModel } from "./cost-model.js";
-import type { CostModelCache } from "./cost-model.js";
 import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { Timer } from "./timer.js";
+import type { ModelEntry, RestorePoint } from "./model-entry.js";
+import type { MemoryResponse } from "../client/types.js";
 
 
 const log: ConsolaInstance = logger.withTag('planner');
@@ -20,16 +15,11 @@ export interface Client {
     completions(body: unknown, model: ModelId, signal: AbortSignal): Promise<Response>;
 }
 
-type PlannerCallback = (body: unknown, client: Client, signal: AbortSignal) => Promise<void>;
-
-type TokenRequirement = {
-    tokens_in: number;
-    est_tokens_out?: number;
-}
+type PlannerCallback = (body: unknown, client: Client, signal: AbortSignal, isFinal: boolean) => Promise<boolean>;
 
 type ActiveState = {
     pending: boolean;
-    model: ModelId;
+    model?: ModelId;     // may be undefined while pending
     readers: number;
 }
 
@@ -37,192 +27,215 @@ type ReadHandle = {
     release(): void;
 }
 
+type PausedReader = {
+    resolve(): void;
+    reject(err?: any): void;
+}
+
 type Waiter = {
     model: ModelId;
-    req: TokenRequirement;
     resolve: (handle: ReadHandle) => void;
     reject: (reason: any) => void;
 }
 
-type Plan = {
-    strategies: StrategyId[];
-    n_ctx: number;
+type RestoreInfo = {
+    point: RestorePoint;
+    bytes_needed: number;
 }
 
-export type RestorePoint = {
-    n_ctx: number;
-    strategies: StrategyId[];
-    slots?: SlotSave[];
+type DeviceInfo = {
+    bytes_total: number;
+    bytes_avail: number;
 }
 
 export class Planner {
 
     client: LlamaAPI;
     config: ManagerConfig;
-    cm: CostModel;
+
+    models: Map<ModelId, ModelEntry> = new Map();
+
+    active: ActiveState | null = null;
+    weights_only: Set<ModelId> = new Set();
+    waiting: Waiter[] = [];
+    waiting_grow: PausedReader[] = [];
+
+    restore_info: Map<ModelId, RestoreInfo> = new Map();
+
+    // TODO - may need to incorporate fit_target_overhead for 'available'
+    dev_info: DeviceInfo = {
+        bytes_total: 0,
+        bytes_avail: 0,
+    };
 
     shutdown_ctrl: AbortController = new AbortController();
 
-    models: Partial<Record<ModelRole, ModelEntry>>;
-    model_to_role: Map<ModelId, ModelRole> = new Map();
-
-    // TODO: reset on idle
-    restore_points: Map<ModelId, RestorePoint> = new Map();
-
-    // Map model -> number of strategies applied from ladder -> measured max ctx
-    max_ctx: Map<ModelId, Map<number, number>> = new Map();
-
-    active: ActiveState | null = null;
-    waiting: Waiter[] = [];
-
-    strategies: Map<StrategyId, Strategy>;
-
-    constructor(client: LlamaAPI, config: ManagerConfig) {
+    constructor(client: LlamaAPI, config: ManagerConfig, models: Map<ModelId, ModelEntry>) {
         this.client = client;
         this.config = config;
-        this.models = config.models;
-
-        const model_main = this.models['main'];
-        const model_task = this.models['task'];
-        // only main model is required
-        if (!model_main) throw new Error(`Planner: expected main model`);
-        this.model_to_role.set(model_main.name, 'main');
-        this.max_ctx.set(model_main.name, new Map());
-
-        if (model_task) {
-            this.max_ctx.set(model_task.name, new Map());
-            this.model_to_role.set(model_task.name, 'task');
-        }
-
-        this.strategies = createStrategies(client);
-
-        this.cm = new CostModel(this.client);
+        this.models = models;
     }
 
-    async initCostModel(config_path: string, force_build: boolean): Promise<void> {
-        const cache = await this.cm.initCostModel({ 
-            config_path, 
-            force_build,
-            models: this.models,
-            strategies: this.strategies,
-            signal: this.shutdown_ctrl.signal,
-        });
+    // Note: not intended to be called twice
+    // TODO - will need to adjust bytes_available calc after implementing idle
+    async serveDefault(): Promise<void> {
+        const t = new Timer('serveDefault');
 
-        this.#applyCostModelCache(cache);
-        await this.#unloadAllModels();
-    }
-
-    #applyCostModelCache(cache: CostModelCache): void {
-        const model_main = this.models['main']!;
-
-        for (const [name, data] of Object.entries(cache.models)) {
-            const entry = this.entry(name);
-            if (!entry) {
-                log.warn(`cost model cache: model ${name} not in config; ignoring`);
+        let first_loaded: ModelEntry | undefined;
+        for (const id of this.config.default_models) {
+            const model = this.models.get(id);
+            if (!model) {
+                log.warn(`serveDefault: model ${id} not found; skipping`);
                 continue;
             }
 
-            const max_ctx = new Map<number, number>();
-            for (const [k, v] of Object.entries(data.max_ctx)) {
-                max_ctx.set(Number(k), v);
+            if (model.status !== LoadStatus.UNLOADED) {
+                log.warn(`serveDefault: model ${id} already loaded; skipping`);
+                continue;
             }
-            this.max_ctx.set(name, max_ctx);
 
-            entry.ladder = data.ladder;
-            entry.applied = [];
-
-            const baseline = max_ctx.get(0);
-            if (baseline !== undefined) {
-                entry.initial_state.n_ctx = baseline;
-                entry.current_state = { ...entry.initial_state };
+            try {
+                log.info(`serveDefault: loading weights for ${id}`);
+                await model.loadWeights(this.shutdown_ctrl.signal, t);
+                this.weights_only.add(id);
+            } catch (err) {
+                log.error(`serveDefault: unable to load weights for model ${id}; skipping`);
+                continue;
             }
+
+            // on first successful load: init device memory info
+            if (!first_loaded) {
+                first_loaded = model;
+
+                const mem = await this.client.getMemory(id, this.shutdown_ctrl.signal);
+                this.dev_info = {
+                    bytes_total: calcTotalBytesOnDevice(mem),
+                    bytes_avail: calcFreeBytes(mem),
+                };
+            } else {
+                // update memory info
+                this.#updateMem(await this.client.getMemory(id, this.shutdown_ctrl.signal));
+            }
+
+            log.info(`memory after load: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
         }
 
-        const main_baseline = this.max_ctx.get(model_main.name)?.get(0);
-        if (main_baseline !== undefined) {
-            this.restore_points.set(model_main.name, { n_ctx: main_baseline, strategies: [] });
+        if (!first_loaded || this.weights_only.size === 0) {
+            throw new Error(`serveDefault: unable to load any models`);
         }
-    }
 
-    async serveDefault(): Promise<void> {
-        const model_main = this.models['main']!;
-        const model_task = this.models['task'];
+        log.info(`serveDefault: loaded weights for ${this.weights_only.size} models`);
 
-        if (model_main.status !== LoadStatus.UNLOADED) throw new Error(`expected main model to be unloaded`);
-        if (model_task?.status !== LoadStatus.UNLOADED) throw new Error(`expected task model to be unloaded`);
+        // first model loaded gets a kv
+        log.info(`serveDefault: loading kvcache for ${first_loaded.name}`);
+        const ctx = await first_loaded.loadWithKV(null, this.shutdown_ctrl.signal, t);
+        log.info(`serving ${first_loaded.name} with a context window of ${ctx} tokens`);
 
-        const count = model_task ? 2 : 1;
-
-        const t = performance.now();
-        await Promise.all([
-            this.#loadAndRestore(model_main),
-            model_task ? this.#loadWeights(model_task) : Promise.resolve()
-        ]);
-        const load_sec = ((performance.now() - t) / 1000).toFixed(2);
-        log.info(`loaded ${count} models in ${load_sec} sec`);
+        // update memory info
+        this.#updateMem(await this.client.getMemory(first_loaded.name, this.shutdown_ctrl.signal));
+        log.info(`memory: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
 
         this.active = {
             pending: false,
-            model: model_main.name,
+            model: first_loaded.name,
             readers: 0,
         };
     }
 
-    async decide(body: unknown, model: ModelId, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
+    async serveModel(body: unknown, model: ModelEntry, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
+        const t = new Timer(`serveModel: ${model.name}`);
 
-        // tokenize input and estimate required tokens
-        const req = await this.#withModel(model, { tokens_in: 0 }, async (entry: ModelEntry) => {
-            const tokens_in = await this.client.countTokens(body, model, signal);
-            const est_tokens_out = tokens_in + entry.expected_response_tokens;
-            const n_ctx = entry.current_state.n_ctx;
-            log.debug(`req ${model} (cur ctx: ${n_ctx} | in: ${tokens_in}, out_estimate: ${est_tokens_out})`);
-
-            return {
-                tokens_in,
-                est_tokens_out: est_tokens_out,
-            };
-        });
-
-        // validate that we are able to serve the request
-        const max_tokens_possible = this.#maxTokensForModel(model);
-        if (req.tokens_in > max_tokens_possible) {
-            throw new Error(`unable to serve request for ${model}; tokens in: ${req.tokens_in} | max tokens: ${max_tokens_possible}`);
-        }
-
-        if (!this.canServeImmediately(model, req)) {
-            log.debug(`req ${model}: can't serve immediately, queuing`);
+        if (!this.canServeNow(model)) {
+            log.debug(`req ${model.name}: can't serve request, queuing`);
         }
 
         // stream from model when token requirement is met
-        await this.#withModel(model, req, async (entry: ModelEntry) => {            
-            const n_ctx = entry.current_state.n_ctx;
-            if (n_ctx < req.est_tokens_out) {
-                log.warn(
-                    `unable to guarantee entire context for ${model}: `,
-                    `in: ${req.tokens_in} | requested: ${req.est_tokens_out} | got: ${n_ctx}`
-                );
-            }
+        await this.#withModel(model, t, async (t?: Timer) => {
+            t?.start('completions callback');
+            let success = await cb(body, this.client, signal, false);
+            t?.stop();
 
-            await cb(body, this.client, signal);
-        });
+            // failure indicates the response was truncated and we need to increase the ctx window
+            while (!success) {
+                try {
+                    await this.#waitForGrow(model, t?.child('waitForGrow'));
+                } catch {
+                    // if unable to grow, inform via callback
+                    success = await cb(body, this.client, signal, true);
+                    break;
+                }
+
+                t?.start('completions callback');
+                success = await cb(body, this.client, signal, false);
+                t?.stop();
+            }
+        }).finally(() => print(t));
     }
 
-    async #withModel<T>(model: ModelId, req: TokenRequirement, cb: (entry: ModelEntry) => Promise<T>): Promise<T> {
+    // attempt to expand the model's context window. if there are other active readers,
+    // add a waiter to `waiting_grow` until all readers are waiting for grow.
+    async #waitForGrow(model: ModelEntry, t?: Timer): Promise<void> {
+        if (this.waiting_grow.length + 1 < this.active!.readers) {
+            await new Promise<void>((resolve, reject) => {
+                this.waiting_grow.push({ resolve, reject });
+            });
+            return;
+        }
+
+        await this.#growModel(model, t);
+    }
+
+    async #growModel(model: ModelEntry, t?: Timer): Promise<void> {
+        if (!this.active || this.active.model !== model.name) {
+            throw new Error(`#growModel: expected ${model.name} to be active`);
+        }
+
+        this.active.pending = true;
+
+        try {
+            // if there are idle weights_only models, evict to make space, then expand to fill
+            // we only apply strategies if we can't evict other models
+            if (this.weights_only.size !== 0) {
+                await this.#unloadAllModels(true, model.name, t?.child('unloadAllModels'));
+                await model.expandToFit(this.shutdown_ctrl.signal, t?.child('growModel'));
+            } else if (model.hasNextStrategy()) {
+                await model.applyNextStrategy(this.shutdown_ctrl.signal, t?.child('applyNextStrategy'));
+            } else {
+                throw new Error(`strategies exhausted`);
+            }
+        } catch (err) {
+            // cannot grow further. release waiters and throw
+            const msg = err instanceof Error ? err.message : String(err);
+            const waiting = this.waiting_grow.splice(0);
+            for (const waiter of waiting) waiter.reject(msg);
+            throw new Error(`#growModel error: ${msg}`);
+        } finally {
+            this.active.pending = false;
+        }
+
+        // update available memory
+        const mem = await this.client.getMemory(model.name, this.shutdown_ctrl.signal);
+        this.#updateMem(mem);
+
+        const waiting = this.waiting_grow.splice(0);
+        for (const w of waiting) w.resolve();
+    }
+
+    async #withModel<T>(model: ModelEntry, t: Timer, cb: (t?: Timer) => Promise<T>): Promise<T> {
         let handle: ReadHandle;
-        if (this.canServeImmediately(model, req)) {
+        if (this.canServeNow(model)) {
             this.active!.readers++;
             handle = this.#getHandle();
         } else {
             handle = await new Promise((resolve, reject) => {
-                this.waiting.push({ model, req, resolve, reject });
-                this.#maybeTransition();
+                this.waiting.push({ model: model.name, resolve, reject });
+                this.#maybeSwap(t.child(`maybeSwap`));
             });
         }
 
         try {
-            const entry = this.entry(model)!;
-            return await cb(entry);
+            return await cb(t);
         } finally {
             handle.release();
         }
@@ -233,113 +246,141 @@ export class Planner {
             release: () => {
                 if (this.active) {
                     this.active.readers--;
-                    if (this.active.readers !== 0) return;
+
+                    // we still have active readers and no grow required
+                    if (this.active.readers !== 0 && this.waiting_grow.length !== this.active.readers) {
+                        return;
+                    }
+
+                    // we have active readers and all are waiting for grow
+                    if (this.waiting_grow.length > 0 && this.waiting_grow.length === this.active.readers) {
+                        const model = this.models.get(this.active.model!)!;
+                        this.#growModel(model).catch(err => log.error(`#growModel error: ${err}`));
+                        return;
+                    }
                 }
 
-                this.#maybeTransition();
+                // we don't have active readers; swap model
+                this.#maybeSwap();
             }
         }
     }
 
-    async #maybeTransition(): Promise<void> {
+    async #maybeSwap(t?: Timer): Promise<void> {
         if (this.active && (this.active.readers !== 0 || this.active.pending)) {
             return;
         }
 
-        let model: ModelEntry;
-        let plan: Plan | undefined = {
-            n_ctx: 0,
-            strategies: [],
-        };
+        // get first entry from queue
+        if (this.waiting.length === 0) return;
+        const waiter = this.waiting.shift()!;
+        const target = this.models.get(waiter.model)!;
 
-        while (true) {
-            if (this.waiting.length === 0) {
-                return;
-            }
-
-            const head: Waiter = this.waiting[0];
-            model = this.entry(head.model)!;
-
-            const idx = this.#largestRequestForModel(model.name);
-            if (idx === undefined) {
-                throw new Error(`#maybeTransition: could not find request for ${model.name}`);
-            }
-
-            const largest = this.waiting.at(idx)!;
-            plan = this.#getMinAddtlStrategies(model.name, largest.req);
-            if (plan !== undefined) {
-                break;
-            }
-
-            // unable to apply: reject/remove request and move to the next one
-            try {
-                largest.reject(`unable to serve request: insufficient tokens when all strategies applied`);
-            } catch (err: any) {
-                log.error(`error rejecting largest request: ${err}`);
-            }
-
-            this.waiting.splice(idx, 1);
-            log.info(
-                `removed request to ${model.name}; max servable: ${this.#maxTokensForModel(model.name)} ` +
-                `req: (tokens_in: ${largest.req.tokens_in} | est_tokens_out: ${largest.req.est_tokens_out})`
-            );
-        }
-
-        if (!this.active) {
-            this.active = { pending: true, model: model.name, readers: 0 };
-        }
-
-        const prior_active = this.entry(this.active.model)!;
-        this.active.pending = true;
-        this.active.model = model.name;
-
-        const t = new Timer(`maybeTransition: serve ${model.name}`);
-
-        if (prior_active.name !== model.name) {
-            let label = `${prior_active.name}: stashKV`;
-            await this.#stashKV(prior_active, t.child(label));
-        }
-
-        if (model.status === LoadStatus.UNLOADED) {
-            let label = `${model.name}: loadWeights`;
-            await this.#loadWeights(model, t.child(label));
-        }
-
-        const restore_point = this.#getOrCreateRestore(model);
-
-        if (plan.strategies.length > 0) {
-            restore_point.n_ctx = plan.n_ctx;
-            restore_point.strategies = [...restore_point.strategies, ...plan.strategies];
-
-            log.info(`${model.name}: applying ${plan.strategies.length} strategies to increase ctx to ${plan.n_ctx}`);
-
-            // if the model has a kvcache, save it
-            if (model.status === LoadStatus.LOADED) {
-                log.debug(`${model.name}: caching slots`);
-                t.start(`saveAllSlots`);
-                restore_point.slots = await this.client.saveAllSlots(model.name, this.shutdown_ctrl.signal);
-                t.stop();
+        if (this.active) {
+            this.active.pending = true;
+        } else {
+            this.active = {
+                pending: true,
+                readers: 0,
             }
         }
 
-        let label = `${model.name}: applyRestore`;
-        await this.#applyRestore(model, restore_point, t.child(label));
-        this.restore_points.delete(model.name);
+        const restore = this.restore_info.get(target.name);
+        const bytes_needed = restore?.bytes_needed;
+
+        // free space on the device for the target model
+        // if we don't know how much space is needed, unload all other models
+        if (bytes_needed === undefined) {
+            log.info(`unknown bytes needed for model ${target.name}; unloading idle models`);
+            await this.#unloadAllModels(true, target.name, t?.child('unloadAllModels'));
+        } else if (bytes_needed > this.dev_info.bytes_avail) {
+            log.info(`freeing ${fmtBytes(bytes_needed)} for model ${target.name}`);
+            await this.#free(target, bytes_needed, t?.child('free'));
+
+            if (bytes_needed > this.dev_info.bytes_avail) {
+                throw new Error(`maybeSwap: unable to free all requested bytes`);
+            }
+        }
+
+        // load target model
+        await target.loadWithKV(restore?.point ?? null, this.shutdown_ctrl.signal, t?.child(`loadWithKV(${target.name})`));
+        this.#updateMem(await this.client.getMemory(target.name, this.shutdown_ctrl.signal));
 
         this.active.pending = false;
+        this.active.model = target.name;
+        this.active.readers++;
+        this.weights_only.delete(target.name);
 
-        print(t);
+        // serve request
+        waiter.resolve(this.#getHandle());
 
-        // fire any waiters satisfied by new active state
-        const ready = this.waiting.filter((w) =>
-            w.model === model.name && this.canServeImmediately(model.name, w.req)
-        );
-
-        this.waiting = this.waiting.filter(w => !ready.includes(w));
-        for (const r of ready) {
-            this.active.readers++;
-            r.resolve(this.#getHandle());
+        // serve any other requests waiting for this model
+        for (const w of this.waiting) {
+            if (w.model === target.name) {
+                this.active.readers++;
+                w.resolve(this.#getHandle());
+            }
         }
+    }
+
+    // free space on the gpu by stashing idle models' kvcaches and/or evicting weights
+    async #free(target_model: ModelEntry, bytes_needed: number, t?: Timer): Promise<void> {
+        if (this.dev_info.bytes_avail > bytes_needed) {
+            log.info(`#free not needed (avail: ${fmtBytes(this.dev_info.bytes_avail)} | needed: ${fmtBytes(bytes_needed)})`);
+            return;
+        }
+
+        // stash kv for currently-loaded model
+        const active_id = this.active?.model;
+        if (active_id !== undefined && active_id !== target_model.name) {
+            const active_model = this.models.get(active_id)!;
+
+            let mem = await this.client.getMemory(active_id, this.shutdown_ctrl.signal);
+            const free_before = calcFreeBytes(mem);
+
+            log.info(`unloading kv for model: ${active_id}`);
+            const restore_point = await active_model.unloadKV(this.shutdown_ctrl.signal, t);
+
+            // update device memory and tracking
+            mem = await this.client.getMemory(active_id, this.shutdown_ctrl.signal);
+            const free_after = calcFreeBytes(mem);
+
+            if (restore_point) {
+                // bytes needed to restore = bytes freed when unloading KV
+                this.restore_info.set(active_id, {
+                    point: restore_point,
+                    bytes_needed: free_after - free_before,
+                });
+            }
+
+            this.#updateMem(mem);
+            this.active!.model = undefined;
+            this.weights_only.add(active_id);
+
+            if (this.dev_info.bytes_avail > bytes_needed) return;
+        }
+
+        if (this.weights_only.size === 0) {
+            const b = bytes_needed - this.dev_info.bytes_avail;
+            log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
+            return;
+        }
+
+        log.info(`unloading weights for idle models`);
+        t = t?.child('unloadWeights');
+
+        // evict weights for all weights-only models
+        for (const id of this.weights_only) {
+            if (id === target_model.name) continue;
+            const model = this.models.get(id)!;
+
+            this.#unloadWithRestore(model, t);
+
+            if (this.dev_info.bytes_avail > bytes_needed) return;
+        }
+
+        const b = bytes_needed - this.dev_info.bytes_avail;
+        log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
     }
 
     async reset(model: ModelId): Promise<void> {
@@ -347,20 +388,26 @@ export class Planner {
     }
 
     async shutdown(): Promise<void> {
-        await this.#unloadAllModels().catch(err => {
+        const t = new Timer(`Planner.shutdown`);
+
+        t.start('unloadAllModels');
+        await this.#unloadAllModels(false).catch(err => {
             log.warn(`shutdown: unloadAllModels error: ${err}`);
         });
+        t.stop();
 
-        log.info(`shutdown: canceling ${this.waiting.length} jobs`);
+        t.start(`cancel ${this.waiting.length} jobs`);
         const waiting = this.waiting.splice(0, this.waiting.length);
         for (const w of waiting) {
-            try { w.reject('shutting down') } catch {}
+            try { w.reject('shutting down') } catch { }
         }
+        t.stop();
 
-        log.info(`shutdown: cleaning up slot cache`);
+        t.start(`cleanupSlots`);
         await this.#cleanupSlots().catch(err => {
             log.warn(`shutdown: cleanupSlots error: ${err}`);
         });
+        t.stop();
 
         this.shutdown_ctrl.abort('shutdown request received');
         log.info(`shutdown: done`);
@@ -381,254 +428,173 @@ export class Planner {
         await Promise.allSettled(targets.map(n => unlink(join(dir, n))));
     }
 
-    async #unloadAllModels(): Promise<void> {
-        const model_main = this.models['main']!;
-        const model_task = this.models['task'];
+    async #unloadAllModels(stash_kv: boolean, exclude?: ModelId, t?: Timer): Promise<void> {
+        let promises: Promise<void>[] = [];
 
-        let count = 0;
-        if (model_main.status !== LoadStatus.UNLOADED) count++;
-        if (model_task?.status !== LoadStatus.UNLOADED) count++;
-        if (count === 0) return;
+        const active_id = this.active?.model;
+        if (active_id && active_id !== exclude) {
+            const model = this.models.get(active_id)!;
 
-        log.info(`unloading ${count} models`);
-        const t = performance.now();
-        await Promise.all([
-            this.#unloadWeights(model_main),
-            model_task ? this.#unloadWeights(model_task) : Promise.resolve(),
-        ]);
-        const unload_sec = ((performance.now() - t) / 1000).toFixed(2);
-        log.info(`unloaded ${count} models in ${unload_sec} sec`);
-    }
-
-    // fresh load model weights
-    async #loadWeights(model: ModelEntry, t?: Timer): Promise<void> {
-        if (model.status !== LoadStatus.UNLOADED) return;
-        model.status = LoadStatus.WEIGHTS_ONLY;
-
-        t?.start(`loadWeights`);
-        await this.client.loadModelAndWait(model.name, this.shutdown_ctrl.signal);
-        t?.stop();
-    }
-
-    // unload model weights and kvcache. does not save restore point
-    async #unloadWeights(model: ModelEntry): Promise<void> {
-        if (model.status === LoadStatus.UNLOADED) return;
-        model.status = LoadStatus.UNLOADED;
-
-        await this.client.unloadModelAndWait(model.name, this.shutdown_ctrl.signal);
-
-        model.applied = [];
-        model.current_state = model.initial_state;
-    }
-
-    // restore a model to its last-seen state. loads weights if needed
-    async #loadAndRestore(model: ModelEntry): Promise<void> {
-        if (model.status === LoadStatus.LOADED) return;
-
-        if (model.status === LoadStatus.UNLOADED) {
-            await this.#loadWeights(model);
-        }
-
-        const restore_point = this.#getOrCreateRestore(model);
-
-        await this.#applyRestore(model, restore_point);
-        this.restore_points.delete(model.name);
-    }
-
-    async #applyRestore(model: ModelEntry, point: RestorePoint, t?: Timer): Promise<void> {
-        if (model.status === LoadStatus.UNLOADED) {
-            throw new Error(`#applyRestore: expected model weights for ${model.name}`);
-        }
-
-        model.status = LoadStatus.LOADED;
-
-        let params: ReloadParams = { n_ctx: point.n_ctx };
-        log.info(
-            `#applyRestore: ${model.name} applying ${point.strategies.length} strategies; `,
-            `n_ctx: ${point.n_ctx}`
-        );
-
-        for (const strategy of point.strategies) {
-            if (model.applied.includes(strategy)) {
-                continue;
-            }
-            
-            const impl = this.strategies.get(strategy)!;
-
-            const ctx = {
-                target: this.model_to_role.get(model.name)!,
-                models: this.models
-            };
-
-            try {
-                log.debug(`applying strategy: ${strategy}`);
-                t?.start(`${strategy}`);
-                params = await impl.applyNoSend(ctx, params, point.slots);
-                t?.stop();
-            } catch (err: any) {
-                throw new Error(`#applyRestore: error applying ${strategy} to ${model.name}: ${err}`);
+            if (!stash_kv) {
+                promises.push(this.#unloadNoRestore(model, t));
+            } else {
+                promises.push(this.#unloadWithRestore(model, t));
             }
         }
 
-        // reload model with new params and restore slot info
-        t?.start(`reloadModel`);
-        await this.client.reloadModel(params, model.name, this.shutdown_ctrl.signal);
-        t?.stop();
-        if (point.slots) {
-            log.info(`#applyRestore: ${model.name} restoring slots`);
-            t?.start(`restoreAllSlots`);
-            await this.client.restoreAllSlots(model.name, point.slots, this.shutdown_ctrl.signal);
-            t?.stop();
+        for (const id of this.weights_only) {
+            if (id === exclude) continue;
+
+            const model = this.models.get(id)!;
+            if (!stash_kv) {
+                promises.push(this.#unloadNoRestore(model, t));
+            } else {
+                promises.push(this.#unloadWithRestore(model, t));
+            }
         }
 
-        model.applied = [...point.strategies];
-        model.current_state.n_ctx = point.n_ctx;
-        log.debug(`#applyRestore: done; serving ${model.name} at ${point.n_ctx} ctx`);
+        log.info(`unloading ${promises.length} models${stash_kv ? ' with restore' : ''}`);
+        await Promise.allSettled(promises);
     }
 
-    // unload a model's kvcache and save a restore point for later
-    async #stashKV(model: ModelEntry, t?: Timer): Promise<void> {
-        if (model.status !== LoadStatus.LOADED) return;
-        model.status = LoadStatus.WEIGHTS_ONLY;
-
-        const restore: RestorePoint = {
-            n_ctx: model.current_state.n_ctx,
-            strategies: [...model.applied],
-        };
-
-        // we only save kvcaches from main models
-        if (model.role === 'main') {
-            t?.start('saveAllSlots');
-            restore.slots = await this.client.saveAllSlots(model.name, this.shutdown_ctrl.signal);
-            t?.stop();
-        }
-
-        t?.start('reloadModel');
+    async #unloadNoRestore(model: ModelEntry, t?: Timer): Promise<void> {
         try {
-            await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, model.name, this.shutdown_ctrl.signal);
-        } catch (err: any) {
-            throw new Error(`#stashKV: error setting ${model.name} to min ctx: ${err}`);
-        }
-        t?.stop();
+            const mem = await this.client.getMemory(model.name, this.shutdown_ctrl.signal);
+            const bytes_used = calcTotalBytesForModel(mem);
 
-        this.restore_points.set(model.name, restore);
-        model.current_state.n_ctx = MIN_ALLOWED_CTX;
-    }
+            await model.unloadHard(t);
 
-    #maxTokensForModel(model: ModelId): number {
-        const entry = this.entry(model);
-        if (!entry) {
-            return 0;
-        }
-
-        const n_strats = entry.ladder.length;
-        return this.max_ctx.get(model)!.get(n_strats) ?? 0;
-    }
-
-    #largestRequestForModel(model: ModelId): number | undefined {
-        let max = -1;
-        let idx: number = -1;
-        for (const [i, waiter] of this.waiting.entries()) {
-            if (waiter.model !== model) continue;
-
-            if (waiter.req.tokens_in > max) {
-                max = waiter.req.tokens_in;
-                idx = i;
-            }
-        }
-
-        return idx === -1 ? undefined : idx;
-    }
-
-    // get the fewest additional strategies on top of currently-applied that will serve the request
-    // evaluates using previous_state if model is not active
-    // return undefined if unable to serve
-    #getMinAddtlStrategies(model: ModelId, req: TokenRequirement): Plan | undefined {
-        const plan: Plan = { strategies: [], n_ctx: 0 };
-        const entry = this.entry(model)!;
-        const ctx_per_strats = this.max_ctx.get(model)!;
-        const ctx_required = req.est_tokens_out ?? req.tokens_in;
-
-        // get currently applied, or load from previous state
-        let applied: StrategyId[] = [];
-        if (entry.status !== LoadStatus.UNLOADED) {
-            applied = entry.applied;
-        } else {
-            const restore = this.restore_points.get(model);
-            if (restore) {
-                applied = restore.strategies;
-            }
-        }
-
-        // no additional strategies needed
-        const n_applied = applied.length;
-        if (ctx_per_strats.get(n_applied)! >= ctx_required) {
-            return plan;
-        }
-
-        // add strategies until request is satisfied
-        for (const [i, strategy] of entry.ladder.entries()) {
-            if (applied.includes(strategy)) {
-                continue;
+            // remove model from tracking
+            this.weights_only.delete(model.name);
+            if (this.active?.model === model.name) {
+                this.active.model = undefined;
             }
 
-            plan.strategies.push(strategy);
-            plan.n_ctx = ctx_per_strats.get(i + 1)!;
+            this.restore_info.delete(model.name);
 
-            if (plan.n_ctx >= ctx_required) {
-                break;
+            this.#setMemFreed(bytes_used);
+        } catch (err) {
+            throw new Error(`#unloadNoRestore: error unloading weights for model ${model.name}: ${err}`);
+        }
+    }
+
+    async #unloadWithRestore(model: ModelEntry, t?: Timer): Promise<void> {
+        try {
+            const mem = await this.client.getMemory(model.name, this.shutdown_ctrl.signal);
+            const bytes_used = calcTotalBytesForModel(mem);
+
+            // unload model and update restore point, if created
+            const restore_point = await model.unloadWeights(this.shutdown_ctrl.signal, t);
+            if (restore_point) {
+                this.restore_info.set(model.name, {
+                    point: restore_point,
+                    bytes_needed: bytes_used,
+                });
+            } else if (this.restore_info.has(model.name)) {
+                // if we already had a restore point and didn't get one back from unloadWeights,
+                // this model was weights-only. we add bytes_used to the existing restore point
+                this.restore_info.get(model.name)!.bytes_needed += bytes_used;
             }
-        }
 
-        if (plan.n_ctx >= ctx_required) {
-            return plan;
-        } else if (plan.n_ctx >= req.tokens_in) {
-            log.warn(`unable to guarantee requested tokens ${ctx_required} for ${model}; serving ${plan.n_ctx} instead`);
-            return plan;
-        }
-
-        // unable to serve request
-        return undefined;
-    }
-
-    #getOrCreateRestore(model: ModelEntry): RestorePoint {
-        let restore_point = this.restore_points.get(model.name);
-        if (!restore_point) {
-            restore_point = {
-                n_ctx: model.current_state.n_ctx,
-                strategies: [...model.applied],
+            // remove model from tracking
+            this.weights_only.delete(model.name);
+            if (this.active?.model === model.name) {
+                this.active.model = undefined;
             }
+
+            this.#setMemFreed(bytes_used);
+        } catch (err) {
+            throw new Error(`#unloadWithRestore: error unloading weights for model ${model.name}: ${err}`);
+        }
+    }
+
+    #setMemFreed(bytes_freed: number): void {
+        this.dev_info.bytes_avail += bytes_freed;
+
+        if (this.dev_info.bytes_avail > this.dev_info.bytes_total) {
+            log.warn(`#setMemFreed shows available > total `,
+                `(avail: ${fmtBytes(this.dev_info.bytes_avail)} |`,
+                ` total: ${fmtBytes(this.dev_info.bytes_total)})`
+            );
+
+            this.dev_info.bytes_avail = this.dev_info.bytes_total;
+        }
+    }
+
+    #updateMem(mem: MemoryResponse): void {
+        this.dev_info.bytes_avail = calcFreeBytes(mem);
+
+        if (calcTotalBytesOnDevice(mem) != this.dev_info.bytes_total) {
+            log.error(`#updateMem shows total device bytes changed; ignoring (`,
+                `cur: ${fmtBytes(this.dev_info.bytes_total)} | `,
+                `new: ${fmtBytes(calcTotalBytesOnDevice(mem))})`
+            );
         }
 
-        return restore_point;
+        if (this.dev_info.bytes_avail > this.dev_info.bytes_total) {
+            log.warn(`#updateMem shows available > total (`,
+                `avail: ${fmtBytes(this.dev_info.bytes_avail)} | `,
+                `total: ${fmtBytes(this.dev_info.bytes_total)})`
+            );
+
+            this.dev_info.bytes_avail = this.dev_info.bytes_total;
+        }
     }
 
-    entry(model: ModelId): ModelEntry | undefined {
-        const role = this.model_to_role.get(model);
-        return role ? this.models[role] : undefined;
+    resolve(name: ModelId): ModelEntry | undefined {
+        return this.models.get(name);
     }
 
-    role(model: ModelId): ModelRole | undefined {
-        return this.model_to_role.get(model);
-    }
-
-    canServeImmediately(model: ModelId, req: TokenRequirement): boolean {
-        const entry = this.entry(model);
-        if (!entry) return false;
-        if (entry.status !== LoadStatus.LOADED) return false;
-
-        const ctx_cap_reached = entry.applied.length === entry.ladder.length;
-        const meets_token_req = ctx_cap_reached
-            ? entry.current_state.n_ctx >= req.tokens_in
-            : entry.current_state.n_ctx >= (req.est_tokens_out ?? req.tokens_in);
-
+    canServeNow(model: ModelEntry): boolean {
         return (
             this.active !== null
             && !this.active.pending
-            && this.active.model === model
-            && meets_token_req
+            && this.active.model === model.name
+            && model.canPrompt()
         );
     }
+}
+
+// TODO - assumes single GPU
+function calcFreeBytes(mem: MemoryResponse): number {
+    for (const dev of mem.devices) {
+        if (dev.type !== "cpu") return dev.free;
+    }
+    return 0;
+}
+
+// TODO - assumes single GPU
+function calcTotalBytesOnDevice(mem: MemoryResponse): number {
+    for (const dev of mem.devices) {
+        if (dev.type !== "cpu") return dev.total;
+    }
+    return 0;
+}
+
+function calcTotalBytesForModel(mem: MemoryResponse): number {
+    let total = 0;
+
+    const calc = (cmp?: { model: number, context: number, compute: number }): number => {
+        if (!cmp) return 0;
+
+        return cmp.model + cmp.context + cmp.compute;
+    };
+
+    for (const dev of mem.devices) {
+        if (dev.type === "cpu") continue;
+
+        const cmp = dev.components;
+        total += calc(cmp.main);
+        total += calc(cmp.spec);
+        total += calc(cmp.mmproj);
+    }
+
+    return total;
+}
+
+function fmtBytes(bytes: number): string {
+    const gib = bytes / (1024 ** 3);
+    return `${gib.toFixed(2)} GiB`;
 }
 
 function print(t?: Timer) {
