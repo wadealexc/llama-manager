@@ -38,11 +38,6 @@ export interface CompletionRequest {
     [key: string]: unknown;
 }
 
-export type ContinuedRequest = CompletionRequest & {
-    continue_final_message: true;
-    add_generation_prompt: false;
-};
-
 export interface ToolCall {
     index?: number;
     id?: string;

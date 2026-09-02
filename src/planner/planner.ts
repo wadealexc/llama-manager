@@ -135,11 +135,14 @@ export class Planner {
         this.#updateMem(await this.client.getMemory(first_loaded.name, this.shutdown_ctrl.signal));
         log.info(`memory: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
 
+        this.weights_only.delete(first_loaded.name);
         this.active = {
             pending: false,
             model: first_loaded.name,
             readers: 0,
         };
+
+        print(t);
     }
 
     async serveModel(body: unknown, model: ModelEntry, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
@@ -370,7 +373,7 @@ export class Planner {
         t = t?.child('unloadWeights');
 
         // evict weights for all weights-only models
-        for (const id of this.weights_only) {
+        for (const id of [...this.weights_only.keys()]) {
             if (id === target_model.name) continue;
             const model = this.models.get(id)!;
 
@@ -442,7 +445,7 @@ export class Planner {
             }
         }
 
-        for (const id of this.weights_only) {
+        for (const id of [...this.weights_only.keys()]) {
             if (id === exclude) continue;
 
             const model = this.models.get(id)!;
