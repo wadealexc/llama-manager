@@ -64,7 +64,9 @@ if (process.argv.includes('--show-breakpoints')) {
 }
 
 try {
-    await planner.serveDefault();
+    if (process.argv.includes('--serve')) {
+        await planner.serveDefault();
+    }
     await api.start();
 } catch (err) {
     log.error(`startup error: ${err}`);

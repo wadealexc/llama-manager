@@ -56,7 +56,11 @@ export class Planner {
 
     models: Map<ModelId, ModelEntry> = new Map();
 
-    active: ActiveState | null = null;
+    active: ActiveState = {
+        pending: false,
+        readers: 0,
+    };
+
     weights_only: Set<ModelId> = new Set();
     waiting: Waiter[] = [];
     waiting_grow: PausedReader[] = [];
@@ -82,6 +86,8 @@ export class Planner {
     async serveDefault(): Promise<void> {
         const t = new Timer('serveDefault');
 
+        this.active.pending = true;
+
         let first_loaded: ModelEntry | undefined;
         for (const id of this.config.default_models) {
             const model = this.models.get(id);
@@ -106,11 +112,7 @@ export class Planner {
 
             // on first successful load: init device memory info
             const mem = await this.client.getMemory(id, this.shutdown_ctrl.signal);
-            if (!first_loaded) {
-                first_loaded = model;
-
-                this.dev_info = { bytes_total: calcTotalBytesOnDevice(mem), bytes_avail: 0 };
-            }
+            if (!first_loaded) { first_loaded = model; }
 
             this.#updateMem(mem);
         }
@@ -173,7 +175,7 @@ export class Planner {
     // attempt to expand the model's context window. if there are other active readers,
     // add a waiter to `waiting_grow` until all readers are waiting for grow.
     async #waitForGrow(model: ModelEntry, t?: Timer): Promise<void> {
-        if (this.waiting_grow.length + 1 < this.active!.readers) {
+        if (this.waiting_grow.length + 1 < this.active.readers) {
             await new Promise<void>((resolve, reject) => {
                 this.waiting_grow.push({ resolve, reject });
             });
@@ -184,7 +186,7 @@ export class Planner {
     }
 
     async #growModel(model: ModelEntry, t?: Timer): Promise<void> {
-        if (!this.active || this.active.model !== model.name) {
+        if (this.active.model !== model.name) {
             throw new Error(`#growModel: expected ${model.name} to be active`);
         }
 
@@ -228,7 +230,7 @@ export class Planner {
     async #withModel<T>(model: ModelEntry, t: Timer, cb: (t?: Timer) => Promise<T>): Promise<T> {
         let handle: ReadHandle;
         if (this.canServeNow(model)) {
-            this.active!.readers++;
+            this.active.readers++;
             handle = this.#getHandle();
         } else {
             handle = await new Promise((resolve, reject) => {
@@ -247,20 +249,18 @@ export class Planner {
     #getHandle(): ReadHandle {
         return {
             release: () => {
-                if (this.active) {
-                    this.active.readers--;
+                this.active.readers--;
 
-                    // we still have active readers and no grow required
-                    if (this.active.readers !== 0 && this.waiting_grow.length !== this.active.readers) {
-                        return;
-                    }
+                // we still have active readers and no grow required
+                if (this.active.readers !== 0 && this.waiting_grow.length !== this.active.readers) {
+                    return;
+                }
 
-                    // we have active readers and all are waiting for grow
-                    if (this.waiting_grow.length > 0 && this.waiting_grow.length === this.active.readers) {
-                        const model = this.models.get(this.active.model!)!;
-                        this.#growModel(model).catch(err => log.error(`#growModel error: ${err}`));
-                        return;
-                    }
+                // we have active readers and all are waiting for grow
+                if (this.waiting_grow.length > 0 && this.waiting_grow.length === this.active.readers) {
+                    const model = this.models.get(this.active.model!)!;
+                    this.#growModel(model).catch(err => log.error(`#growModel error: ${err}`));
+                    return;
                 }
 
                 // we don't have active readers; swap model
@@ -270,7 +270,7 @@ export class Planner {
     }
 
     async #maybeSwap(t?: Timer): Promise<void> {
-        if (this.active && (this.active.readers !== 0 || this.active.pending)) {
+        if (this.active.readers !== 0 || this.active.pending) {
             return;
         }
 
@@ -279,14 +279,8 @@ export class Planner {
         const waiter = this.waiting.shift()!;
         const target = this.models.get(waiter.model)!;
 
-        if (this.active) {
-            this.active.pending = true;
-        } else {
-            this.active = {
-                pending: true,
-                readers: 0,
-            }
-        }
+        this.active.pending = true;
+        this.active.readers = 0;
 
         const restore = this.restore_info.get(target.name);
         const bytes_needed = restore?.bytes_needed;
@@ -336,7 +330,7 @@ export class Planner {
         }
 
         // stash kv for currently-loaded model
-        const active_id = this.active?.model;
+        const active_id = this.active.model;
         if (active_id !== undefined && active_id !== target_model.name) {
             const active_model = this.models.get(active_id)!;
 
@@ -359,7 +353,7 @@ export class Planner {
             }
 
             this.#updateMem(mem);
-            this.active!.model = undefined;
+            this.active.model = undefined;
             this.weights_only.add(active_id);
 
             if (this.dev_info.bytes_avail > bytes_needed) return;
@@ -471,7 +465,7 @@ export class Planner {
 
             // remove model from tracking
             this.weights_only.delete(model.name);
-            if (this.active?.model === model.name) {
+            if (this.active.model === model.name) {
                 this.active.model = undefined;
             }
 
@@ -503,7 +497,7 @@ export class Planner {
 
             // remove model from tracking
             this.weights_only.delete(model.name);
-            if (this.active?.model === model.name) {
+            if (this.active.model === model.name) {
                 this.active.model = undefined;
             }
 
@@ -527,6 +521,11 @@ export class Planner {
     }
 
     #updateMem(mem: MemoryResponse): void {
+        if (this.dev_info.bytes_total === 0) {
+            log.info(`first model loaded`);
+            this.dev_info.bytes_total = calcTotalBytesOnDevice(mem);
+        }
+
         this.dev_info.bytes_avail = calcFreeBytes(mem);
 
         if (calcTotalBytesOnDevice(mem) != this.dev_info.bytes_total) {
