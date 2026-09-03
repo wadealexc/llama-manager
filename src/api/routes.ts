@@ -85,6 +85,9 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
 
         if (!upstream.ok || (is_stream && !upstream.body)) {
             const text = await upstream.text().catch(() => '');
+            if (isContextExceeded(text) && !req_info.isFinal) {
+                return false;
+            }
             sendUpstreamError(res, is_stream, text || `upstream returned ${upstream.status}`);
             return true;
         }
@@ -128,7 +131,7 @@ async function streamCompletion(
                 if (pending_frame) {
                     res.write(`data: ${pending_frame.raw}\n\n`);
                 }
-                res.write("data: [DONE]\n\n");
+                finishSSEResponse(res);
                 return true;
             }
 
@@ -150,7 +153,7 @@ async function streamCompletion(
                 if (req.isFinal) {
                     res.write(`data: ${pending_frame.raw}\n\n`);
                     res.write(`data: ${JSON.stringify(json)}\n\n`);
-                    res.write("data: [DONE]\n\n");
+                    finishSSEResponse(res);
                     return true;
                 }
 
@@ -194,7 +197,7 @@ async function streamCompletion(
             }
         }
 
-        res.write("data: [DONE]\n\n");
+        finishSSEResponse(res);
         return true;
     } catch (err) {
         if (res.writableEnded) return true;
@@ -326,6 +329,15 @@ function isTruncated(completion_tokens: number, finish_reason?: string, max_toke
     return max_tokens === undefined || completion_tokens < max_tokens;
 }
 
+function isContextExceeded(text: string): boolean {
+    try {
+        const parsed = JSON.parse(text);
+        return parsed?.error?.type === "exceed_context_size_error";
+    } catch {
+        return false;
+    }
+}
+
 function applyTruncation(
     req: ReqInfo,
     completion_tokens: number,
@@ -364,6 +376,11 @@ function applyTruncation(
 
 function sendError(res: ExpressResponse, status: number, type: string, message: string): void {
     res.status(status).json({ error: { message, type } });
+}
+
+function finishSSEResponse(res: ExpressResponse): void {
+    res.write("data: [DONE]\n\n");
+    res.end();
 }
 
 function sendUpstreamError(res: ExpressResponse, is_stream: boolean, err: unknown): void {

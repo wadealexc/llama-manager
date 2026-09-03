@@ -38,6 +38,9 @@ models:
         model: /home/fox/kitsu/models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf
         mmproj: /home/fox/kitsu/models/qwen3.5-9b/mmproj-BF16.gguf
 
+        fit-target: 512
+        n-gpu-layers: 99
+
         ladder: []
 
 default_models: [qwen3.8-27b, qwen3.5-9b]

@@ -3,10 +3,6 @@ export interface InputTokensResponse {
     object: string;
 }
 
-export interface FitResponse {
-    n_ctx: number;
-}
-
 export type SpeculativeType = 
     "none" | "draft-simple" | "draft-eagle3" | "draft-mtp" | "draft-dflash" | (string & {});
 
@@ -138,6 +134,12 @@ export interface SlotRestore {
 
 export interface StatusResponse {
     success: boolean;
+    message?: string;
+}
+
+export interface ReloadResponse {
+    success: boolean;
+    n_ctx: number;
     message?: string;
 }
 

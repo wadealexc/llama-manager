@@ -104,20 +104,14 @@ export class Planner {
             }
 
             // on first successful load: init device memory info
+            const mem = await this.client.getMemory(id, this.shutdown_ctrl.signal);
             if (!first_loaded) {
                 first_loaded = model;
 
-                const mem = await this.client.getMemory(id, this.shutdown_ctrl.signal);
-                this.dev_info = {
-                    bytes_total: calcTotalBytesOnDevice(mem),
-                    bytes_avail: calcFreeBytes(mem),
-                };
-            } else {
-                // update memory info
-                this.#updateMem(await this.client.getMemory(id, this.shutdown_ctrl.signal));
+                this.dev_info = { bytes_total: calcTotalBytesOnDevice(mem), bytes_avail: 0 };
             }
 
-            log.info(`memory after load: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
+            this.#updateMem(mem);
         }
 
         if (!first_loaded || this.weights_only.size === 0) {
@@ -128,12 +122,11 @@ export class Planner {
 
         // first model loaded gets a kv
         log.info(`serveDefault: loading kvcache for ${first_loaded.name}`);
-        const ctx = await first_loaded.loadWithKV(null, this.shutdown_ctrl.signal, t);
-        log.info(`serving ${first_loaded.name} with a context window of ${ctx} tokens`);
+        const n_ctx = await first_loaded.loadWithKV(null, this.shutdown_ctrl.signal, t);
+        log.info(`serving ${first_loaded.name} with a context window of ${n_ctx} tokens`);
 
         // update memory info
         this.#updateMem(await this.client.getMemory(first_loaded.name, this.shutdown_ctrl.signal));
-        log.info(`memory: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
 
         this.weights_only.delete(first_loaded.name);
         this.active = {
@@ -196,6 +189,9 @@ export class Planner {
 
         this.active.pending = true;
 
+        log.info(`growing model ${model.name} to fill available space`);
+        const prev_ctx = model.curCtx();
+
         try {
             // if there are idle weights_only models, evict to make space, then expand to fill
             // we only apply strategies if we can't evict other models
@@ -208,6 +204,7 @@ export class Planner {
                 throw new Error(`strategies exhausted`);
             }
         } catch (err) {
+            log.info(`${model.name} already at max ctx of ${model.curCtx()} tokens (strategies exhausted)`);
             // cannot grow further. release waiters and throw
             const msg = err instanceof Error ? err.message : String(err);
             const waiting = this.waiting_grow.splice(0);
@@ -216,6 +213,8 @@ export class Planner {
         } finally {
             this.active.pending = false;
         }
+
+        log.info(`${model.name} context window expanded from ${prev_ctx} to ${model.curCtx()}`);
 
         // update available memory
         const mem = await this.client.getMemory(model.name, this.shutdown_ctrl.signal);
@@ -306,7 +305,9 @@ export class Planner {
         }
 
         // load target model
-        await target.loadWithKV(restore?.point ?? null, this.shutdown_ctrl.signal, t?.child(`loadWithKV(${target.name})`));
+        log.info(`loading kvcache for model ${target.name}`);
+        const n_ctx = await target.loadWithKV(restore?.point ?? null, this.shutdown_ctrl.signal, t?.child(`loadWithKV(${target.name})`));
+        log.info(`${target.name} kvcache loaded; ctx window: ${n_ctx} tokens`);
         this.#updateMem(await this.client.getMemory(target.name, this.shutdown_ctrl.signal));
 
         this.active.pending = false;
@@ -542,6 +543,8 @@ export class Planner {
 
             this.dev_info.bytes_avail = this.dev_info.bytes_total;
         }
+
+        log.info(`available memory: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
     }
 
     resolve(name: ModelId): ModelEntry | undefined {

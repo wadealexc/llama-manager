@@ -61,10 +61,10 @@ export class ModelEntry {
             await this.loadWeights(signal, t);
         }
 
-        // if we have a restore point from a prior load, restore first
-        if (restore) {
-            let params: ReloadParams = { n_ctx: restore.n_ctx };
+        let params: ReloadParams = { n_ctx: 0 };
 
+        // handle restore point from prior load
+        if (restore) {
             for (const [i, rung] of this.ladder.entries()) {
                 // stop when target is reached
                 if (i > restore.ladder_i) break;
@@ -89,27 +89,15 @@ export class ModelEntry {
                 }
             }
 
-            t?.start('reloadModel');
-            await this.client.reloadModel(params, this.name, signal);
-            t?.stop();
-
             this.ladder_i = restore.ladder_i;
-            this.n_ctx = restore.n_ctx;
+        } else {
+            this.ladder_i = 0;
         }
 
-        // get max ctx given current config and available space
-        t?.start('fitModel');
-        const fit_ctx = await this.client.fitModel(this.name, signal);
+        // load kvcache, applying restore point params if supplied
+        t?.start('reloadModel');
+        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
         t?.stop();
-
-        // if fit returns a larger ctx window, fill available space
-        if (fit_ctx > this.curCtx()) {
-            t?.start('reloadModel');
-            await this.client.reloadModel({ n_ctx: fit_ctx }, this.name, signal);
-            t?.stop();
-
-            this.n_ctx = fit_ctx;
-        }
 
         if (restore && restore.slots) {
             t?.start('restoreAllSlots');
@@ -124,31 +112,21 @@ export class ModelEntry {
     async expandToFit(signal: AbortSignal, t?: Timer): Promise<number> {
         if (this.status !== LoadStatus.LOADED) throw new Error(`expandToFit: model must be loaded`);
 
-        // get max ctx given current config and available space
-        t?.start('fitModel');
-        const fit_ctx = await this.client.fitModel(this.name, signal);
-        t?.stop();
-
-        if (fit_ctx <= this.curCtx()) {
-            throw new Error(`expandToFit: unable to grow`);
-        }
-
-        // create restore point
+        // stash existing kvcache
         const restore = await this.#createRestorePoint(signal, t);
 
         // reload to fill available space
         t?.start('reloadModel');
-        await this.client.reloadModel({ n_ctx: fit_ctx }, this.name, signal);
+        this.n_ctx = await this.client.reloadModel({ n_ctx: 0 }, this.name, signal);
         t?.stop();
 
-        // restore slots
+        // restore kvcache
         if (restore.slots) {
             t?.start('restoreAllSlots');
             await this.client.restoreAllSlots(this.name, restore.slots, signal);
             t?.stop();
         }
 
-        this.n_ctx = fit_ctx;
         return this.curCtx();
     }
 
@@ -158,14 +136,16 @@ export class ModelEntry {
         const next_rung = this.ladder.at(this.ladder_i + 1);
         if (!next_rung) throw new Error(`applyNextStrategy: model has no more strategies`);
 
+        // stash existing kvcache
         const restore = await this.#createRestorePoint(signal, t);
+
+        let params: ReloadParams = { n_ctx: 0 };
 
         if (next_rung.strategy !== 'none') {
             // get reload params for strategy
             this.log.debug(`model ${this.name} applying strategy ${next_rung.strategy}`);
-            const params = next_rung.impl.getNewParams({});
+            params = next_rung.impl.getNewParams(params);
 
-            // apply strategy's additional action if needed
             if (next_rung.impl.action) {
                 try {
                     t?.start(`${next_rung.strategy}: action`);
@@ -178,21 +158,11 @@ export class ModelEntry {
                     this.log.error(`${next_rung.strategy}.action error: ${err}`);
                 }
             }
-
-            // reload to new config
-            t?.start('reloadModel');
-            await this.client.reloadModel(params, this.name, signal);
-            t?.stop();
         }
-
-        // check fit
-        t?.start('fitModel');
-        const fit_ctx = await this.client.fitModel(this.name, signal);
-        t?.stop();
 
         // reload to fill available space
         t?.start('reloadModel');
-        await this.client.reloadModel({ n_ctx: fit_ctx }, this.name, signal);
+        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
         t?.stop();
 
         // restore slots
@@ -203,8 +173,7 @@ export class ModelEntry {
         }
 
         this.ladder_i++;
-        this.n_ctx = fit_ctx;
-        return fit_ctx;
+        return this.curCtx();
     }
 
     async unloadKV(signal: AbortSignal, t?: Timer): Promise<RestorePoint | null> {
@@ -251,6 +220,18 @@ export class ModelEntry {
         this.#setUnloaded();
     }
 
+    async #createRestorePoint(signal: AbortSignal, t?: Timer): Promise<RestorePoint> {
+        t?.start('saveAllSlots');
+        const restore: RestorePoint = {
+            ladder_i: this.ladder_i,
+            n_ctx: this.n_ctx,
+            slots: await this.client.saveAllSlots(this.name, signal),
+        };
+        t?.stop();
+
+        return restore;
+    }
+
     curCtx(): number {
         return this.n_ctx;
     }
@@ -265,18 +246,6 @@ export class ModelEntry {
 
     hasNextStrategy(): boolean {
         return this.ladder.length - 1 > this.ladder_i;
-    }
-
-    async #createRestorePoint(signal: AbortSignal, t?: Timer): Promise<RestorePoint> {
-        t?.start('saveAllSlots');
-        const restore: RestorePoint = {
-            ladder_i: this.ladder_i,
-            n_ctx: this.n_ctx,
-            slots: await this.client.saveAllSlots(this.name, signal),
-        };
-        t?.stop();
-
-        return restore;
     }
 
     #setWeightsOnly() {
