@@ -74,6 +74,7 @@ export class Planner {
     };
 
     shutdown_ctrl: AbortController = new AbortController();
+    idle_timer?: ReturnType<typeof setTimeout>;
 
     constructor(client: LlamaAPI, config: ManagerConfig, models: Map<ModelId, ModelEntry>) {
         this.client = client;
@@ -82,7 +83,6 @@ export class Planner {
     }
 
     // Note: not intended to be called twice
-    // TODO - will need to adjust bytes_available calc after implementing idle
     async serveDefault(): Promise<void> {
         const t = new Timer('serveDefault');
 
@@ -139,9 +139,12 @@ export class Planner {
         };
 
         print(t);
+        this.#startIdleTimer();
     }
 
     async serveModel(body: unknown, model: ModelEntry, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
+        this.#cancelIdleTimer();
+
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
         const t = new Timer(`serveModel: ${model.name}`);
 
@@ -169,7 +172,10 @@ export class Planner {
                 success = await cb(body, this.client, signal, false);
                 t?.stop();
             }
-        }).finally(() => print(t));
+        }).finally(() => {
+            print(t);
+            this.#startIdleTimer();
+        });
     }
 
     // attempt to expand the model's context window. if there are other active readers,
@@ -387,6 +393,8 @@ export class Planner {
     }
 
     async shutdown(): Promise<void> {
+        this.#cancelIdleTimer();
+
         const t = new Timer(`Planner.shutdown`);
 
         t.start('unloadAllModels');
@@ -410,6 +418,46 @@ export class Planner {
 
         this.shutdown_ctrl.abort('shutdown request received');
         log.info(`shutdown: done`);
+    }
+
+    #startIdleTimer(): void {
+        this.#cancelIdleTimer();
+
+        // not idle; return
+        if (
+            this.active.readers !== 0 || 
+            this.waiting.length !== 0 || 
+            this.waiting_grow.length !== 0 || 
+            this.active.pending
+        ) {
+            return;
+        }
+
+        const ms = this.config.idle_timeout * 1000;
+        this.idle_timer = setTimeout(() => {
+            this.#onIdle().catch(err => log.error(`idle unload error: ${err}`));
+        }, ms);
+    }
+
+    #cancelIdleTimer(): void {
+        if (this.idle_timer !== undefined) {
+            clearTimeout(this.idle_timer);
+            this.idle_timer = undefined;
+        }
+    }
+
+    async #onIdle(): Promise<void> {
+        if (this.active.readers !== 0 || this.waiting.length !== 0 || this.waiting_grow.length !== 0 || this.active.pending) {
+            return;
+        }
+
+        this.active.pending = true;
+
+        log.info(`idle timeout reached; unloading all models`);
+        await this.#unloadAllModels(false);
+        this.restore_info.clear();
+
+        this.active.pending = false;
     }
 
     async #cleanupSlots(): Promise<void> {
