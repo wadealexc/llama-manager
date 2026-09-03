@@ -7,6 +7,7 @@ import type { CompletionChunk, CompletionRequest, ToolCall } from "./types.js";
 export function registerRoutes(app: Express, server: ApiServer): void {
     app.get('/v1/models', (req, res) => listModels(server, req, res));
     app.post('/v1/chat/completions', (req, res) => completions(server, req, res));
+    app.post('/v1/chat/completions/input_tokens', (req, res) => countTokens(server, req, res));
 }
 
 async function listModels(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
@@ -20,6 +21,43 @@ async function listModels(server: ApiServer, req: Request, res: ExpressResponse)
         }));
 
     res.json({ object: 'list', data });
+}
+
+async function countTokens(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
+    const body = req.body as CompletionRequest | undefined;
+    if (body === undefined) {
+        sendError(res, 400, 'invalid_request', 'expected request body');
+        return;
+    }
+
+    const model_name = body.model;
+    if (typeof model_name !== 'string') {
+        sendError(res, 400, 'invalid_request', 'missing or invalid "model" field');
+        return;
+    }
+
+    const model = server.planner.resolve(model_name);
+    if (!model) {
+        sendError(res, 400, 'invalid_request', `unable to resolve model ${model_name}`);
+        return;
+    }
+
+    const ac = new AbortController();
+    res.on('close', () => ac.abort());
+    req.on('aborted', () => ac.abort());
+
+    await server.planner.serveModel(body, model, ac.signal, async (_body: unknown, client: Client, signal: AbortSignal, _isFinal: boolean) => {
+        let tokens: number;
+        try {
+            tokens = await client.countTokens(body, model.name, signal);
+        } catch (err) {
+            sendUpstreamError(res, false, err);
+            return true;
+        }
+
+        res.json({ tokens });
+        return true;
+    });
 }
 
 async function completions(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {

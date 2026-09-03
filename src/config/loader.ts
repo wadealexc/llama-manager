@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { load as yamlLoad } from "js-yaml";
 import { type ManagerConfig, type ModelConfig, type ModelState, type StrategyId } from "./types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
@@ -19,13 +20,11 @@ const MANAGER_FIELDS = new Set([
     "slot-save-path",
 ]);
 
-const PRESET_OUT_PATH = "./generated-preset.ini";
-
 type RawModel = Record<string, unknown>;
 
 export class ConfigLoader {
 
-    async load(path: string): Promise<[ManagerConfig, string]> {
+    async load(path: string, project_root: string, preset_out_path: string): Promise<[ManagerConfig, string]> {
         let raw: Record<string, unknown>;
         try {
             raw = yamlLoad(readFileSync(path, "utf8")) as Record<string, unknown>;
@@ -35,7 +34,9 @@ export class ConfigLoader {
 
         const raw_models: Record<string, RawModel> = (raw.models as Record<string, RawModel>) ?? {};
         const raw_router = (raw.router ?? {}) as Record<string, unknown>;
-        const llama_log_dir = normalizeDir((raw_router['llama_log_dir'] as string) ?? DEFAULT_LOG_DIR);
+        const raw_model_load = (raw['model-load'] ?? {}) as Record<string, unknown>;
+
+        const llama_log_dir = normalizeDir((raw_router['llama-log-dir'] as string) ?? DEFAULT_LOG_DIR);
         const slot_save_path = normalizeDir((raw_router['slot-save-path'] as string) ?? DEFAULT_SLOT_SAVE_DIR);
 
         const models: Record<string, ModelConfig> = {};
@@ -47,7 +48,7 @@ export class ConfigLoader {
             models[key] = this.#buildEntry(key, raw_entry);
         }
 
-        const raw_defaults = raw.default_models as string[] | undefined;
+        const raw_defaults = raw['default-models'] as string[] | undefined;
         const model_keys = Object.keys(models);
         const default_models = (raw_defaults && raw_defaults.length > 0)
             ? raw_defaults
@@ -55,32 +56,35 @@ export class ConfigLoader {
 
         for (const id of default_models) {
             if (!models[id]) {
-                throw new Error(`default_model '${id}' not found in models`);
+                throw new Error(`default-model '${id}' not found in models`);
             }
         }
 
         const config: ManagerConfig = {
             router: {
-                bin: raw_router['bin'] as string,
-                llama_log_dir,
-                slot_save_path,
-                listen: raw_router['listen'] as string,
-                poll_interval_ms: raw_router['poll_interval_ms'] as number,
-                poll_timeout_ms: raw_router['poll_timeout_ms'] as number,
-                shutdown_grace_period_ms: raw_router['shutdown_grace_period_ms'] as number,
+                bin: resolve(project_root, (raw_router['bin'] as string) ?? './llama.cpp/build/bin/llama-server'),
+                llama_log_dir: resolve(project_root, llama_log_dir),
+                slot_save_path: resolve(project_root, slot_save_path),
+                listen: (raw_router['listen'] as string) ?? '127.0.0.1:10000',
+                poll_interval_ms: (raw_router['poll-interval-ms'] as number) ?? 50,
+                poll_timeout_ms: (raw_router['poll-timeout-ms'] as number) ?? 10000,
+                shutdown_grace_period_ms: (raw_router['shutdown-grace-period-ms'] as number) ?? 10000,
             },
-            listen: raw.listen as string,
-            idle_timeout: raw.idle_timeout as number,
-            model_load: raw.model_load as ManagerConfig["model_load"],
+            listen: (raw.listen as string) ?? '127.0.0.1:10001',
+            idle_timeout: (raw['idle-timeout'] as number) ?? 300,
+            model_load: {
+                poll_interval_ms: (raw_model_load['poll-interval-ms'] as number) ?? 100,
+                poll_timeout_ms: (raw_model_load['poll-timeout-ms'] as number) ?? 50000,
+            },
             models,
             default_models,
         };
 
         mkdirSync(config.router.llama_log_dir, { recursive: true });
         mkdirSync(config.router.slot_save_path, { recursive: true });
-        writeFileSync(PRESET_OUT_PATH, this.#buildIni(raw_models, config.router.slot_save_path), "utf8");
+        writeFileSync(preset_out_path, this.#buildIni(raw_models, config.router.slot_save_path), "utf8");
 
-        return [config, PRESET_OUT_PATH];
+        return [config, preset_out_path];
     }
 
     #buildEntry(name: string, raw: RawModel): ModelConfig {
@@ -171,7 +175,7 @@ function getKvUnified(entry: RawModel): boolean {
     return true;
 }
 
-export default async function loadConfig(path: string): Promise<[ManagerConfig, string]> {
+export default async function loadConfig(path: string, project_root: string, preset_out_path: string): Promise<[ManagerConfig, string]> {
     const loader = new ConfigLoader();
-    return await loader.load(path);
+    return await loader.load(path, project_root, preset_out_path);
 }

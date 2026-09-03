@@ -1,3 +1,4 @@
+import { join, resolve } from "node:path";
 import { showBreakpoints } from "./show-breakpoints.js";
 import loadConfig from "./config/loader.js";
 import { RouterProcess } from "./client/router-process.js";
@@ -13,8 +14,11 @@ import { createStrategies } from "./planner/strategies/index.js";
 
 const log: ConsolaInstance = logger.withTag('main');
 
-const CONFIG_PATH = process.env.MANAGER_CONFIG ?? "./config.yaml";
-const [config, preset_path] = await loadConfig(CONFIG_PATH);
+const PROJECT_ROOT = resolve(import.meta.dirname, '..');
+const PRESET_PATH = join(PROJECT_ROOT, 'generated-preset.ini');
+const CONFIG_PATH = process.env.MANAGER_CONFIG ?? resolve(PROJECT_ROOT, 'config.yaml');
+
+const [config, preset_path] = await loadConfig(CONFIG_PATH, PROJECT_ROOT, PRESET_PATH);
 
 const router = new RouterProcess(config.router, config.model_load);
 
@@ -65,6 +69,7 @@ try {
 } catch (err) {
     log.error(`startup error: ${err}`);
     await shutdown('error');
+    process.exit(1);
 }
 
 /* -------------------- STOP SERVER -------------------- */
@@ -73,8 +78,8 @@ async function shutdown(event: string) {
     log.info(`shutdown: ${event}`);
 
     await Promise.allSettled([
-        planner?.shutdown().catch(err => log.warn(`planner shutdown error: ${err}`)),
         router?.shutdown().catch(err => log.warn(`router shutdown error: ${err}`)),
+        planner?.shutdown().catch(err => log.warn(`planner shutdown error: ${err}`)),
         api?.shutdown().catch(err => log.warn(`api shutdown error: ${err}`)),
     ]);
 

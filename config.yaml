@@ -1,26 +1,26 @@
 router:
     # Paths to llama-server binary and output dir for llama-server logs
     bin: ./llama.cpp/build/bin/llama-server
-    llama_log_dir: ./logs
+    llama-log-dir: ./logs
 
     # Internal listen address for llama-server
     listen: 127.0.0.1:10000
 
     # Frequency of pings sent to the router on startup, and how long
     # to wait for router process to start/shut down
-    poll_interval_ms: 50
-    poll_timeout_ms: 10000
-    shutdown_grace_period_ms: 10000
+    poll-interval-ms: 50
+    poll-timeout-ms: 10000
+    shutdown-grace-period-ms: 10000
     
 # External listen address. OAI interface is exposed here.
 listen: 192.168.87.30:10001
 
 # Seconds of no requests after which current models are unloaded
-idle_timeout: 300
+idle-timeout: 300
 
-model_load:
-    poll_interval_ms: 100
-    poll_timeout_ms: 50000
+model-load:
+    poll-interval-ms: 100
+    poll-timeout-ms: 50000
 
 models:
     qwen3.8-27b:
@@ -43,4 +43,4 @@ models:
 
         ladder: []
 
-default_models: [qwen3.8-27b, qwen3.5-9b]
+default-models: [qwen3.8-27b, qwen3.5-9b]

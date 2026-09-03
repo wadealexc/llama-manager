@@ -13,6 +13,7 @@ const log: ConsolaInstance = logger.withTag('planner');
 
 export interface Client {
     completions(body: unknown, model: ModelId, signal: AbortSignal): Promise<Response>;
+    countTokens(body: unknown, model: ModelId, signal: AbortSignal): Promise<number>;
 }
 
 type PlannerCallback = (body: unknown, client: Client, signal: AbortSignal, isFinal: boolean) => Promise<boolean>;

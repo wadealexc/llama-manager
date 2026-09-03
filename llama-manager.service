@@ -1,0 +1,24 @@
+[Unit]
+Description=llama-manager inference router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=YOUR_USER_HERE
+WorkingDirectory=%h/llama-manager
+ExecStart=%h/llama-manager/run.sh
+
+TimeoutStopSec=20
+KillSignal=SIGINT
+KillMode=process
+
+Restart=on-failure
+RestartSec=10
+
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-manager
+
+[Install]
+WantedBy=multi-user.target
