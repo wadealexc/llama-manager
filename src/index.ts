@@ -1,3 +1,4 @@
+import { showBreakpoints } from "./show-breakpoints.js";
 import loadConfig from "./config/loader.js";
 import { RouterProcess } from "./client/router-process.js";
 import type { ConsolaInstance } from "consola";
@@ -47,8 +48,16 @@ if (models.size === 0) {
 }
 
 const planner = new Planner(llama_api, config, models);
-
 const api = new ApiServer(planner, config);
+
+if (process.argv.includes('--show-breakpoints')) {
+    try {
+        await showBreakpoints(llama_api, config, models);
+    } finally {
+        await shutdown('breakpoints complete');
+        process.exit(0);
+    }
+}
 
 try {
     await planner.serveDefault();
