@@ -53,7 +53,7 @@ export async function showBreakpoints(
 
             while (entry.hasNextStrategy()) {
                 log.info(`${name}: applying ${entry.ladder[entry.ladder_i + 1].strategy}`);
-                const n = await entry.applyNextStrategy(signal);
+                const n = await entry.applyNextStrategy(false, signal);
                 mem = await client.getMemory(name, signal);
                 const { weight_bytes, context_bytes } = getModelMemory(mem);
                 rungs.push({

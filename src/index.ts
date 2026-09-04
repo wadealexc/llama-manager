@@ -18,12 +18,23 @@ const PROJECT_ROOT = resolve(import.meta.dirname, '..');
 const PRESET_PATH = join(PROJECT_ROOT, 'generated-preset.ini');
 const CONFIG_PATH = process.env.MANAGER_CONFIG ?? resolve(PROJECT_ROOT, 'config.yaml');
 
+// when loading a model for the first time, this runs through all strategies to calc a max
+// ctx. (enables `/v1/models` to return the model's max ctx after all strategies are applied)
+const CALC_MAX_ENABLED = process.argv.includes('--calc-max-ctx');
+
 const [config, preset_path] = await loadConfig(CONFIG_PATH, PROJECT_ROOT, PRESET_PATH);
 
 const router = new RouterProcess(config.router, config.model_load);
 
 // Shutdown if we receive an interrupt or any uncaught errors
-for (const evt of ['SIGINT', 'SIGTERM', 'SIGHUP', 'uncaughtException', 'unhandledRejection'] as const) {
+for (const evt of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.once(evt, async () => {
+        await shutdown(evt);
+        process.exit(0);
+    });
+}
+
+for (const evt of ['uncaughtException', 'unhandledRejection'] as const) {
     process.once(evt, async (err?: unknown) => {
         if (err instanceof Error) {
             log.error(`${evt}: ${err.message}`);
@@ -32,7 +43,7 @@ for (const evt of ['SIGINT', 'SIGTERM', 'SIGHUP', 'uncaughtException', 'unhandle
             log.error(`${evt}: ${String(err)}`);
         }
         await shutdown(evt);
-        process.exit();
+        process.exit(1);
     });
 }
 
@@ -61,6 +72,16 @@ if (process.argv.includes('--show-breakpoints')) {
         await shutdown('breakpoints complete');
         process.exit(0);
     }
+}
+
+try {
+    if (CALC_MAX_ENABLED) {
+        await planner.calcMaxCtx();
+    }
+} catch (err) {
+    log.error(`startup error when calculating max ctx: ${err}`);
+    await shutdown('error');
+    process.exit(1);
 }
 
 try {

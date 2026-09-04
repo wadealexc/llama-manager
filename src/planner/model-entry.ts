@@ -130,14 +130,17 @@ export class ModelEntry {
         return this.curCtx();
     }
 
-    async applyNextStrategy(signal: AbortSignal, t?: Timer): Promise<number> {
+    async applyNextStrategy(create_restore: boolean, signal: AbortSignal, t?: Timer): Promise<number> {
         if (this.status !== LoadStatus.LOADED) throw new Error(`applyNextStrategy: model must be loaded`);
 
         const next_rung = this.ladder.at(this.ladder_i + 1);
         if (!next_rung) throw new Error(`applyNextStrategy: model has no more strategies`);
 
         // stash existing kvcache
-        const restore = await this.#createRestorePoint(signal, t);
+        let restore: RestorePoint | undefined;
+        if (create_restore) {
+            restore = await this.#createRestorePoint(signal, t);
+        }
 
         let params: ReloadParams = { n_ctx: 0 };
 
@@ -166,7 +169,7 @@ export class ModelEntry {
         t?.stop();
 
         // restore slots
-        if (restore.slots) {
+        if (restore?.slots) {
             t?.start('restoreAllSlots');
             await this.client.restoreAllSlots(this.name, restore.slots, signal);
             t?.stop();

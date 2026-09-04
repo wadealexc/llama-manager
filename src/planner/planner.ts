@@ -73,6 +73,8 @@ export class Planner {
         bytes_avail: 0,
     };
 
+    max_ctx: Map<ModelId, number> = new Map();
+
     shutdown_ctrl: AbortController = new AbortController();
     idle_timer?: ReturnType<typeof setTimeout>;
 
@@ -80,6 +82,35 @@ export class Planner {
         this.client = client;
         this.config = config;
         this.models = models;
+    }
+
+    // Note: intended to be called once on startup (jank!)
+    // load each model, apply all strategies, and calculate max ctx
+    async calcMaxCtx(): Promise<void> {
+        const t = new Timer('calcMaxCtx');
+
+        const signal = this.shutdown_ctrl.signal;
+        this.active.pending = true;
+
+        await this.#unloadAllModels(false, undefined, t);
+
+        for (const [id, entry] of this.models.entries()) {
+            log.info(`calculating max ctx for model: ${id}`);
+
+            let ctx = await entry.loadWithKV(null, signal, t);
+
+            while (entry.hasNextStrategy()) {
+                ctx = await entry.applyNextStrategy(false, signal, t);
+            }
+
+            await entry.unloadHard(t);
+
+            log.info(`${id} has max ctx ${ctx} at ${entry.ladder.length - 1} strategies applied`);
+            this.max_ctx.set(id, ctx);
+        }
+
+        this.active.pending = false;
+        print(t);
     }
 
     // Note: not intended to be called twice
@@ -208,7 +239,7 @@ export class Planner {
                 await this.#unloadAllModels(true, model.name, t?.child('unloadAllModels'));
                 await model.expandToFit(this.shutdown_ctrl.signal, t?.child('growModel'));
             } else if (model.hasNextStrategy()) {
-                await model.applyNextStrategy(this.shutdown_ctrl.signal, t?.child('applyNextStrategy'));
+                await model.applyNextStrategy(true, this.shutdown_ctrl.signal, t?.child('applyNextStrategy'));
             } else {
                 throw new Error(`strategies exhausted`);
             }
@@ -516,7 +547,10 @@ export class Planner {
             }
         }
 
-        log.info(`unloading ${promises.length} models${stash_kv ? ' with restore' : ''}`);
+        if (promises.length > 0) {
+            log.info(`unloading ${promises.length} models${stash_kv ? ' with restore' : ''}`);
+        }
+
         await Promise.allSettled(promises);
     }
 

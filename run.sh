@@ -4,4 +4,4 @@ set -euo pipefail
 source "$HOME/.nvm/nvm.sh"
 
 cd "$(dirname "$0")"
-exec node dist/index.js
+exec node dist/index.js "$@"
