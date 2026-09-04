@@ -280,10 +280,35 @@ export class Planner {
             return;
         }
 
-        // get first entry from queue
         if (this.waiting.length === 0) return;
         const waiter = this.waiting.shift()!;
         const target = this.models.get(waiter.model)!;
+
+        const flush_queue = () => {
+            const serve: Waiter[] = [];
+            const wait: Waiter[] = [];
+
+            for (const w of this.waiting) {
+                if (w.model === target.name) {
+                    serve.push(w);
+                } else {
+                    wait.push(w);
+                }
+            }
+
+            this.waiting = wait;
+            for (const w of serve) {
+                this.active.readers++;
+                w.resolve(this.#getHandle());
+            }
+        }
+
+        if (this.active.model === target.name) {
+            this.active.readers++;
+            waiter.resolve(this.#getHandle());
+            flush_queue();
+            return;
+        }
 
         this.active.pending = true;
         this.active.readers = 0;
@@ -320,12 +345,7 @@ export class Planner {
         waiter.resolve(this.#getHandle());
 
         // serve any other requests waiting for this model
-        for (const w of this.waiting) {
-            if (w.model === target.name) {
-                this.active.readers++;
-                w.resolve(this.#getHandle());
-            }
-        }
+        flush_queue();
     }
 
     // free space on the gpu by stashing idle models' kvcaches and/or evicting weights
@@ -379,17 +399,13 @@ export class Planner {
             if (id === target_model.name) continue;
             const model = this.models.get(id)!;
 
-            this.#unloadWithRestore(model, t);
+            await this.#unloadWithRestore(model, t);
 
             if (this.dev_info.bytes_avail > bytes_needed) return;
         }
 
         const b = bytes_needed - this.dev_info.bytes_avail;
         log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
-    }
-
-    async reset(model: ModelId): Promise<void> {
-        throw new Error('unimplemented');
     }
 
     async shutdown(): Promise<void> {
@@ -597,6 +613,10 @@ export class Planner {
 
     resolve(name: ModelId): ModelEntry | undefined {
         return this.models.get(name);
+    }
+
+    isModelQueued(name: ModelId): boolean {
+        return this.waiting.some(w => w.model === name);
     }
 
     canServeNow(model: ModelEntry): boolean {

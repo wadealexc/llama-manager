@@ -6,10 +6,12 @@ import type { CompletionChunk, CompletionRequest, ToolCall } from "./types.js";
 
 export function registerRoutes(app: Express, server: ApiServer): void {
     app.get('/v1/models', (req, res) => listModels(server, req, res));
+    app.post('/v1/models/load', (req, res) => loadModel(server, req, res));
     app.post('/v1/chat/completions', (req, res) => completions(server, req, res));
     app.post('/v1/chat/completions/input_tokens', (req, res) => countTokens(server, req, res));
 }
 
+// TODO - clean up status return
 async function listModels(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
     const data = [...server.planner.models.values()]
         .filter((e): e is NonNullable<typeof e> => !!e)
@@ -18,9 +20,36 @@ async function listModels(server: ApiServer, req: Request, res: ExpressResponse)
             object: 'model',
             created: 0,
             owned_by: 'llama-manager',
+            status: e.status,
+            queued: server.planner.isModelQueued(e.name),
+            active: server.planner.active.model === e.name && !server.planner.active.pending,
+            n_ctx: e.curCtx(),
         }));
 
     res.json({ object: 'list', data });
+}
+
+async function loadModel(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
+    const model_name = req.body?.model;
+    if (typeof model_name !== 'string') {
+        sendError(res, 400, 'invalid_request', 'missing or invalid "model" field');
+        return;
+    }
+
+    const model = server.planner.resolve(model_name);
+    if (!model) {
+        sendError(res, 404, 'invalid_request', `unable to resolve model ${model_name}`);
+        return;
+    }
+
+    const ac = new AbortController();
+    res.on('close', () => ac.abort());
+    req.on('aborted', () => ac.abort());
+
+    await server.planner.serveModel({}, model, ac.signal, async (_b: unknown, client: Client, signal: AbortSignal, _isFinal: boolean) => {
+        res.json({ success: true });
+        return true;
+    });
 }
 
 async function countTokens(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
@@ -55,7 +84,7 @@ async function countTokens(server: ApiServer, req: Request, res: ExpressResponse
             return true;
         }
 
-        res.json({ tokens });
+        res.json({ input_tokens: tokens, object: 'response.input_tokens' });
         return true;
     });
 }
@@ -75,7 +104,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
 
     const model = server.planner.resolve(model_name);
     if (!model) {
-        sendError(res, 400, 'invalid_request', `unable to resolve model ${model_name}`);
+        sendError(res, 404, 'invalid_request', `unable to resolve model ${model_name}`);
         return;
     }
 
