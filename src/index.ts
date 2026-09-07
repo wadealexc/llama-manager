@@ -24,6 +24,12 @@ const CALC_MAX_ENABLED = process.argv.includes('--calc-max-ctx');
 
 const [config, preset_path] = await loadConfig(CONFIG_PATH, PROJECT_ROOT, PRESET_PATH);
 
+// TODO: temporarily disabling hadamard rotation to simplify strategy implementation
+const has_kv_quantize_strat = Object.values(config.models).some(m => m.ladder.some(id => ['quantize-kv-q8', 'quantize-kv-q4'].includes(id)));
+if (has_kv_quantize_strat) {
+    process.env.LLAMA_ATTN_ROT_DISABLE = '1';
+}
+
 const router = new RouterProcess(config.router, config.model_load);
 
 // Shutdown if we receive an interrupt or any uncaught errors

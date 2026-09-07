@@ -1,9 +1,9 @@
 import type { ConsolaInstance } from "consola";
+import { logger } from "../../logger.js";
 import type { LlamaAPI } from "../../client/llama-api.js";
 import type { ReloadParams } from "../../client/types.js";
 import type { ModelState, StrategyId } from "../../config/types.js";
 import type { Strategy } from "../types.js";
-import { logger } from "../../logger.js";
 
 const log: ConsolaInstance = logger.withTag('quantize-kv-q8');
 
