@@ -28,6 +28,7 @@ export async function showBreakpoints(
     client: LlamaAPI,
     config: ManagerConfig,
     models: Map<ModelId, ModelEntry>,
+    record?: (id: ModelId, ctx: number) => void,
 ): Promise<void> {
     const ctrl = new AbortController();
     const signal = ctrl.signal;
@@ -69,6 +70,7 @@ export async function showBreakpoints(
 
             await entry.unloadHard();
             results.push({ name, device_total_gib, rungs });
+            record?.(name, rungs.at(-1)!.n_ctx);
             log.info(`${name}: done`);
         } catch (err) {
             log.error(`error processing model ${name}: ${err}`);

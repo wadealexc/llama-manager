@@ -25,8 +25,7 @@ export class ApiServer {
     }
 
     async start(): Promise<void> {
-        const [host, port] = this.config.listen.replace(/^https?:\/\//, '').split(':');
-        this.server = this.app.listen(Number(port), host);
+        this.server = this.app.listen(this.config.port, this.config.host);
     }
 
     async shutdown(): Promise<void> {

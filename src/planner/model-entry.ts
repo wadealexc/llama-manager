@@ -26,17 +26,19 @@ export class ModelEntry {
     client: LlamaAPI;
 
     name: ModelId;
+    aliases: string[];
 
     readonly ladder: Rung[];
     ladder_i: number = -1;
     n_ctx: number = 0;
     status: LoadStatus = LoadStatus.UNLOADED;
 
-    constructor(client: LlamaAPI, name: ModelId, ladder: Rung[]) {
+    constructor(client: LlamaAPI, name: ModelId, aliases: string[], ladder: Rung[]) {
         this.log = logger.withTag(name);
 
         this.client = client;
         this.name = name;
+        this.aliases = aliases;
         this.ladder = ladder;
     }
 

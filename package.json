@@ -1,6 +1,6 @@
 {
   "name": "llama-manager",
-  "version": "1.0.0",
+  "version": "0.0.1-alpha",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -28,7 +28,6 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "chalk": "^6.0.0",
     "consola": "^3.4.2",
     "express": "^5.2.1",
     "js-yaml": "^5.2.3"

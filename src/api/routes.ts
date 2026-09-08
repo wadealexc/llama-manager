@@ -20,6 +20,7 @@ async function listModels(server: ApiServer, req: Request, res: ExpressResponse)
             object: 'model',
             created: 0,
             owned_by: 'llama-manager',
+            aliases: e.aliases,
             status: e.status,
             queued: server.planner.isModelQueued(e.name),
             active: server.planner.active.model === e.name && !server.planner.active.pending,

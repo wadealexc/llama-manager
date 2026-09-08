@@ -480,7 +480,9 @@ export class Planner {
             return;
         }
 
-        const ms = this.config.idle_timeout * 1000;
+        const ms = this.config.sleep_idle_seconds * 1000;
+        if (ms <= 0) return;
+
         this.idle_timer = setTimeout(() => {
             this.#onIdle().catch(err => log.error(`idle unload error: ${err}`));
         }, ms);
@@ -645,8 +647,21 @@ export class Planner {
         log.info(`available memory: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
     }
 
+    // server mode: return the only model we're serving, regardless of input
+    // router mode: resolve model id, fall back to aliases
     resolve(name: ModelId): ModelEntry | undefined {
-        return this.models.get(name);
+        if (this.config.mode === 'server') {
+            return [...this.models.values()][0];
+        }
+
+        const exact = this.models.get(name);
+        if (exact) return exact;
+
+        for (const entry of this.models.values()) {
+            if (entry.aliases.includes(name)) return entry;
+        }
+
+        return undefined;
     }
 
     isModelQueued(name: ModelId): boolean {

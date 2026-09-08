@@ -41,14 +41,33 @@ export interface ModelState {
 
 export interface ModelConfig {
     name: ModelId;
+    aliases: string[];
     ladder: StrategyId[];
     initial_state: ModelState;
 }
 
+export type Mode = 'server' | 'router';
+
+export type RawModel = Record<string, unknown>;
+
+export interface ConfigSource {
+    mode: Mode;
+    raw_models: Record<string, RawModel>;
+    raw_router: Record<string, unknown>;
+    raw_model_load: Record<string, unknown>;
+    host: string;
+    port: number;
+    sleep_idle_seconds: number;
+    default_models?: ModelId[];
+    ladder_override?: StrategyId[];
+}
+
 export interface ManagerConfig {
+    mode: Mode;
     router: LlamaConfig;
-    listen: string;
-    idle_timeout: number;
+    host: string;
+    port: number;
+    sleep_idle_seconds: number;
     model_load: ModelLoadConfig;
     models: Record<ModelId, ModelConfig>;
     default_models: ModelId[];

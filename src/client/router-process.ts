@@ -10,7 +10,10 @@ type Instance = {
     url: string;
     proc: ChildProcess;
     exited: Promise<void>;
+    stderr_tail: StderrTail;
 }
+
+const STARTUP_STDERR_LINES = 20;
 
 const log: ConsolaInstance = logger.withTag('router-process');
 
@@ -36,6 +39,7 @@ export class RouterProcess {
         log.info(`start`);
 
         const [log_path, log_stream] = createLogStream(this.config.llama_log_dir);
+        const stderr_tail = new StderrTail(STARTUP_STDERR_LINES);
 
         const [host, port] = this.config.listen.replace(/^https?:\/\//, '').split(':');
 
@@ -55,6 +59,7 @@ export class RouterProcess {
         log.info(`piping logs to ${log_path}`);
         proc.stdout?.pipe(log_stream);
         proc.stderr?.pipe(log_stream);
+        proc.stderr?.on('data', (chunk: Buffer) => stderr_tail.push(chunk.toString()));
 
         this.instance = {
             url: this.config.listen,
@@ -66,6 +71,7 @@ export class RouterProcess {
                     resolve();
                 });
             }),
+            stderr_tail,
         };
 
         // 'error' is emitted in a lot of different scenarios. we just log here and handle
@@ -160,13 +166,18 @@ export class RouterProcess {
             }
 
             if (exited || !this.isAlive()) {
-                throw new Error(`router exited while polling`);
+                throw new Error(`router exited while polling${this.#stderrSuffix()}`);
             }
 
             await new Promise((r) => setTimeout(r, this.config.poll_interval_ms));
         }
 
-        throw new Error(`router failed to start within ${this.config.poll_timeout_ms}ms`);
+        throw new Error(`router failed to start within ${this.config.poll_timeout_ms}ms${this.#stderrSuffix()}`);
+    }
+
+    #stderrSuffix(): string {
+        const tail = this.instance?.stderr_tail.tail() ?? '';
+        return tail ? `\n${tail}` : '';
     }
 
     isAlive(): boolean {
@@ -184,4 +195,37 @@ function createLogStream(dir: string): [string, fs.WriteStream] {
     const stream = fs.createWriteStream(log_path, { flags: 'a' });
 
     return [log_path, stream];
+}
+
+// keep the last `max_lines` of the router's stderr to surface on startup fail
+class StderrTail {
+
+    lines: string[] = [];
+    pending: string = '';
+    max_lines: number;
+
+    constructor(max_lines: number) {
+        this.max_lines = max_lines;
+    }
+
+    push(text: string): void {
+        this.pending += text;
+
+        const parts = this.pending.split('\n');
+        this.pending = parts.pop() ?? '';
+
+        for (const line of parts) {
+            this.lines.push(line);
+            if (this.lines.length > this.max_lines) {
+                this.lines.shift();
+            }
+        }
+    }
+
+    tail(): string {
+        return [...this.lines, this.pending]
+            .filter(l => l.trim() !== '')
+            .slice(-this.max_lines)
+            .join('\n');
+    }
 }
