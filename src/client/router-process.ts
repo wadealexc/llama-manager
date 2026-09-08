@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import path from 'path';
 import * as fs from 'fs';
 import type { LlamaConfig, ModelLoadConfig } from "../config/types.js";
@@ -54,6 +54,7 @@ export class RouterProcess {
         const proc = spawn(this.config.bin, argv, {
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: true,
+            windowsHide: true,
         });
 
         log.info(`piping logs to ${log_path}`);
@@ -103,6 +104,29 @@ export class RouterProcess {
         const exited = this.instance.exited;
         const pid = this.instance.proc.pid!;
         const grace_period_ms = this.config.shutdown_grace_period_ms;
+
+        if (process.platform === 'win32') {
+            if (this.instance.proc.exitCode !== null || this.instance.proc.signalCode !== null) return;
+            // Windows does not support negative-PID POSIX process-group signals.
+            // Include model workers in the forced termination of the router tree.
+            log.info(`terminating Windows router process tree (pid ${pid})...`);
+            await new Promise<void>((resolve, reject) => {
+                execFile('taskkill', ['/PID', String(pid), '/T', '/F'],
+                    { windowsHide: true, timeout: grace_period_ms }, (err) => {
+                        if (err && this.instance?.proc.exitCode === null && this.instance?.proc.signalCode === null) {
+                            reject(new Error(`failed to terminate router process tree (pid ${pid}): ${err.message}`));
+                        } else {
+                            resolve();
+                        }
+                    });
+            });
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error(`router process ${pid} did not exit`)), grace_period_ms);
+                exited.then(() => { clearTimeout(timeout); resolve(); });
+            });
+            log.info('done! (Windows process tree terminated)');
+            return;
+        }
 
         // Send a kill signal to the process group, then wait for a grace period.
         const kill = async (

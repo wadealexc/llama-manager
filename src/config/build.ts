@@ -80,7 +80,9 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
     const config: ManagerConfig = {
         mode: source.mode,
         router: {
-            bin: resolve(project_root, (raw_router['bin'] as string) ?? './llama.cpp/build/bin/llama-server'),
+            bin: resolve(project_root, (raw_router['bin'] as string) ?? (process.platform === 'win32'
+                ? './llama.cpp/build/bin/Release/llama-server.exe'
+                : './llama.cpp/build/bin/llama-server')),
             llama_log_dir,
             slot_save_path,
             listen,

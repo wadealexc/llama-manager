@@ -24,6 +24,31 @@ If this doesn't work (or you want to target another backend), you can `cd` into 
 
 ### Run
 
+#### Windows build
+
+Use Node.js and npm, CMake, and Visual Studio 2022 Build Tools with the C++ workload
+and a Windows SDK. For CUDA, install a CUDA toolkit compatible with your compiler.
+From PowerShell, for example with CUDA 12.8:
+
+```powershell
+$env:CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+$env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+cmake -S llama.cpp -B llama.cpp/build -G "Visual Studio 17 2022" -A x64 -T "cuda=$env:CUDA_PATH" -DGGML_CUDA=ON -DCUDAToolkit_ROOT="$env:CUDA_PATH" -DCUDAToolkit_BIN_DIR="$env:CUDA_PATH\bin" -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+cmake --build llama.cpp/build --config Release --parallel 10 --target llama-server
+```
+
+For CPU-only builds, omit the CUDA environment setup and the `-T` and CUDA `-D`
+options. Keep the DLLs alongside `build/bin/Release/llama-server.exe`.
+When changing CUDA versions in an existing build directory, use a fresh build
+directory or clear the cached `CUDA_*` and `CUDAToolkit_*` entries first.
+
+Server mode defaults to that Windows Release executable. In router mode, remove
+the sample config's explicit Unix `router.bin` to use the default, or set it to
+`./llama.cpp/build/bin/Release/llama-server.exe`. Replace the sample model paths
+and host with values for your machine (for local use, `127.0.0.1`).
+Windows shutdown uses forced process-tree termination to include model workers;
+it does not provide Unix-style graceful SIGTERM handling.
+
 * **Server mode**: Serve a single model using an existing `llama-server` invocation
 * **Router mode**: Serve multiple models using a config.yaml file
 
