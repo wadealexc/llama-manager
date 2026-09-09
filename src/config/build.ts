@@ -13,6 +13,9 @@ const log: ConsolaInstance = logger.withTag('config');
 const DEFAULT_LOG_DIR = './logs/';
 const DEFAULT_SLOT_SAVE_DIR = './slots/';
 
+const DEFAULT_LLAMA_BIN = './llama.cpp/build/bin/llama-server';
+const DEFAULT_LLAMA_BIN_WIN32 = './llama.cpp/build/bin/Release/llama-server.exe';
+
 const CTX_KEY = "ctx-size";
 
 const MANAGER_FIELDS = new Set([
@@ -80,7 +83,9 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
     const config: ManagerConfig = {
         mode: source.mode,
         router: {
-            bin: resolve(project_root, (raw_router['bin'] as string) ?? './llama.cpp/build/bin/llama-server'),
+            bin: resolve(project_root, (raw_router['bin'] as string) ?? (process.platform === 'win32'
+                ? DEFAULT_LLAMA_BIN_WIN32
+                : DEFAULT_LLAMA_BIN)),
             llama_log_dir,
             slot_save_path,
             listen,

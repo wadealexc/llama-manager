@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import path from 'path';
 import * as fs from 'fs';
 import type { LlamaConfig, ModelLoadConfig } from "../config/types.js";
@@ -22,7 +22,7 @@ const log: ConsolaInstance = logger.withTag('router-process');
  * kills it on shutdown.
  */
 export class RouterProcess {
-    
+
     config: LlamaConfig;
     model_load_cfg: ModelLoadConfig;
 
@@ -54,6 +54,7 @@ export class RouterProcess {
         const proc = spawn(this.config.bin, argv, {
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: true,
+            windowsHide: true,
         });
 
         log.info(`piping logs to ${log_path}`);
@@ -104,39 +105,63 @@ export class RouterProcess {
         const pid = this.instance.proc.pid!;
         const grace_period_ms = this.config.shutdown_grace_period_ms;
 
-        // Send a kill signal to the process group, then wait for a grace period.
-        const kill = async (
-            signal: string,
-            grace_period_ms: number,
-        ): Promise<boolean> => {
-            try { process.kill(-pid, signal) } catch { }
+        if (process.platform === 'win32') {
+            if (this.instance.proc.exitCode !== null || this.instance.proc.signalCode !== null) return;
 
-            return Promise.race([
-                exited.then(() => true),
-                new Promise<boolean>((resolve) => {
-                    setTimeout(() => resolve(false), grace_period_ms);
-                }),
-            ]);
-        };
+            // Windows does not support negative-PID POSIX process-group signals.
+            // Include model workers in the forced termination of the router tree.
+            await new Promise<void>((resolve, reject) => {
+                execFile('taskkill', ['/PID', String(pid), '/T', '/F'],
+                    { windowsHide: true, timeout: grace_period_ms }, (err) => {
+                        if (err && this.instance?.proc.exitCode === null && this.instance?.proc.signalCode === null) {
+                            reject(new Error(`failed to terminate router process tree (pid ${pid}): ${err.message}`));
+                        } else {
+                            resolve();
+                        }
+                    });
+            });
 
-        // try a graceful shutdown first (SIGTERM)
-        log.info(`killing router process (pid ${pid}) (SIGTERM)...`);
-        if (await kill('SIGTERM', grace_period_ms)) {
-            log.info('done! (graceful shutdown)');
-            return;
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error(`router process ${pid} did not exit`)), grace_period_ms);
+                exited.then(() => { clearTimeout(timeout); resolve(); });
+            });
+
+            log.info('done! (shutdown)');
+        } else {
+            // Send a kill signal to the process group, then wait for a grace period.
+            const kill = async (
+                signal: string,
+                grace_period_ms: number,
+            ): Promise<boolean> => {
+                try { process.kill(-pid, signal) } catch { }
+
+                return Promise.race([
+                    exited.then(() => true),
+                    new Promise<boolean>((resolve) => {
+                        setTimeout(() => resolve(false), grace_period_ms);
+                    }),
+                ]);
+            };
+
+            // try a graceful shutdown first (SIGTERM)
+            log.info(`killing router process (pid ${pid}) (SIGTERM)...`);
+            if (await kill('SIGTERM', grace_period_ms)) {
+                log.info('done! (graceful shutdown)');
+                return;
+            }
+
+            // grace period's up, now it's business (SIGKILL)
+            //
+            // *teleports behind you* "nothin personnel, kid"
+            log.warn(`killing router process (pid ${pid}) (SIGKILL)...`);
+            if (await kill('SIGKILL', grace_period_ms)) {
+                log.warn(`done! (forced shutdown)`);
+                return;
+            }
+
+            // if we don't get a shutdown, burn it all to the ground
+            throw new Error(`failed to kill router process (pid ${pid})`);
         }
-
-        // grace period's up, now it's business (SIGKILL)
-        //
-        // *teleports behind you* "nothin personnel, kid"
-        log.warn(`killing router process (pid ${pid}) (SIGKILL)...`);
-        if (await kill('SIGKILL', grace_period_ms)) {
-            log.warn(`done! (forced shutdown)`);
-            return;
-        }
-
-        // if we don't get a shutdown, burn it all to the ground
-        throw new Error(`failed to kill router process (pid ${pid})`);
     }
 
     async #pollRouter(client: LlamaAPI): Promise<void> {
