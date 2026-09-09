@@ -22,7 +22,7 @@ const log: ConsolaInstance = logger.withTag('router-process');
  * kills it on shutdown.
  */
 export class RouterProcess {
-    
+
     config: LlamaConfig;
     model_load_cfg: ModelLoadConfig;
 
@@ -107,9 +107,9 @@ export class RouterProcess {
 
         if (process.platform === 'win32') {
             if (this.instance.proc.exitCode !== null || this.instance.proc.signalCode !== null) return;
+
             // Windows does not support negative-PID POSIX process-group signals.
             // Include model workers in the forced termination of the router tree.
-            log.info(`terminating Windows router process tree (pid ${pid})...`);
             await new Promise<void>((resolve, reject) => {
                 execFile('taskkill', ['/PID', String(pid), '/T', '/F'],
                     { windowsHide: true, timeout: grace_period_ms }, (err) => {
@@ -120,47 +120,48 @@ export class RouterProcess {
                         }
                     });
             });
+
             await new Promise<void>((resolve, reject) => {
                 const timeout = setTimeout(() => reject(new Error(`router process ${pid} did not exit`)), grace_period_ms);
                 exited.then(() => { clearTimeout(timeout); resolve(); });
             });
-            log.info('done! (Windows process tree terminated)');
-            return;
+
+            log.info('done! (shutdown)');
+        } else {
+            // Send a kill signal to the process group, then wait for a grace period.
+            const kill = async (
+                signal: string,
+                grace_period_ms: number,
+            ): Promise<boolean> => {
+                try { process.kill(-pid, signal) } catch { }
+
+                return Promise.race([
+                    exited.then(() => true),
+                    new Promise<boolean>((resolve) => {
+                        setTimeout(() => resolve(false), grace_period_ms);
+                    }),
+                ]);
+            };
+
+            // try a graceful shutdown first (SIGTERM)
+            log.info(`killing router process (pid ${pid}) (SIGTERM)...`);
+            if (await kill('SIGTERM', grace_period_ms)) {
+                log.info('done! (graceful shutdown)');
+                return;
+            }
+
+            // grace period's up, now it's business (SIGKILL)
+            //
+            // *teleports behind you* "nothin personnel, kid"
+            log.warn(`killing router process (pid ${pid}) (SIGKILL)...`);
+            if (await kill('SIGKILL', grace_period_ms)) {
+                log.warn(`done! (forced shutdown)`);
+                return;
+            }
+
+            // if we don't get a shutdown, burn it all to the ground
+            throw new Error(`failed to kill router process (pid ${pid})`);
         }
-
-        // Send a kill signal to the process group, then wait for a grace period.
-        const kill = async (
-            signal: string,
-            grace_period_ms: number,
-        ): Promise<boolean> => {
-            try { process.kill(-pid, signal) } catch { }
-
-            return Promise.race([
-                exited.then(() => true),
-                new Promise<boolean>((resolve) => {
-                    setTimeout(() => resolve(false), grace_period_ms);
-                }),
-            ]);
-        };
-
-        // try a graceful shutdown first (SIGTERM)
-        log.info(`killing router process (pid ${pid}) (SIGTERM)...`);
-        if (await kill('SIGTERM', grace_period_ms)) {
-            log.info('done! (graceful shutdown)');
-            return;
-        }
-
-        // grace period's up, now it's business (SIGKILL)
-        //
-        // *teleports behind you* "nothin personnel, kid"
-        log.warn(`killing router process (pid ${pid}) (SIGKILL)...`);
-        if (await kill('SIGKILL', grace_period_ms)) {
-            log.warn(`done! (forced shutdown)`);
-            return;
-        }
-
-        // if we don't get a shutdown, burn it all to the ground
-        throw new Error(`failed to kill router process (pid ${pid})`);
     }
 
     async #pollRouter(client: LlamaAPI): Promise<void> {
