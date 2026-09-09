@@ -57,9 +57,10 @@ export interface ConfigSource {
     raw_model_load: Record<string, unknown>;
     host: string;
     port: number;
-    sleep_idle_seconds: number;
+    sleep_idle_seconds?: number;
     default_models?: ModelId[];
     ladder_override?: StrategyId[];
+    bin_override?: string;
 }
 
 export interface ManagerConfig {

@@ -2,6 +2,13 @@
 
 Run your models using optimal configurations that degrade gracefully as context expands. `llama-manager` ensures that you are always serving the most capable version of your model possible by reactively adjusting model configuration as your context window grows.
 
+**Note:** llama-manager uses a custom fork of llama.cpp with the following changes:
+* TODO elaborate
+
+**Note:** llama-manager is in beta and may not be tested with your hardware/model. Please open an issue if you find any bugs, and include your OS, what model you were using, and any relevant logs!
+
+**Note:** llama-manager assumes a single-GPU setup, and defaults to running models entirely on GPU. It will not work for pure-CPU inference, and probably will not work for split inference. If this is something you want, please open an issue.
+
 ### Build
 
 Requires Node.js and npm.
@@ -13,23 +20,24 @@ npm install
 npm run build
 ```
 
-`llama-manager` drives `llama-server` in router mode, which requires a custom fork of llama.cpp (included as a git submodule). To build the server binary:
+#### llama.cpp
+
+`llama-manager` drives `llama-server` in router mode, which requires a custom fork of llama.cpp (included as a git submodule). To build the server binary, cd into the llama.cpp submodule and build llama-server for your platform. `llama.cpp` has detailed build instructions [here](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
+
+If you're on Linux+CUDA like me, you can use this script:
 
 ```sh
-./scripts/build-server.sh          # cpu build
-./scripts/build-server.sh --gpu    # cuda build
+./scripts/build-server.sh --gpu
 ```
-
-If this doesn't work (or you want to target another backend), you can `cd` into the submodule and build llama-server the way you normally would.
 
 ### Run
 
-* **Server mode**: Serve a single model using an existing `llama-server` invocation
+* **Single model**: Serve a single model using an existing `llama-server` invocation
 * **Router mode**: Serve multiple models using a config.yaml file
 
-#### Server Mode
+#### Single Model
 
-Take an existing `llama-server` invocation and run via `llama-manager` instead:
+Use an existing `llama-server` invocation and run via `llama-manager` instead. Most arguments are passed directly through to `llama-server`:
 
 ```sh
 node dist/index.js \
@@ -40,16 +48,15 @@ node dist/index.js \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   -ngl 999
-  --sleep-idle-seconds 300
 ```
 
 Arguments are interpreted the same way `llama-server` would interpret them, with a few
 changes:
-
 - The model starts at its **best-possible configuration**: full-precision kvcache, spec decoding, mmproj on GPU. A breakpoint table showing performance degradation is printed at startup, then the model is loaded and served.
 - `-c` is ignored - context is sized reactively.
 - kvcache arguments are treated as a "lower bound" on kvcache precision. e.g. supplying `--cache-type-k q8_0 --cache-type-v q8_0` will allow kvcache to be quantized to a _minimum_ of q8_0 during inference. If no kvcache precision is supplied, llama-manager will quantize down to q4_0, if needed.
-- Models are never unloaded on idle unless you pass `--sleep-idle-seconds <n>`.
+- Models unload after 10 minutes of idle by default, which also resets
+degradation. Pass `--sleep-idle-seconds <n>` to change it (`0` disables).
   - NOTE: Currently, idle acts as a 'reset' for strategy application, so running with a timeout is recommended.
 
 See `--help` for the full flag list. All other arguments pass through to `llama-server` untouched.

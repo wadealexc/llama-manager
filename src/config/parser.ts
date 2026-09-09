@@ -4,12 +4,14 @@ import { load as yamlLoad } from "js-yaml";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
 import type { ConfigSource, ModelId, RawModel, StrategyId } from "./types.js";
+import { DEFAULT_HOST, DEFAULT_PORT } from "./defaults.js";
 
 const log: ConsolaInstance = logger.withTag('parser');
 
 export type ParsedArgs = {
     mode: 'router';
     config_path?: string;
+    bin?: string;
     show_breakpoints: boolean;
     calc_max_ctx: boolean;
     help: boolean;
@@ -104,19 +106,22 @@ export function rejectedKeyReason(key: string): string | undefined {
 
 const MODEL_SOURCE_FLAGS = new Set(['model', 'model-url']);
 
-const MANAGER_VALUE_FLAGS = new Set(['config', 'ladder', 'sleep-idle-seconds', 'host', 'port', 'slot-save-path']);
+const MANAGER_VALUE_FLAGS = new Set(['bin', 'config', 'ladder', 'sleep-idle-seconds', 'host', 'port', 'slot-save-path']);
 const MANAGER_BOOL_FLAGS = new Set(['show-breakpoints', 'calc-max-ctx', 'serve', 'help', 'version']);
 
 const STRATEGY_IDS: StrategyId[] = ['disable-spec', 'mmproj-to-cpu', 'quantize-kv-q8', 'quantize-kv-q4'];
+export { STRATEGY_IDS };
 
 interface ServerState {
     entry: RawModel;
     raw_router: Record<string, unknown>;
     aliases: string[];
     model_sources: Set<string>;
-    host: string;
-    port: number;
-    sleep_idle_seconds: number;
+    bin?: string;
+    config_path?: string;
+    host?: string;
+    port?: number;
+    sleep_idle_seconds?: number;
     show_breakpoints: boolean;
     calc_max_ctx: boolean;
     help: boolean;
@@ -151,6 +156,9 @@ function parseRouterArgs(argv: string[]): ParsedArgs {
     for (let i = 0; i < argv.length; i++) {
         const name = normalizeFlagName(argv[i]);
         switch (name) {
+            case 'bin':
+                parsed.bin = argv[++i];
+                break;
             case 'config':
                 parsed.config_path = argv[++i];
                 break;
@@ -178,9 +186,6 @@ function parseServerArgs(argv: string[]): ParsedArgs {
         raw_router: {},
         aliases: [],
         model_sources: new Set(),
-        host: '127.0.0.1',
-        port: 8080,
-        sleep_idle_seconds: 0,
         show_breakpoints: false,
         calc_max_ctx: false,
         help: false,
@@ -234,8 +239,12 @@ function parseServerArgs(argv: string[]): ParsedArgs {
 
 function handleManagerValue(state: ServerState, name: string, value: string): void {
     switch (name) {
+        case 'bin':
+            state.bin = value;
+            return;
         case 'config':
-            throw new Error(`--config cannot be combined with a model source`);
+            state.config_path = value;
+            return;
         case 'ladder':
             state.ladder = parseLadder(value);
             return;
@@ -320,16 +329,27 @@ function finalizeServer(state: ServerState): ParsedArgs {
         state.entry['alias'] = rest;
     }
 
+    let config: ConfigSource | undefined;
+    const config_path = state.config_path ?? process.env.MANAGER_CONFIG;
+    if (config_path !== undefined) {
+        config = parseRouterConfig(config_path);
+        const ignored = Object.keys(config.raw_models);
+        if (ignored.length > 0) {
+            log.error(`server mode: ignoring ${ignored.length} model(s) from config '${config_path}': ${ignored.join(', ')}`);
+        }
+    }
+
     const source: ConfigSource = {
         mode: 'server',
         raw_models: { [id]: state.entry },
-        raw_router: state.raw_router,
-        raw_model_load: {},
-        host: state.host,
-        port: state.port,
-        sleep_idle_seconds: state.sleep_idle_seconds,
+        raw_router: { ...config?.raw_router, ...state.raw_router },
+        raw_model_load: config?.raw_model_load ?? {},
+        host: state.host ?? config?.host ?? DEFAULT_HOST,
+        port: state.port ?? config?.port ?? DEFAULT_PORT,
+        sleep_idle_seconds: state.sleep_idle_seconds ?? config?.sleep_idle_seconds,
         default_models: [id],
         ladder_override: state.ladder,
+        bin_override: state.bin,
     };
 
     return {
@@ -408,8 +428,8 @@ export function parseRouterConfig(path: string): ConfigSource {
         raw_models: (raw.models as Record<string, RawModel>) ?? {},
         raw_router: (raw.router ?? {}) as Record<string, unknown>,
         raw_model_load: (raw['model-load'] ?? {}) as Record<string, unknown>,
-        host: (raw.host as string) ?? '127.0.0.1',
-        port: (raw.port as number) ?? 8080,
+        host: (raw.host as string) ?? DEFAULT_HOST,
+        port: (raw.port as number) ?? DEFAULT_PORT,
         sleep_idle_seconds: (raw['sleep-idle-seconds'] as number) ?? 300,
         default_models: raw['default-models'] as string[] | undefined,
     };

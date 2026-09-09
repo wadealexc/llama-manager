@@ -1,20 +1,15 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
-import { canonicalKey, rejectedKeyReason } from "./parser.js";
+import { canonicalKey, rejectedKeyReason, STRATEGY_IDS } from "./parser.js";
+import { DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
 import { type ConfigSource, type ManagerConfig, type Mode, type ModelConfig, type ModelState, type RawModel, type StrategyId } from "./types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 
 const log: ConsolaInstance = logger.withTag('config');
-
-const DEFAULT_LOG_DIR = './logs/';
-const DEFAULT_SLOT_SAVE_DIR = './slots/';
-
-const DEFAULT_LLAMA_BIN = './llama.cpp/build/bin/llama-server';
-const DEFAULT_LLAMA_BIN_WIN32 = './llama.cpp/build/bin/Release/llama-server.exe';
 
 const CTX_KEY = "ctx-size";
 
@@ -49,9 +44,10 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
         interpreted.set(id, interpretEntry(raw, source.mode));
     }
 
-    if (source.mode === 'server') {
-        const interp = interpreted.values().next().value!;
-        interp.entry['ladder'] = source.ladder_override ?? deriveLadder(interp.entry, interp.cache_floor);
+    for (const interp of interpreted.values()) {
+        if (!('ladder' in interp.entry)) {
+            interp.entry['ladder'] = source.ladder_override ?? deriveLadder(interp.entry, interp.cache_floor);
+        }
     }
 
     validateAliases(interpreted);
@@ -76,29 +72,34 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
     const llama_log_dir = resolve(project_root, normalizeDir((raw_router['llama-log-dir'] as string) ?? DEFAULT_LOG_DIR));
     const slot_save_path = resolve(project_root, normalizeDir((raw_router['slot-save-path'] as string) ?? DEFAULT_SLOT_SAVE_DIR));
 
+    // resolve llama-server binary. tiered resolution: [--bin flag, MANAGER_BIN env, config.yaml, default location]
+    const default_bin = process.platform === 'win32' ? DEFAULT_LLAMA_BIN_WIN32 : DEFAULT_LLAMA_BIN;
+    const bin = resolve(project_root, source.bin_override ?? process.env.MANAGER_BIN ?? (raw_router['bin'] as string) ?? default_bin);
+    if (!existsSync(bin)) {
+        throw new Error(`llama-server binary not found at '${bin}'. build it with scripts/build-llamacpp.sh, or supply one via --bin, the MANAGER_BIN env var, or 'router.bin' in the config`);
+    }
+
     const router_listen = raw_router['listen'] as string | undefined;
-    const listen = router_listen ?? `127.0.0.1:${await findFreePort()}`;
+    const listen = router_listen ?? `${DEFAULT_HOST}:${await findFreePort()}`;
 
     const raw_model_load = source.raw_model_load;
     const config: ManagerConfig = {
         mode: source.mode,
         router: {
-            bin: resolve(project_root, (raw_router['bin'] as string) ?? (process.platform === 'win32'
-                ? DEFAULT_LLAMA_BIN_WIN32
-                : DEFAULT_LLAMA_BIN)),
+            bin,
             llama_log_dir,
             slot_save_path,
             listen,
-            poll_interval_ms: (raw_router['poll-interval-ms'] as number) ?? 50,
-            poll_timeout_ms: (raw_router['poll-timeout-ms'] as number) ?? 10000,
-            shutdown_grace_period_ms: (raw_router['shutdown-grace-period-ms'] as number) ?? 10000,
+            poll_interval_ms: (raw_router['poll-interval-ms'] as number) ?? DEFAULT_ROUTER_POLL_INTERVAL_MS,
+            poll_timeout_ms: (raw_router['poll-timeout-ms'] as number) ?? DEFAULT_ROUTER_POLL_TIMEOUT_MS,
+            shutdown_grace_period_ms: (raw_router['shutdown-grace-period-ms'] as number) ?? DEFAULT_ROUTER_SHUTDOWN_GRACE_MS,
         },
         host: source.host,
         port: source.port,
-        sleep_idle_seconds: source.sleep_idle_seconds,
+        sleep_idle_seconds: source.sleep_idle_seconds ?? DEFAULT_SLEEP_IDLE_SECONDS,
         model_load: {
-            poll_interval_ms: (raw_model_load['poll-interval-ms'] as number) ?? 100,
-            poll_timeout_ms: (raw_model_load['poll-timeout-ms'] as number) ?? 50000,
+            poll_interval_ms: (raw_model_load['poll-interval-ms'] as number) ?? DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS,
+            poll_timeout_ms: (raw_model_load['poll-timeout-ms'] as number) ?? DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS,
         },
         models,
         default_models,
@@ -132,6 +133,18 @@ function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
                 aliases.push(...aliasValues(value));
                 entry['alias'] = value;
                 break;
+            case 'ladder': {
+                const ids = Array.isArray(value)
+                    ? value.map(String)
+                    : String(value).split(',').map(s => s.trim()).filter(s => s !== '');
+                for (const id of ids) {
+                    if (!STRATEGY_IDS.includes(id as StrategyId)) {
+                        throw new Error(`unknown strategy id '${id}' in 'ladder' (supported: ${STRATEGY_IDS.join(', ')})`);
+                    }
+                }
+                entry['ladder'] = ids;
+                break;
+            }
             case 'ctx-size':
                 if (mode === 'server') {
                     log.error(`'ctx-size' is ignored; context is sized reactively. run with --show-breakpoints to see achievable context sizes`);
@@ -364,7 +377,7 @@ function findFreePort(): Promise<number> {
     return new Promise((resolve, reject) => {
         const server = net.createServer();
         server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
+        server.listen(0, DEFAULT_HOST, () => {
             const addr = server.address() as AddressInfo;
             server.close(() => resolve(addr.port));
         });

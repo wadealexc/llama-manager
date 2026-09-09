@@ -33,21 +33,26 @@ Pass a config file to run in router mode:
   llama-manager --config ./config.yaml
 
 Flags (router mode):
-  --config <path>            run in router mode with the given config file
   --show-breakpoints         print per-rung context capacity, then exit
   --serve                    load default models at startup
 
 Flags (server mode):
   --host <host>              external listen host (default: 127.0.0.1)
   --port <port>              external listen port (default: 8080)
-  --sleep-idle-seconds <n>   unload all models after n idle seconds (default: disabled)
+  --sleep-idle-seconds <n>   unload all models after n idle seconds (default: 600)
   --ladder <id,...>          override the default strategy ladder
     (default: [disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4])
 
 Flags (both):
+  --bin <path>               path to the llama-server binary
+  --config <path>            supply a config file. router mode reads models from
+                             it; server mode takes manager settings only (model
+                             entries are ignored with a warning)
   --calc-max-ctx             calculate max ctx for GET /v1/models
   --version                  print version
   --help                     print this message
+
+MANAGER_CONFIG=<path> may be used in place of --config.
 
 All other arguments are passed through to llama-server.`;
 
@@ -66,18 +71,14 @@ try {
         process.exit(0);
     }
 
-    if (parsed.mode === 'server') {
-        const env_path = process.env.MANAGER_CONFIG;
-        if (env_path !== undefined && resolve(env_path) !== DEFAULT_CONFIG_PATH) {
-            throw new Error(`model source cannot be combined with manager config path (MANAGER_CONFIG=${env_path})`);
-        }
-    }
-
     const config_path = parsed.mode === 'server'
         ? undefined
         : (parsed.config_path ?? process.env.MANAGER_CONFIG ?? DEFAULT_CONFIG_PATH);
 
     const source = parsed.mode === 'server' ? parsed.source : parseRouterConfig(config_path!);
+    if (parsed.mode === 'router' && parsed.bin !== undefined) {
+        source.bin_override = parsed.bin;
+    }
     config = await buildConfig(source, PROJECT_ROOT, PRESET_PATH);
 } catch (err) {
     log.error(err instanceof Error ? err.message : String(err));
@@ -164,6 +165,13 @@ try {
         await planner.serveDefault();
     }
     await api.start();
+
+    log.box([
+        `llama-manager is running`,
+        ``,
+        `  api:    http://${config.host}:${config.port}`,
+        `  models: ${[...models.keys()].join(', ')}`,
+    ].join('\n'));
 } catch (err) {
     log.error(`startup error: ${err}`);
     await shutdown('error');

@@ -5,4 +5,4 @@
 
 *.ini
 
-generated-cost-model.json
+config.yaml

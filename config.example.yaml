@@ -1,0 +1,51 @@
+router:
+    # path to llama-server binary
+    bin: ./llama.cpp/build/bin/llama-server
+    
+# External listen address. OAI interface is exposed here.
+host: 127.0.0.1
+port: 8080
+
+# Seconds of idle after which current models are unloaded
+# Note: idle resets model degradation strategies and deletes stored kvcaches. 
+# On wakeup, the model will be served at baseline.
+sleep-idle-seconds: 3000
+
+models:
+    qwen3.8-27b:
+        model: /home/user/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf
+        mmproj: /home/user/models/qwen3.8/mmproj-BF16.gguf
+
+        spec-type: draft-mtp
+        spec-draft-n-max: 2
+
+        fit-target: 512
+        n-gpu-layers: 99
+
+        # qwen3.8-27b doesn't specify a ladder, meaning it will use the default
+        # strategy order. this is equivalent to:
+        # ladder: [disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4]
+    qwen3.6-27b:
+        model: /home/user/models/qwen3.6/Qwen3.6-27B-UD-Q4_K_XL.gguf
+        mmproj: /home/user/models/qwen3.6/mmproj-BF16.gguf
+
+        spec-type: draft-mtp
+        spec-draft-n-max: 2
+
+        fit-target: 512
+        n-gpu-layers: 99
+
+        # reorder default strategies
+        # note that quantize-kv-q4 will never be applied
+        ladder: [mmproj-to-cpu, disable-spec, quantize-kv-q8]
+    qwen3.5-9b:
+        model: /home/user/models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf
+        mmproj: /home/user/models/qwen3.5-9b/mmproj-BF16.gguf
+
+        fit-target: 512
+        n-gpu-layers: 99
+
+        # empty ladder: no strategies will be applied (mmproj stays on GPU, kvcache stays f16)
+        ladder: []
+
+default-models: [qwen3.8-27b]
