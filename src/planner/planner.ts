@@ -105,7 +105,7 @@ export class Planner {
 
         this.#updateMem(await this.client.getMemory(model.name, this.shutdown_ctrl.signal));
 
-        await this.#onFirstLoad(model, t?.child('firstLoad'));
+        await this.#onFirstLoad(model, t?.child('onFirstLoad'));
 
         log.info(`serveDefault: loading kvcache for ${model.name}`);
         const n_ctx = await model.loadWithKV(null, this.shutdown_ctrl.signal, t?.child('loadWithKV'));

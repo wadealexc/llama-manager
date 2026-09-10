@@ -5,7 +5,7 @@ llama-manager runs your models using optimal configurations that degrade gracefu
 **Notes:**
 - **llama-manager is in beta** and may not be tested with your hardware/model. Please open an issue if you find any bugs, and include your OS, what model you were using, and any relevant logs!
 - **llama-manager assumes inference uses a single GPU**. It will not work for pure-CPU inference, and probably will not work for split inference. If this is something you want, please open an issue.
-- llama-manager uses a custom fork of llama.cpp. See (TODO) for details on what the fork introduces.
+- llama-manager uses a custom fork of llama.cpp. See ([llama.cpp changes](#llamacpp-changes)) for details on what the fork introduces.
 
 ---
 
@@ -86,7 +86,7 @@ When serving a model, llama-manager reactively applies strategies to free up dev
 - `quantize-kv-q8`: Quantize kvcache to q8_0
 - `quantize-kv-q4`: Quantize kvcache to q4_0
 
-By default, strategies are applied in the following order: [`disable-spec`, `mmproj-to-cpu`, `quantize-kv-q8`, `quantize-kv-q8`]. This order can be changed via the CLI flag `--ladder` (or by editing your config.yaml. See [the example](./config.example.yaml)).
+By default, strategies are applied in the following order: [`disable-spec`, `mmproj-to-cpu`, `quantize-kv-q8`, `quantize-kv-q4`]. This order can be changed via the CLI flag `--ladder` (or by editing your config.yaml. See [the example](./config.example.yaml)).
 
 Strategies are displayed when a model is loaded for the first time:
 
@@ -109,19 +109,21 @@ Strategies are displayed when a model is loaded for the first time:
 llama-manager uses [my fork of llama.cpp](https://github.com/wadealexc/llama.cpp/tree/feat/reload-runtime). This version has a few notable changes:
 - New: `common_init_result::reinit_context`
   - This method factors out some common model initialization logic from `common_init_result`'s constructor, and defines a method `reinit_context` to reset a model's existing context and reinit using the factored logic.
+- New: `fit.cpp::common_fit_for_reload`
+  - Performs fit calculations while assuming the model's weights are already in place. (Needs work)
 - New: `server_context_impl::reload_model`
   - Acts as the reload analogue to `server_context_impl::load_model`. This method performs similar steps to `load_model`, except that it assumes model weights have already been loaded, and instead calls `reinit_context` rather than `common_init_from_params`.
   - Note that if `n_ctx: 0` is passed in, `reload_model` performs a fit calculation to reload to the max possible ctx (similar to `load_model` fit).
 - New HTTP endpoint: `POST /reload`
-  - Exposes `reload_model` as an HTTP endpoint, returning the new `n_ctx` after reloading. `POST /reload` accepts input in the form `ReloadParams` (see [the definition in types.ts](`src/client/types.ts`)).
+  - Exposes `reload_model` as an HTTP endpoint, returning the new `n_ctx` after reloading. `POST /reload` accepts input in the form `ReloadParams` (see [the type definition in types.ts](`src/client/types.ts`)).
 - New HTTP endpoint: `GET /memory`
-  - Query the amount of space a currently-loaded model occupies on each backend device, broken down by component. Outputs `MemoryResponse` (see [the definition in types.ts](`src/client/types.ts`)).
+  - Query the amount of space a currently-loaded model occupies on each backend device, broken down by component. Outputs `MemoryResponse` (see [the type definition in types.ts](`src/client/types.ts`)).
 - Modified: `POST /slots/:id-slot` (fix prompt reuse for swa/hybrid/recurrent models)
   - `?action=save`: adds an additional 'sidecar' save file that saves prompt checkpoints
   - `?action=restore`: reads the aforementioned sidecar to restore prompt checkpoints
   - (Here, I adapted a solution from [this issue](https://github.com/ggml-org/llama.cpp/issues/25913))
 - Modified: `POST /slots/:id-slot` (convert kvcache precision)
-  - `?action=restore`: when restoring a slot, automatically convert between f16 / q8_0 / q4_0 precision, rather than rejecting.
+  - `?action=restore`: when restoring a slot, automatically convert between f16 / q8_0 / q4_0 precision, rather than rejecting. (Needs work)
 
 The llama.cpp work is admittedly a little messy in places. I'm still working on cleaning/polishing it, as I think these features are genuinely useful and would like to contribute upstream. I'm releasing it now to get feedback from the community, as getting llama.cpp maintainer eyes on PRs has proved quite challenging so far!
 
