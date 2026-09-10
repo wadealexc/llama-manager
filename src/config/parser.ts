@@ -3,241 +3,167 @@ import { basename } from "node:path";
 import { load as yamlLoad } from "js-yaml";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
-import type { ConfigSource, ModelId, RawModel, StrategyId } from "./types.js";
-import { DEFAULT_HOST, DEFAULT_PORT } from "./defaults.js";
+import { STRATEGY_IDS, type ConfigSource, type Mode, type ModelId, type RawModel, type StrategyId } from "./types.js";
+import { hasValue, isManagerBoolFlag, isManagerValueFlag, isModelSource, isRecognized, maybeReject, normalizeFlag } from "./flags.js";
 
 const log: ConsolaInstance = logger.withTag('parser');
 
-export type ParsedArgs = {
-    mode: 'router';
-    config_path?: string;
-    bin?: string;
-    show_breakpoints: boolean;
-    calc_max_ctx: boolean;
-    help: boolean;
-    version: boolean;
-} | {
-    mode: 'server';
-    source: ConfigSource;
-    show_breakpoints: boolean;
-    calc_max_ctx: boolean;
-    help: boolean;
-    version: boolean;
-};
-
-interface FlagDef {
-    aliases: string[];
-    value: boolean;
-}
-
-// tokenization grammar for llama-server args. canonical flag name -> ini key.
-// `value` marks flags that consume the next token; the rest are bool flags
-const FLAGS: Record<string, FlagDef> = {
-    'model': { aliases: ['m'], value: true },
-    'model-url': { aliases: ['mu'], value: true },
-    'alias': { aliases: ['a'], value: true },
-    'mmproj': { aliases: ['mm'], value: true },
-    'mmproj-url': { aliases: ['mmu'], value: true },
-    'mmproj-auto': { aliases: [], value: false },
-    'no-mmproj': { aliases: [], value: false },
-    'no-mmproj-auto': { aliases: [], value: false },
-    'mmproj-offload': { aliases: [], value: false },
-    'no-mmproj-offload': { aliases: [], value: false },
-    'mmproj-device': { aliases: ['mmdev'], value: true },
-    'spec-type': { aliases: [], value: true },
-    'cache-type-k': { aliases: ['ctk'], value: true },
-    'cache-type-v': { aliases: ['ctv'], value: true },
-    'ctx-size': { aliases: ['c'], value: true },
-    'n-gpu-layers': { aliases: ['ngl', 'gpu-layers'], value: true },
-    'api-key': { aliases: [], value: true },
-    'api-key-file': { aliases: [], value: true },
-    'device': { aliases: ['dev'], value: true },
-    'fa': { aliases: ['flash-attn'], value: true },
-    'no-fa': { aliases: [], value: false },
-    'fit': { aliases: [], value: true },
-    'fit-print': { aliases: ['fitp'], value: true },
-    'fit-target': { aliases: ['fitt'], value: true },
-    'fit-ctx': { aliases: ['fitc'], value: true },
-    'parallel': { aliases: ['np'], value: true },
-    'kv-unified': { aliases: ['kvu'], value: false },
-    'no-kv-unified': { aliases: ['no-kvu'], value: false },
-    'kv-offload': { aliases: ['kvo'], value: false },
-    'no-kv-offload': { aliases: ['nkvo'], value: false },
-    'op-offload': { aliases: [], value: false },
-    'no-op-offload': { aliases: [], value: false },
-    'swa-full': { aliases: [], value: false },
-    'n-cpu-moe': { aliases: ['ncmoe'], value: true },
-    'n-cpu-moe-draft': { aliases: ['ncmoed', 'spec-draft-ncmoe', 'spec-draft-n-cpu-moe'], value: true },
-    'override-tensor': { aliases: ['ot'], value: true },
-    'override-tensor-draft': { aliases: ['otd', 'spec-draft-override-tensor'], value: true },
-    'lora': { aliases: [], value: true },
-    'webui': { aliases: ['ui'], value: false },
-    'no-webui': { aliases: ['no-ui'], value: false },
-};
-
-const CANONICAL: Record<string, string> = {};
-for (const [canonical, def] of Object.entries(FLAGS)) {
-    CANONICAL[canonical] = canonical;
-    for (const alias of def.aliases) {
-        CANONICAL[alias] = canonical;
-    }
-}
-
-export function canonicalKey(raw: string): string | undefined {
-    return CANONICAL[normalizeFlagName(raw)];
-}
-
-const REJECTED_HF = new Set(['hf', 'hfr', 'hf-repo', 'hff', 'hf-file', 'hft', 'hf-token', 'dr', 'docker-repo', 'mtp']);
-const REJECTED_MULTI_DEVICE = new Set(['ts', 'tensor-split', 'sm', 'split-mode']);
-const REJECTED_ROUTER_LEVEL = new Set(['models-preset', 'models-dir', 'models-max', 'models-autoload', 'no-models-autoload']);
-
-export function rejectedKeyReason(key: string): string | undefined {
-    if (REJECTED_HF.has(key)) {
-        return `'${key}' is not supported: hf/docker model sources resolve remote router presets`;
-    }
-    if (REJECTED_MULTI_DEVICE.has(key) || key.startsWith('rpc')) {
-        return `'${key}' implies multi-device placement, which is unsupported`;
-    }
-    if (REJECTED_ROUTER_LEVEL.has(key)) {
-        return `'${key}' is a router-level flag and cannot appear in a model config`;
-    }
-    return undefined;
-}
-
-const MODEL_SOURCE_FLAGS = new Set(['model', 'model-url']);
-
-const MANAGER_VALUE_FLAGS = new Set(['bin', 'config', 'ladder', 'sleep-idle-seconds', 'host', 'port', 'slot-save-path']);
-const MANAGER_BOOL_FLAGS = new Set(['show-breakpoints', 'calc-max-ctx', 'serve', 'help', 'version']);
-
-const STRATEGY_IDS: StrategyId[] = ['disable-spec', 'mmproj-to-cpu', 'quantize-kv-q8', 'quantize-kv-q4'];
-export { STRATEGY_IDS };
-
-interface ServerState {
-    entry: RawModel;
-    raw_router: Record<string, unknown>;
-    aliases: string[];
-    model_sources: Set<string>;
+// accumulates the manager flags shared by both modes' parsers
+interface ManagerFlags {
     bin?: string;
     config_path?: string;
     host?: string;
     port?: number;
     sleep_idle_seconds?: number;
-    show_breakpoints: boolean;
-    calc_max_ctx: boolean;
+    ladder?: StrategyId[];
+    slot_save_path?: string;
+    idle: boolean;
+    calc_breakpoints: boolean;
     help: boolean;
     version: boolean;
-    ladder?: StrategyId[];
+}
+
+interface ServerState extends ManagerFlags {
+    entry: RawModel;
+    aliases: string[];
+    model_sources: Set<string>;
     seen: Set<string>;
 }
 
+export interface ParsedArgs extends ManagerFlags {
+    mode: Mode;
+
+    // server mode only
+    raw_models?: Record<string, RawModel>;
+}
+
 export function parseArgs(argv: string[]): ParsedArgs {
+    // first pass - reject unsupported keys
     for (const tok of argv) {
         if (!tok.startsWith('-')) continue;
-        const reason = rejectedKeyReason(normalizeFlagName(tok));
+        const reason = maybeReject(normalizeFlag(tok));
         if (reason) throw new Error(reason);
     }
 
-    const has_model_source = argv.some(tok => tok.startsWith('-') && MODEL_SOURCE_FLAGS.has(normalizeFlagName(tok)));
+    // if CLI args pass in an explicit model source, parse and prepare to serve single model
+    const has_model_source = argv.some(tok => tok.startsWith('-') && isModelSource(normalizeFlag(tok)));
     if (has_model_source) {
         return parseServerArgs(argv);
     }
+
+    // model source must be in supplied config and may contain multiple models
     return parseRouterArgs(argv);
 }
 
 function parseRouterArgs(argv: string[]): ParsedArgs {
-    const parsed: Extract<ParsedArgs, { mode: 'router' }> = {
-        mode: 'router',
-        show_breakpoints: false,
-        calc_max_ctx: false,
+    const flags: ManagerFlags = {
+        idle: false,
+        calc_breakpoints: false,
         help: false,
         version: false,
     };
 
-    for (let i = 0; i < argv.length; i++) {
-        const name = normalizeFlagName(argv[i]);
-        switch (name) {
-            case 'bin':
-                parsed.bin = argv[++i];
-                break;
-            case 'config':
-                parsed.config_path = argv[++i];
-                break;
-            case 'show-breakpoints':
-                parsed.show_breakpoints = true;
-                break;
-            case 'calc-max-ctx':
-                parsed.calc_max_ctx = true;
-                break;
-            case 'help':
-                parsed.help = true;
-                break;
-            case 'version':
-                parsed.version = true;
-                break;
-        }
-    }
+    parseLlamaArgs(argv, flags, () => { });
 
-    return parsed;
+    return { mode: 'router', ...flags };
 }
 
 function parseServerArgs(argv: string[]): ParsedArgs {
     const state: ServerState = {
         entry: {},
-        raw_router: {},
         aliases: [],
         model_sources: new Set(),
-        show_breakpoints: false,
-        calc_max_ctx: false,
+        idle: false,
+        calc_breakpoints: false,
         help: false,
         version: false,
         seen: new Set(),
     };
 
+    parseLlamaArgs(argv, state, (key, value) => setEntryValue(state, key, value));
+
+    if (state.model_sources.size === 0) {
+        throw new Error(`server mode requires a model source (-m/--model or -mu/--model-url)`);
+    }
+
+    if (state.model_sources.size > 1) {
+        throw new Error(`server mode accepts exactly one model source`);
+    }
+
+    const source_path = (state.entry['model'] ?? state.entry['model-url']) as string;
+    const id = state.aliases.length > 0 ? state.aliases[0] : deriveModelId(source_path);
+
+    const rest = state.aliases.slice(1);
+    if (rest.length > 0) {
+        state.entry['alias'] = rest;
+    }
+
+    return {
+        mode: 'server',
+        bin: state.bin,
+        config_path: state.config_path,
+        host: state.host,
+        port: state.port,
+        sleep_idle_seconds: state.sleep_idle_seconds,
+        ladder: state.ladder,
+        slot_save_path: state.slot_save_path,
+        idle: state.idle,
+        calc_breakpoints: state.calc_breakpoints,
+        help: state.help,
+        version: state.version,
+        raw_models: { [id]: state.entry },
+    };
+}
+
+function parseLlamaArgs(
+    argv: string[],
+    flags: ManagerFlags,
+    sink: (key: string, value: string | number | boolean) => void,
+): void {
     let i = 0;
     while (i < argv.length) {
         const tok = argv[i];
         if (!tok.startsWith('-')) {
-            log.error(`server mode: ignoring positional argument '${tok}'`);
+            log.error(`ignoring positional argument '${tok}'`);
             i++;
             continue;
         }
 
-        const name = normalizeFlagName(tok);
+        const name = normalizeFlag(tok);
         i++;
 
-        if (MANAGER_VALUE_FLAGS.has(name)) {
+        if (isManagerValueFlag(name)) {
             const value = consumeValue(argv, i, tok);
             i = value.next;
-            handleManagerValue(state, name, value.value);
+            handleManagerValue(flags, name, value.value);
             continue;
         }
 
-        if (MANAGER_BOOL_FLAGS.has(name)) {
-            handleManagerBool(state, name);
+        if (isManagerBoolFlag(name)) {
+            handleManagerBool(flags, name);
             continue;
         }
 
-        const canonical = CANONICAL[name];
-        if (!canonical) {
+        // if we don't recognize the flag, try to consume a value
+        if (!isRecognized(name)) {
             const consumed = consumeUnknownValue(argv, i);
             i = consumed.next;
-            setEntryValue(state, name, coerceValue(consumed.value));
+            sink(name, coerceValue(consumed.value));
             continue;
         }
 
-        if (FLAGS[canonical].value) {
+        // flag is recognized - consume a value if needed
+        if (hasValue(name)) {
             const value = consumeValue(argv, i, tok);
             i = value.next;
-            setEntryValue(state, canonical, coerceValue(value.value));
+            sink(name, coerceValue(value.value));
         } else {
-            setEntryValue(state, canonical, true);
+            sink(name, true);
         }
     }
-
-    return finalizeServer(state);
 }
 
-function handleManagerValue(state: ServerState, name: string, value: string): void {
+function handleManagerValue(state: ManagerFlags, name: string, value: string): void {
     switch (name) {
         case 'bin':
             state.bin = value;
@@ -260,20 +186,18 @@ function handleManagerValue(state: ServerState, name: string, value: string): vo
             state.port = toInt(value, name);
             return;
         case 'slot-save-path':
-            state.raw_router['slot-save-path'] = value;
+            state.slot_save_path = value;
             return;
     }
 }
 
-function handleManagerBool(state: ServerState, name: string): void {
+function handleManagerBool(state: ManagerFlags, name: string): void {
     switch (name) {
-        case 'show-breakpoints':
-            state.show_breakpoints = true;
+        case 'idle':
+            state.idle = true;
             return;
-        case 'calc-max-ctx':
-            state.calc_max_ctx = true;
-            return;
-        case 'serve':
+        case 'calc-breakpoints':
+            state.calc_breakpoints = true;
             return;
         case 'help':
             state.help = true;
@@ -311,55 +235,6 @@ function setEntryValue(state: ServerState, key: string, value: string | number |
     }
 
     state.entry[key] = value;
-}
-
-function finalizeServer(state: ServerState): ParsedArgs {
-    if (state.model_sources.size === 0) {
-        throw new Error(`server mode requires a model source (-m/--model or -mu/--model-url)`);
-    }
-    if (state.model_sources.size > 1) {
-        throw new Error(`server mode accepts exactly one model source`);
-    }
-
-    const source_path = (state.entry['model'] ?? state.entry['model-url']) as string;
-    const id = state.aliases.length > 0 ? state.aliases[0] : deriveModelId(source_path);
-
-    const rest = state.aliases.slice(1);
-    if (rest.length > 0) {
-        state.entry['alias'] = rest;
-    }
-
-    let config: ConfigSource | undefined;
-    const config_path = state.config_path ?? process.env.MANAGER_CONFIG;
-    if (config_path !== undefined) {
-        config = parseRouterConfig(config_path);
-        const ignored = Object.keys(config.raw_models);
-        if (ignored.length > 0) {
-            log.error(`server mode: ignoring ${ignored.length} model(s) from config '${config_path}': ${ignored.join(', ')}`);
-        }
-    }
-
-    const source: ConfigSource = {
-        mode: 'server',
-        raw_models: { [id]: state.entry },
-        raw_router: { ...config?.raw_router, ...state.raw_router },
-        raw_model_load: config?.raw_model_load ?? {},
-        host: state.host ?? config?.host ?? DEFAULT_HOST,
-        port: state.port ?? config?.port ?? DEFAULT_PORT,
-        sleep_idle_seconds: state.sleep_idle_seconds ?? config?.sleep_idle_seconds,
-        default_models: [id],
-        ladder_override: state.ladder,
-        bin_override: state.bin,
-    };
-
-    return {
-        mode: 'server',
-        source,
-        show_breakpoints: state.show_breakpoints,
-        calc_max_ctx: state.calc_max_ctx,
-        help: state.help,
-        version: state.version,
-    };
 }
 
 function parseLadder(value: string): StrategyId[] {
@@ -400,10 +275,6 @@ function coerceValue(v: string | true): string | number | boolean {
     return isNumeric(v) ? Number(v) : v;
 }
 
-function normalizeFlagName(tok: string): string {
-    return tok.replace(/^-+/, '').replaceAll('_', '-');
-}
-
 function isNumeric(s: string): boolean {
     return /^-?\d+(\.\d+)?$/.test(s);
 }
@@ -428,9 +299,9 @@ export function parseRouterConfig(path: string): ConfigSource {
         raw_models: (raw.models as Record<string, RawModel>) ?? {},
         raw_router: (raw.router ?? {}) as Record<string, unknown>,
         raw_model_load: (raw['model-load'] ?? {}) as Record<string, unknown>,
-        host: (raw.host as string) ?? DEFAULT_HOST,
-        port: (raw.port as number) ?? DEFAULT_PORT,
-        sleep_idle_seconds: (raw['sleep-idle-seconds'] as number) ?? 300,
-        default_models: raw['default-models'] as string[] | undefined,
+        host: raw.host as string | undefined,
+        port: raw.port as number | undefined,
+        sleep_idle_seconds: raw['sleep-idle-seconds'] as number | undefined,
+        default_model: raw['default-model'] as string | undefined,
     };
 }

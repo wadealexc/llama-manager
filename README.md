@@ -1,13 +1,13 @@
 ## llama-manager
 
-Run your models using optimal configurations that degrade gracefully as context expands. `llama-manager` ensures that you are always serving the most capable version of your model possible by reactively adjusting model configuration as your context window grows.
+llama-manager runs your models using optimal configurations that degrade gracefully as context expands. This ensures that you are always serving the most capable version of your model possible by reactively adjusting model configuration as your context window grows.
 
-**Note:** llama-manager uses a custom fork of llama.cpp with the following changes:
-* TODO elaborate
+**Notes:**
+- **llama-manager is in beta** and may not be tested with your hardware/model. Please open an issue if you find any bugs, and include your OS, what model you were using, and any relevant logs!
+- **llama-manager assumes inference uses a single GPU**. It will not work for pure-CPU inference, and probably will not work for split inference. If this is something you want, please open an issue.
+- llama-manager uses a custom fork of llama.cpp. See (TODO) for details on what the fork introduces.
 
-**Note:** llama-manager is in beta and may not be tested with your hardware/model. Please open an issue if you find any bugs, and include your OS, what model you were using, and any relevant logs!
-
-**Note:** llama-manager assumes a single-GPU setup, and defaults to running models entirely on GPU. It will not work for pure-CPU inference, and probably will not work for split inference. If this is something you want, please open an issue.
+---
 
 ### Build
 
@@ -22,7 +22,7 @@ npm run build
 
 #### llama.cpp
 
-`llama-manager` drives `llama-server` in router mode, which requires a custom fork of llama.cpp (included as a git submodule). To build the server binary, cd into the llama.cpp submodule and build llama-server for your platform. `llama.cpp` has detailed build instructions [here](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
+llama-manager drives `llama-server` via a custom fork of llama.cpp. To build the server binary, cd into the llama.cpp submodule and build llama-server for your platform. llama.cpp has detailed build instructions [here](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
 
 If you're on Linux+CUDA like me, you can use this script:
 
@@ -30,14 +30,15 @@ If you're on Linux+CUDA like me, you can use this script:
 ./scripts/build-server.sh --gpu
 ```
 
+---
+
 ### Run
 
-* **Single model**: Serve a single model using an existing `llama-server` invocation
-* **Router mode**: Serve multiple models using a config.yaml file
+Supply args/config as either/both CLI args, or YAML.
 
 #### Single Model
 
-Use an existing `llama-server` invocation and run via `llama-manager` instead. Most arguments are passed directly through to `llama-server`:
+Serve a model directly from the command line using the same syntax as `llama-server`:
 
 ```sh
 node dist/index.js \
@@ -50,57 +51,44 @@ node dist/index.js \
   -ngl 999
 ```
 
-Arguments are interpreted the same way `llama-server` would interpret them, with a few
-changes:
-- The model starts at its **best-possible configuration**: full-precision kvcache, spec decoding, mmproj on GPU. A breakpoint table showing performance degradation is printed at startup, then the model is loaded and served.
-- `-c` is ignored - context is sized reactively.
-- kvcache arguments are treated as a "lower bound" on kvcache precision. e.g. supplying `--cache-type-k q8_0 --cache-type-v q8_0` will allow kvcache to be quantized to a _minimum_ of q8_0 during inference. If no kvcache precision is supplied, llama-manager will quantize down to q4_0, if needed.
-- Models unload after 10 minutes of idle by default, which also resets
-degradation. Pass `--sleep-idle-seconds <n>` to change it (`0` disables).
-  - NOTE: Currently, idle acts as a 'reset' for strategy application, so running with a timeout is recommended.
+#### Multiple Models
 
-See `--help` for the full flag list. All other arguments pass through to `llama-server` untouched.
-
-#### Router Mode
-
-For multi-model setups, use a config file (`config.yaml` by default; override with `--config <path>` or the `MANAGER_CONFIG` env var):
+Serve multiple models and swap between them automatically using a `config.yaml` file:
 
 ```sh
-node dist/index.js --config ./config.yaml --serve
+node dist/index.js --config './my-config.yaml'
 ```
 
-Example config (or see this repo's config.yaml):
+See the [example config file](./config.example.yaml) for an example.
 
-```yaml
-host: 127.0.0.1
-port: 8080
-sleep-idle-seconds: 300
+#### Notes
 
-models:
-    qwen3.8-27b:
-        model: /home/models/Qwen3.8-27B-UD-Q4_K_XL.gguf
-        mmproj: /home/models/mmproj-BF16.gguf
-        spec-type: draft-mtp
-        n-gpu-layers: 99
-        aliases: [qwen3.8-dense]
-        ladder: [disable-spec, mmproj-to-cpu, quantize-kv-q8]
-    qwen3.5-9b:
-        model: /home/models/Qwen3.5-9B-Q4_K_M.gguf
-        n-gpu-layers: 99
-        ladder: []
+- Models are served using the **best-possible configuration**. If you pass the flag `cache-type-k/v: q8_0`, the model will initially be served at `f16` precision, and will degrade _to a minimum_ of `q8_0`. 
+  - If you do not specify a precision argument, the minimum is set to `q4_0` (this will not be used unless space is needed).
+- When a model is loaded for the first time, llama-manager calculates strategy breakpoints and displays them as a printed table. Use `--calc-breakpoints` to do this on startup, instead.
+- Models unload after 10 minutes of idle by default, which also resets kvcache and strategies. Pass `--sleep-idle-seconds <n>` to change it (`0` disables).
+  - NOTE: Currently, idle acts as a 'reset' for strategy application, so running with a timeout is recommended.
+- `-c` is ignored: context is sized reactively as strategies are applied
+- CLI args take priority over YAML
+- Unknown YAML fields/CLI args are passed to llama-server
 
-default-models: [qwen3.8-27b]
-```
+See `--help` for the full flag list.
 
-Each model's entry is just llama-server arguments (passed through verbatim) plus a `ladder` — an ordered list of degradation strategies the manager may apply as that model's context grows. `default-models` are pre-loaded as weights at startup (when run with `--serve`).
-
-
+---
 
 ## About
 
 ### Reactive context growth
 
-When serving a model, `llama-manager` reactively applies strategies to free up device space, expanding the context window on-demand. We can see which strategies it uses by adding `--show-breakpoints` to our startup command. The result looks like this:
+When serving a model, llama-manager reactively applies strategies to free up device space, expanding the context window on-demand. llama-manager recognizes the following strategies:
+- `disable-spec`: Disable speculative decoding
+- `mmproj-to-cpu`: Move mmproj to CPU
+- `quantize-kv-q8`: Quantize kvcache to q8_0
+- `quantize-kv-q4`: Quantize kvcache to q4_0
+
+By default, strategies are applied in the following order: [`disable-spec`, `mmproj-to-cpu`, `quantize-kv-q8`, `quantize-kv-q8`]. This order can be changed via the CLI flag `--ladder` (or by editing your config.yaml. See [the example](./config.example.yaml)).
+
+Strategies are displayed when a model is loaded for the first time:
 
 ```sh
 ════════════════════════════════════════════════════════════════════════════
@@ -116,26 +104,47 @@ When serving a model, `llama-manager` reactively applies strategies to free up d
  final ctx:      262,144 tokens
 ```
 
-For this model, `llama-manager` first serves the model at ~150k context and full kvcache precision. When a request comes in that exceeds this context window, `llama-manager` disables speculative decoding, then expands the model's context window to ~182k tokens. When the context window is exceeded again, `llama-manager` moves the mmproj to the CPU and continues serving at ~200k context.
+### llama.cpp changes
 
-Finally, when a request comes in that requires more than 200k tokens of context, `llama-manager` quantizes the kvcache to q8, serving the model at its maximum possible context.
+llama-manager uses [my fork of llama.cpp](https://github.com/wadealexc/llama.cpp/tree/feat/reload-runtime). This version has a few notable changes:
+- New: `common_init_result::reinit_context`
+  - This method factors out some common model initialization logic from `common_init_result`'s constructor, and defines a method `reinit_context` to reset a model's existing context and reinit using the factored logic.
+- New: `server_context_impl::reload_model`
+  - Acts as the reload analogue to `server_context_impl::load_model`. This method performs similar steps to `load_model`, except that it assumes model weights have already been loaded, and instead calls `reinit_context` rather than `common_init_from_params`.
+  - Note that if `n_ctx: 0` is passed in, `reload_model` performs a fit calculation to reload to the max possible ctx (similar to `load_model` fit).
+- New HTTP endpoint: `POST /reload`
+  - Exposes `reload_model` as an HTTP endpoint, returning the new `n_ctx` after reloading. `POST /reload` accepts input in the form `ReloadParams` (see [the definition in types.ts](`src/client/types.ts`)).
+- New HTTP endpoint: `GET /memory`
+  - Query the amount of space a currently-loaded model occupies on each backend device, broken down by component. Outputs `MemoryResponse` (see [the definition in types.ts](`src/client/types.ts`)).
+- Modified: `POST /slots/:id-slot` (fix prompt reuse for swa/hybrid/recurrent models)
+  - `?action=save`: adds an additional 'sidecar' save file that saves prompt checkpoints
+  - `?action=restore`: reads the aforementioned sidecar to restore prompt checkpoints
+  - (Here, I adapted a solution from [this issue](https://github.com/ggml-org/llama.cpp/issues/25913))
+- Modified: `POST /slots/:id-slot` (convert kvcache precision)
+  - `?action=restore`: when restoring a slot, automatically convert between f16 / q8_0 / q4_0 precision, rather than rejecting.
 
-`llama-manager` exposes an OpenAI-compatible interface and manages strategy applications gracefully, so your favorite harness or frontend doesn't need to do anything special to use this.
+The llama.cpp work is admittedly a little messy in places. I'm still working on cleaning/polishing it, as I think these features are genuinely useful and would like to contribute upstream. I'm releasing it now to get feedback from the community, as getting llama.cpp maintainer eyes on PRs has proved quite challenging so far!
 
-<!-- ### How it works -->
+### Known Issues
 
-<!-- TODO -->
+- Expects inference to be performed on a single GPU; does not support CPU inference. If you want support for CPU/multi-device, please open an issue.
+- Hadamard rotation is disabled to simplify llama.cpp-side slot restore code.
+- I've only tested this extensively on my server. YMMV; please open an issue if you find bugs or crashes. My specs:
+  - Ubuntu Server
+  - RTX 5090
+  - CUDA v13.1
+- Models I've tested:
+  - Qwen3
+  - Qwen3.8
+  - Gemma4
 
-<!-- llama.cpp router mode, custom fork, and a sprinkle of movie magic -->
+### Future Work
 
-### Caveats
-
-Assumes single GPU. Early stage project; expect breaking changes.
-
-<!-- ### Roadmap
-
-Strategies:
-- Reactively move layers between CPU/GPU
-- True mmproj-on-demand
-
-Multi-device support -->
+- Smarter kv growth and model swapping (to reduce swap time and allow inference to multiple models at once)
+- Better kvcache management:
+  - Attach kvc to consumer via api key
+  - Serve model based on input tokens / cache hit rate (each request is served at precisely the config it needs, rather than having model-wide config)
+- Additional degradation strategies:
+  - Move layers between GPU/CPU
+  - Mmproj "on demand" (bring mmproj to GPU temporarily/as-needed to process an image, then evict it and carry result into prompt processing)
+  - kvu/batching/parallelization strategies

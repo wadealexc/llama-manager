@@ -1,12 +1,13 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import { LoadStatus, type ManagerConfig, type ModelId } from "../config/types.js";
+import { type ManagerConfig, type ModelId } from "../config/types.js";
 import { logger } from "../logger.js";
 import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { Timer } from "./timer.js";
 import type { ModelEntry, RestorePoint } from "./model-entry.js";
 import type { MemoryResponse } from "../client/types.js";
+import { printModelBreakpoints, walkBreakpoints } from "../show-breakpoints.js";
 
 
 const log: ConsolaInstance = logger.withTag('planner');
@@ -84,88 +85,38 @@ export class Planner {
         this.models = models;
     }
 
-    // Note: intended to be called once on startup (jank!)
-    // load each model, apply all strategies, and calculate max ctx
-    async calcMaxCtx(): Promise<void> {
-        const t = new Timer('calcMaxCtx');
-
-        const signal = this.shutdown_ctrl.signal;
-        this.active.pending = true;
-
-        await this.#unloadAllModels(false, undefined, t);
-
-        for (const [id, entry] of this.models.entries()) {
-            log.info(`calculating max ctx for model: ${id}`);
-
-            let ctx = await entry.loadWithKV(null, signal, t);
-
-            while (entry.hasNextStrategy()) {
-                ctx = await entry.applyNextStrategy(false, signal, t);
-            }
-
-            await entry.unloadHard(t);
-
-            log.info(`${id} has max ctx ${ctx} at ${entry.ladder.length - 1} strategies applied`);
-            this.max_ctx.set(id, ctx);
-        }
-
-        this.active.pending = false;
-        print(t);
-    }
-
     // Note: not intended to be called twice
     async serveDefault(): Promise<void> {
         const t = new Timer('serveDefault');
 
         this.active.pending = true;
 
-        let first_loaded: ModelEntry | undefined;
-        for (const id of this.config.default_models) {
-            const model = this.models.get(id);
-            if (!model) {
-                log.warn(`serveDefault: model ${id} not found; skipping`);
-                continue;
-            }
-
-            if (model.status !== LoadStatus.UNLOADED) {
-                log.warn(`serveDefault: model ${id} already loaded; skipping`);
-                continue;
-            }
-
-            try {
-                log.info(`serveDefault: loading weights for ${id}`);
-                await model.loadWeights(this.shutdown_ctrl.signal, t);
-                this.weights_only.add(id);
-            } catch (err) {
-                log.error(`serveDefault: unable to load weights for model ${id}; skipping`);
-                continue;
-            }
-
-            // on first successful load: init device memory info
-            const mem = await this.client.getMemory(id, this.shutdown_ctrl.signal);
-            if (!first_loaded) { first_loaded = model; }
-
-            this.#updateMem(mem);
+        const model = this.models.get(this.config.default_model);
+        if (!model) {
+            throw new Error(`serveDefault: default model '${this.config.default_model}' not found`);
         }
 
-        if (!first_loaded || this.weights_only.size === 0) {
-            throw new Error(`serveDefault: unable to load any models`);
+        try {
+            log.info(`serveDefault: loading weights for ${model.name}`);
+            await model.loadWeights(this.shutdown_ctrl.signal, t);
+        } catch (err) {
+            throw new Error(`serveDefault: unable to load weights for model ${model.name}: ${err}`);
         }
 
-        log.info(`serveDefault: loaded weights for ${this.weights_only.size} models`);
+        this.#updateMem(await this.client.getMemory(model.name, this.shutdown_ctrl.signal));
 
-        // first model loaded gets a kv
-        log.info(`serveDefault: loading kvcache for ${first_loaded.name}`);
-        const n_ctx = await first_loaded.loadWithKV(null, this.shutdown_ctrl.signal, t);
-        log.info(`serving ${first_loaded.name} with a context window of ${n_ctx} tokens`);
+        await this.#onFirstLoad(model, t?.child('firstLoad'));
+
+        log.info(`serveDefault: loading kvcache for ${model.name}`);
+        const n_ctx = await model.loadWithKV(null, this.shutdown_ctrl.signal, t?.child('loadWithKV'));
+        log.info(`serving ${model.name} with a context window of ${n_ctx} tokens`);
 
         // update memory info
-        this.#updateMem(await this.client.getMemory(first_loaded.name, this.shutdown_ctrl.signal));
+        this.#updateMem(await this.client.getMemory(model.name, this.shutdown_ctrl.signal));
 
-        this.weights_only.delete(first_loaded.name);
         this.active = {
             pending: false,
-            model: first_loaded.name,
+            model: model.name,
             readers: 0,
         };
 
@@ -361,6 +312,11 @@ export class Planner {
             }
         }
 
+        // on first load, calculate breakpoints and max ctx
+        if (!this.max_ctx.has(target.name)) {
+            await this.#onFirstLoad(target, t?.child('onFirstLoad'));
+        }
+
         // load target model
         log.info(`loading kvcache for model ${target.name}`);
         const n_ctx = await target.loadWithKV(restore?.point ?? null, this.shutdown_ctrl.signal, t?.child(`loadWithKV(${target.name})`));
@@ -437,6 +393,20 @@ export class Planner {
 
         const b = bytes_needed - this.dev_info.bytes_avail;
         log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
+    }
+
+    // calculate and print a model's breakpoints the first time it is loaded
+    // the model is fully unloaded afterwards.
+    // TODO: a little janky. we should be able to do this without a hard unload (ctx reset?)
+    async #onFirstLoad(model: ModelEntry, t?: Timer): Promise<void> {
+        if (this.max_ctx.has(model.name)) return;
+
+        log.info(`first load of ${model.name}; calculating max ctx`);
+        const breakpoints = await walkBreakpoints(this.client, model, this.shutdown_ctrl.signal, t?.child(`walkBreakpoints(${model.name})`));
+        const ctx = breakpoints.rungs.at(-1)!.n_ctx;
+
+        this.max_ctx.set(model.name, ctx);
+        console.log(printModelBreakpoints(breakpoints));
     }
 
     async shutdown(): Promise<void> {

@@ -4,10 +4,11 @@ import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
-import { canonicalKey, rejectedKeyReason, STRATEGY_IDS } from "./parser.js";
-import { DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
-import { type ConfigSource, type ManagerConfig, type Mode, type ModelConfig, type ModelState, type RawModel, type StrategyId } from "./types.js";
+import { DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
+import { STRATEGY_IDS, type ConfigSource, type ManagerConfig, type ModelConfig, type ModelState, type RawModel, type StrategyId } from "./types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
+import { maybeReject, normalizeFlag } from "./flags.js";
+import { parseRouterConfig, type ParsedArgs } from "./parser.js";
 
 const log: ConsolaInstance = logger.withTag('config');
 
@@ -33,7 +34,14 @@ type InterpretedEntry = {
     cache_floor: 'f16' | 'q8_0' | 'q4_0';
 };
 
-export async function buildConfig(source: ConfigSource, project_root: string, preset_out_path: string): Promise<ManagerConfig> {
+export async function buildConfig(
+    parsed: ParsedArgs, 
+    project_root: string, 
+    preset_out_path: string, 
+    default_config_path: string
+): Promise<ManagerConfig> {
+    const source = buildSource(parsed, default_config_path);
+    
     const raw_models = source.raw_models;
     if (Object.keys(raw_models).length === 0) {
         throw new Error(`no models found in config`);
@@ -41,7 +49,7 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
 
     const interpreted = new Map<string, InterpretedEntry>();
     for (const [id, raw] of Object.entries(raw_models)) {
-        interpreted.set(id, interpretEntry(raw, source.mode));
+        interpreted.set(id, interpretEntry(raw));
     }
 
     for (const interp of interpreted.values()) {
@@ -58,25 +66,20 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
     }
 
     const model_keys = Object.keys(models);
-    const default_models = (source.default_models && source.default_models.length > 0)
-        ? source.default_models
-        : [model_keys[0]];
-
-    for (const id of default_models) {
-        if (!models[id]) {
-            throw new Error(`default-model '${id}' not found in models`);
-        }
+    const default_model = source.default_model ?? model_keys[0];
+    if (!models[default_model]) {
+        throw new Error(`default-model '${default_model}' not found in models`);
     }
 
     const raw_router = source.raw_router;
     const llama_log_dir = resolve(project_root, normalizeDir((raw_router['llama-log-dir'] as string) ?? DEFAULT_LOG_DIR));
     const slot_save_path = resolve(project_root, normalizeDir((raw_router['slot-save-path'] as string) ?? DEFAULT_SLOT_SAVE_DIR));
 
-    // resolve llama-server binary. tiered resolution: [--bin flag, MANAGER_BIN env, config.yaml, default location]
+    // resolve llama-server binary. tiered resolution: [--bin flag, LLAMA_BIN env, config.yaml, default location]
     const default_bin = process.platform === 'win32' ? DEFAULT_LLAMA_BIN_WIN32 : DEFAULT_LLAMA_BIN;
-    const bin = resolve(project_root, source.bin_override ?? process.env.MANAGER_BIN ?? (raw_router['bin'] as string) ?? default_bin);
+    const bin = resolve(project_root, source.bin_override ?? process.env.LLAMA_BIN ?? (raw_router['bin'] as string) ?? default_bin);
     if (!existsSync(bin)) {
-        throw new Error(`llama-server binary not found at '${bin}'. build it with scripts/build-llamacpp.sh, or supply one via --bin, the MANAGER_BIN env var, or 'router.bin' in the config`);
+        throw new Error(`llama-server binary not found at '${bin}'. build it with scripts/build-llamacpp.sh, or supply one via --bin, the LLAMA_BIN env var, or 'router.bin' in the config`);
     }
 
     const router_listen = raw_router['listen'] as string | undefined;
@@ -94,15 +97,15 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
             poll_timeout_ms: (raw_router['poll-timeout-ms'] as number) ?? DEFAULT_ROUTER_POLL_TIMEOUT_MS,
             shutdown_grace_period_ms: (raw_router['shutdown-grace-period-ms'] as number) ?? DEFAULT_ROUTER_SHUTDOWN_GRACE_MS,
         },
-        host: source.host,
-        port: source.port,
+        host: source.host ?? DEFAULT_HOST,
+        port: source.port ?? DEFAULT_PORT,
         sleep_idle_seconds: source.sleep_idle_seconds ?? DEFAULT_SLEEP_IDLE_SECONDS,
         model_load: {
             poll_interval_ms: (raw_model_load['poll-interval-ms'] as number) ?? DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS,
             poll_timeout_ms: (raw_model_load['poll-timeout-ms'] as number) ?? DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS,
         },
         models,
-        default_models,
+        default_model,
     };
 
     mkdirSync(config.router.llama_log_dir, { recursive: true });
@@ -113,9 +116,56 @@ export async function buildConfig(source: ConfigSource, project_root: string, pr
     return config;
 }
 
+// assemble the ConfigSource for both modes: parsed CLI flags override values from the
+// config file, which fall back to defaults applied later in buildConfig
+function buildSource(parsed: ParsedArgs, default_config_path: string): ConfigSource {
+    const config_path = parsed.config_path ?? process.env.MANAGER_CONFIG;
+
+    let source: ConfigSource;
+    if (parsed.mode === 'server') {
+        let cfg: ConfigSource | undefined;
+        if (config_path !== undefined) {
+            cfg = parseRouterConfig(config_path);
+            const ignored = Object.keys(cfg.raw_models);
+            if (ignored.length > 0) {
+                log.error(`server mode: ignoring ${ignored.length} model(s) from config '${config_path}': ${ignored.join(', ')}`);
+            }
+        }
+
+        source = {
+            mode: 'server',
+            raw_models: parsed.raw_models ?? {},
+            raw_router: cfg?.raw_router ?? {},
+            raw_model_load: cfg?.raw_model_load ?? {},
+            host: parsed.host ?? cfg?.host,
+            port: parsed.port ?? cfg?.port,
+            sleep_idle_seconds: parsed.sleep_idle_seconds ?? cfg?.sleep_idle_seconds,
+            default_model: Object.keys(parsed.raw_models ?? {})[0],
+            ladder_override: parsed.ladder,
+            bin_override: parsed.bin,
+        };
+    } else {
+        const cfg = parseRouterConfig(config_path ?? default_config_path);
+        source = {
+            ...cfg,
+            host: parsed.host ?? cfg.host,
+            port: parsed.port ?? cfg.port,
+            sleep_idle_seconds: parsed.sleep_idle_seconds ?? cfg.sleep_idle_seconds,
+            ladder_override: parsed.ladder ?? cfg.ladder_override,
+            bin_override: parsed.bin ?? cfg.bin_override,
+        };
+    }
+
+    if (parsed.slot_save_path !== undefined) {
+        source.raw_router['slot-save-path'] = parsed.slot_save_path;
+    }
+
+    return source;
+}
+
 // canonicalizes config keys, rejects unsupported fields, warns about manager-owned fields, etc
 // unrecognized keys pass through as llama.cpp args
-function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
+function interpretEntry(raw: RawModel): InterpretedEntry {
     const entry: RawModel = {};
     const aliases: string[] = [];
 
@@ -123,12 +173,12 @@ function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
     let cache_type_v: string | undefined;
 
     for (const [raw_key, value] of Object.entries(raw)) {
-        const key = canonicalKey(raw_key) ?? raw_key;
+        const flag = normalizeFlag(raw_key);
 
-        const rejected = rejectedKeyReason(key);
-        if (rejected) throw new Error(rejected);
+        const reason = maybeReject(flag);
+        if (reason) throw new Error(reason);
 
-        switch (key) {
+        switch (flag) {
             case 'alias':
                 aliases.push(...aliasValues(value));
                 entry['alias'] = value;
@@ -146,21 +196,14 @@ function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
                 break;
             }
             case 'ctx-size':
-                if (mode === 'server') {
-                    log.error(`'ctx-size' is ignored; context is sized reactively. run with --show-breakpoints to see achievable context sizes`);
-                } else {
-                    log.error(`'ctx-size' is ignored; context is sized reactively`);
-                }
+                log.error(`'ctx-size' is ignored; context is sized reactively. run with --calc-breakpoints to see achievable context sizes`);
                 break;
             case 'cache-type-k':
             case 'cache-type-v':
                 if (typeof value !== 'string' || !SUPPORTED_KV_PRECISION.includes(value)) {
-                    throw new Error(`unsupported cache type '${value}' for '${key}' (supported: ${SUPPORTED_KV_PRECISION.join(', ')})`);
+                    throw new Error(`unsupported cache type '${value}' for '${flag}' (supported: ${SUPPORTED_KV_PRECISION.join(', ')})`);
                 }
-                if (mode === 'router') {
-                    log.error(`'${key}' is manager-controlled; the manager serves an f16 kvcache at baseline`);
-                }
-                if (key === 'cache-type-k') cache_type_k = value;
+                if (flag === 'cache-type-k') cache_type_k = value;
                 else cache_type_v = value;
                 break;
             case 'n-gpu-layers':
@@ -171,7 +214,7 @@ function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
                 break;
             case 'api-key':
             case 'api-key-file':
-                log.error(`'${key}' is ignored; the manager does not support auth`);
+                log.error(`'${flag}' is ignored; the manager does not support auth`);
                 break;
             case 'device':
                 log.error(`'device' with CPU devices is not supported by the memory planner`);
@@ -189,12 +232,12 @@ function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
                 break;
             case 'mmproj-device':
             case 'no-mmproj-offload':
-                log.error(`'${key}' is ignored; mmproj placement is managed via the ladder`);
+                log.error(`'${flag}' is ignored; mmproj placement is managed via the ladder`);
                 break;
             case 'webui':
             case 'no-webui':
                 log.error(`the webui may not be compatible with the manager`);
-                entry[key] = value;
+                entry[flag] = value;
                 break;
             case 'no-op-offload':
             case 'no-kv-offload':
@@ -204,11 +247,11 @@ function interpretEntry(raw: RawModel, mode: Mode): InterpretedEntry {
             case 'override-tensor':
             case 'override-tensor-draft':
             case 'lora':
-                log.error(`'${key}' implies CPU-resident components the memory planner does not model`);
-                entry[key] = value;
+                log.error(`'${flag}' implies CPU-resident components the memory planner does not model`);
+                entry[flag] = value;
                 break;
             default:
-                entry[key] = value;
+                entry[flag] = value;
         }
     }
 

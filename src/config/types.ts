@@ -10,6 +10,9 @@ export type StrategyId =
     | "quantize-kv-q4"
     | "mmproj-to-cpu";
 
+const STRATEGY_IDS: StrategyId[] = ['disable-spec', 'mmproj-to-cpu', 'quantize-kv-q8', 'quantize-kv-q4'];
+export { STRATEGY_IDS };
+
 export enum LoadStatus {
     UNLOADED,
     WEIGHTS_ONLY,
@@ -55,10 +58,10 @@ export interface ConfigSource {
     raw_models: Record<string, RawModel>;
     raw_router: Record<string, unknown>;
     raw_model_load: Record<string, unknown>;
-    host: string;
-    port: number;
+    host?: string;
+    port?: number;
     sleep_idle_seconds?: number;
-    default_models?: ModelId[];
+    default_model?: ModelId;
     ladder_override?: StrategyId[];
     bin_override?: string;
 }
@@ -71,7 +74,7 @@ export interface ManagerConfig {
     sleep_idle_seconds: number;
     model_load: ModelLoadConfig;
     models: Record<ModelId, ModelConfig>;
-    default_models: ModelId[];
+    default_model: ModelId;
 }
 
 export class ConfigError extends Error {

@@ -36,8 +36,8 @@ models:
         n-gpu-layers: 99
 
         # reorder default strategies
-        # note that quantize-kv-q4 will never be applied
-        ladder: [mmproj-to-cpu, disable-spec, quantize-kv-q8]
+        # note that quantize-kv-q4 will never be applied due to its exclusion
+        ladder: [mmproj-to-cpu, quantize-kv-q8, disable-spec]
     qwen3.5-9b:
         model: /home/user/models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf
         mmproj: /home/user/models/qwen3.5-9b/mmproj-BF16.gguf
@@ -48,4 +48,4 @@ models:
         # empty ladder: no strategies will be applied (mmproj stays on GPU, kvcache stays f16)
         ladder: []
 
-default-models: [qwen3.8-27b]
+default-model: qwen3.8-27b
