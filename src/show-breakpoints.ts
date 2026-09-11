@@ -43,6 +43,24 @@ export async function walkBreakpoints(
 
     const device_total_gib = getDeviceTotalBytes(mem) / (1024 ** 3);
 
+    const infos = await client.getModels(signal);
+    const n_ctx_train = infos.find(info => info.id === entry.name)?.meta?.n_ctx_train;
+
+    const get_n_ctx_seq = async (): Promise<number> => {
+        const slots = await client.getSlots(entry.name, signal).catch(() => undefined);
+        return slots?.[0]?.n_ctx ?? 0;
+    };
+
+    if (n_ctx_train !== undefined) {
+        const n_ctx_seq = await get_n_ctx_seq();
+        if (n_ctx_seq >= n_ctx_train) {
+            const addtl = entry.ladder.length - 1 - entry.ladder_i;
+            log.info(`max ctx per seq reached for ${entry.name} (${n_ctx_train}); no strategies needed`);
+
+            entry.ladder.splice(1);
+        }
+    }
+
     while (entry.hasNextStrategy()) {
         log.info(`${entry.name}: applying ${entry.ladder[entry.ladder_i + 1].strategy}`);
         const n_ctx = await entry.applyNextStrategy(false, signal, t);
@@ -57,6 +75,20 @@ export async function walkBreakpoints(
             context_gib: context_bytes / (1024 ** 3),
         });
         prev = n_ctx;
+
+        const n_ctx_seq = await get_n_ctx_seq();
+
+        if (n_ctx_train !== undefined && n_ctx_seq >= n_ctx_train) {
+            const addtl = entry.ladder.length - 1 - entry.ladder_i;
+            if (addtl !== 0) {
+                log.info(`max ctx per seq reached for ${entry.name} (${n_ctx_train}); ignoring ${addtl} additional strategies`);
+            } else {
+                log.info(`max ctx per seq reached for ${entry.name} (${n_ctx_train})`);
+            }
+
+            entry.ladder.splice(entry.ladder_i + 1);
+            break;
+        }
     }
 
     await entry.unloadHard(t);

@@ -53,13 +53,13 @@ node dist/index.js \
 
 #### Multiple Models
 
-Serve multiple models and swap between them automatically using a `config.yaml` file:
+See the [example config file](./config.example.yaml) for an example. Serve multiple models and swap between them automatically using a `config.yaml` file:
 
 ```sh
 node dist/index.js --config './my-config.yaml'
 ```
 
-See the [example config file](./config.example.yaml) for an example.
+Models are swapped out in response to requests: when a request comes in for a model that isn't loaded, the current model's kvcache is saved, then the model is unloaded and swapped for the requested model. When the original model is requested again, the saved kvcache is restored.
 
 #### Notes
 
@@ -92,14 +92,14 @@ Strategies are displayed when a model is loaded for the first time:
 
 ```sh
 ════════════════════════════════════════════════════════════════════════════
- qwen3.8-27b        baseline: 150,784 tokens                device: 31 GiB
+ qwen3.8-27b        baseline: 167,680 tokens                device: 31 GiB
 ════════════════════════════════════════════════════════════════════════════
   i  strategy        ctx (tokens)    gain (tokens)       weights / ctx GiB
  ──────────────────────────────────────────────────────────────────────────
-  0  baseline             150,784                            17.13 / 12.01
-  1  disable-spec         182,784        (+32,000)           17.13 / 12.03
-  2  mmproj-to-cpu        200,960        (+18,176)           16.02 / 13.16
-  3  quantize-kv-q8       262,144        (+61,184)           16.02 / 10.41
+  0  baseline             167,680                            17.13 / 13.14
+  1  disable-spec         200,960        (+33,280)           17.13 / 13.16
+  2  mmproj-to-cpu        218,880        (+17,920)           16.02 / 14.27
+  3  quantize-kv-q8       262,144        (+43,264)           16.02 / 10.40
  ──────────────────────────────────────────────────────────────────────────
  final ctx:      262,144 tokens
 ```
@@ -131,6 +131,7 @@ The llama.cpp work is admittedly a little messy in places. I'm still working on 
 
 - Expects inference to be performed on a single GPU; does not support CPU inference. If you want support for CPU/multi-device, please open an issue.
 - Hadamard rotation is disabled to simplify llama.cpp-side slot restore code.
+- Strategy application is not optimized to serve multiple users - degradation strategies are applied model-wide rather than per-request. Fixing this requires more granular kvcache and model management (see Future Work below).
 - I've only tested this extensively on my server. YMMV; please open an issue if you find bugs or crashes. My specs:
   - Ubuntu Server
   - RTX 5090

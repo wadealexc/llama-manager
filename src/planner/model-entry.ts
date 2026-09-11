@@ -28,7 +28,7 @@ export class ModelEntry {
     name: ModelId;
     aliases: string[];
 
-    readonly ladder: Rung[];
+    ladder: Rung[];
     ladder_i: number = -1;
     n_ctx: number = 0;
     status: LoadStatus = LoadStatus.UNLOADED;
