@@ -39,7 +39,7 @@ export interface ReloadParams {
     spec?: {
         types?: SpeculativeType[]; // passing "none" disables
         draft?: {
-            path: string;
+            path?: string;
             n_max?: number;
             n_min?: number;
             p_split?: number;

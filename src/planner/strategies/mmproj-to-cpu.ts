@@ -1,7 +1,6 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../../client/llama-api.js";
-import type { ReloadParams } from "../../client/types.js";
-import type { ModelState, StrategyId } from "../../config/types.js";
+import { hasMmproj, isMmprojOnCPU, type ModelState, type StrategyId } from "../../config/types.js";
 import { logger } from "../../logger.js";
 import type { Strategy } from "../types.js";
 
@@ -29,19 +28,12 @@ export class MmprojToCPU implements Strategy {
     }
 
     canApply(state: ModelState): boolean {
-        return state.mmproj_loaded;
+        return hasMmproj(state) && !isMmprojOnCPU(state);
     }
 
     getNewState(cur: ModelState): ModelState {
         const next = structuredClone(cur);
-        next.mmproj_loaded = false;
+        next.mmproj = { ...next.mmproj, mmproj_offload: false };
         return next;
-    }
-
-    getNewParams(params: ReloadParams): ReloadParams {
-        return {
-            ...params,
-            mmproj: { mmproj_offload: false }
-        };
     }
 }

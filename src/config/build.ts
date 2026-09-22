@@ -6,6 +6,7 @@ import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
 import { DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
 import { STRATEGY_IDS, type ConfigSource, type ManagerConfig, type ModelConfig, type ModelState, type RawModel, type StrategyId } from "./types.js";
+import type { ReloadParams, SpeculativeType } from "../client/types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { maybeReject, normalizeFlag } from "./flags.js";
 import { parseRouterConfig, type ParsedArgs } from "./parser.js";
@@ -27,6 +28,8 @@ const MANAGER_FIELDS = new Set([
 
 const SUPPORTED_KV_PRECISION = ['f16', 'q8_0', 'q4_0'];
 const PRECISION_RANK: Record<string, number> = { 'q4_0': 0, 'q8_0': 1, 'f16': 2 };
+
+type SpecDraft = NonNullable<ReloadParams['spec']>['draft'];
 
 type InterpretedEntry = {
     entry: RawModel;
@@ -312,12 +315,24 @@ function aliasValues(value: unknown): string[] {
 
 function buildEntry(name: string, raw: RawModel, aliases: string[]): ModelConfig {
     const initial_state: ModelState = {
-        mmproj_loaded: getHasMmproj(raw),
-        spec_loaded: getHasSpec(raw),
         kv_unified: getKvUnified(raw),
         cache_type_k: DEFAULT_KV_PRECISION,
         cache_type_v: DEFAULT_KV_PRECISION,
     };
+
+    if (getHasSpec(raw)) {
+        initial_state.spec = {
+            types: getSpecTypes(raw),
+            draft: getSpecDraft(raw),
+        };
+    }
+
+    if (getHasMmproj(raw)) {
+        initial_state.mmproj = { 
+            path: getMmprojPath(raw),
+            mmproj_offload: true 
+        };
+    }
 
     return {
         name,
@@ -368,17 +383,60 @@ function normalizeDir(p: string): string {
     return p.endsWith('/') ? p : p + '/';
 }
 
-export function getHasSpec(entry: RawModel): boolean {
+export function getSpecTypes(entry: RawModel): SpeculativeType[] {
     const spec = entry['spec-type'];
-    let types: string[];
     if (typeof spec === 'string') {
-        types = spec.split(',').map(t => t.trim().toLowerCase()).filter(t => t !== '');
-    } else if (Array.isArray(spec)) {
-        types = spec.map(t => String(t).trim().toLowerCase()).filter(t => t !== '');
-    } else {
-        return false;
+        return spec.split(',').map(t => t
+            .trim()
+            .toLowerCase())
+            .filter(t => t !== '');
     }
+    if (Array.isArray(spec)) {
+        return spec.map(t => String(t)
+            .trim()
+            .toLowerCase())
+            .filter(t => t !== '');
+    }
+    return [];
+}
+
+export function getHasSpec(entry: RawModel): boolean {
+    const types = getSpecTypes(entry);
     return types.length > 0 && !types.includes('none');
+}
+
+function getSpecDraft(entry: RawModel): SpecDraft | undefined {
+    const draft: SpecDraft = {};
+
+    const path = entry['model-draft'] ?? entry['md'] ?? entry['spec-draft-model'];
+    if (typeof path === 'string' && path.length > 0) draft.path = path;
+
+    const n_max = entry['spec-draft-n-max'];
+    if (typeof n_max === 'number') draft.n_max = n_max;
+
+    const n_min = entry['spec-draft-n-min'];
+    if (typeof n_min === 'number') draft.n_min = n_min;
+
+    const p_split = entry['spec-draft-p-split'] ?? entry['draft-p-split'];
+    if (typeof p_split === 'number') draft.p_split = p_split;
+
+    const p_min = entry['spec-draft-p-min'] ?? entry['draft-p-min'];
+    if (typeof p_min === 'number') draft.p_min = p_min;
+
+    const ngl = entry['spec-draft-ngl'] ?? entry['ngld'] ?? entry['n-gpu-layers-draft'];
+    if (typeof ngl === 'number') draft.n_gpu_layers = ngl;
+
+    return Object.keys(draft).length > 0 ? draft : undefined;
+}
+
+function getMmprojPath(entry: RawModel): string | undefined {
+    const path = entry['mmproj'] ?? entry['mm'];
+    if (typeof path === 'string' && path.length > 0) return path;
+
+    const url = entry['mmproj-url'] ?? entry['mmu'];
+    if (typeof url === 'string' && url.length > 0) return url;
+
+    return undefined;
 }
 
 export function getHasMmproj(entry: RawModel): boolean {

@@ -24,7 +24,7 @@ async function listModels(server: ApiServer, req: Request, res: ExpressResponse)
             status: e.status,
             queued: server.planner.isModelQueued(e.name),
             active: server.planner.active.model === e.name && !server.planner.active.pending,
-            n_ctx: server.planner.max_ctx.get(e.name) ?? e.curCtx(),
+            n_ctx: e.getMaxCtx() ?? e.curCtx(),
         }));
 
     res.json({ object: 'list', data });

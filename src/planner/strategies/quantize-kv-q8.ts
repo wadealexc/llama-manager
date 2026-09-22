@@ -1,7 +1,6 @@
 import type { ConsolaInstance } from "consola";
 import { logger } from "../../logger.js";
 import type { LlamaAPI } from "../../client/llama-api.js";
-import type { ReloadParams } from "../../client/types.js";
 import type { ModelState, StrategyId } from "../../config/types.js";
 import type { Strategy } from "../types.js";
 
@@ -26,14 +25,6 @@ export class QuantizeKvQ8 implements Strategy {
         next.cache_type_k = 'q8_0';
         next.cache_type_v = 'q8_0';
         return next;
-    }
-
-    getNewParams(params: ReloadParams): ReloadParams {
-        return {
-            ...params,
-            cache_type_k: 'q8_0',
-            cache_type_v: 'q8_0',
-        };
     }
 }
 

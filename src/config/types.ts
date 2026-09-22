@@ -1,4 +1,4 @@
-import type { KVPrecision } from "../client/types.js";
+import type { ReloadParams } from "../client/types.js";
 
 export type ModelId = string;
 
@@ -34,12 +34,24 @@ export interface ModelLoadConfig {
     poll_timeout_ms: number;
 }
 
-export interface ModelState {
-    mmproj_loaded: boolean;
-    spec_loaded: boolean;
-    kv_unified: boolean;
-    cache_type_k: KVPrecision;
-    cache_type_v: KVPrecision;
+export type ModelState = Pick<ReloadParams,
+    | 'cache_type_k'
+    | 'cache_type_v'
+    | 'kv_unified'
+    | 'mmproj'
+    | 'spec'
+>;
+
+export function isSpecEnabled(state: ModelState): boolean {
+    return !!state.spec && !!state.spec.types?.length && !state.spec.types.includes('none');
+}
+
+export function hasMmproj(state: ModelState): boolean {
+    return state.mmproj !== undefined && state.mmproj.path !== '';
+}
+
+export function isMmprojOnCPU(state: ModelState): boolean {
+    return state.mmproj?.mmproj_offload === false;
 }
 
 export interface ModelConfig {

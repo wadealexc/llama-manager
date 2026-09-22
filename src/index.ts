@@ -60,9 +60,7 @@ api = new ApiServer(planner, config);
 // if `--calc-breakpoints`, load each model and pretty-print strategy breakpoints on startup
 if (parsed.calc_breakpoints) {
     try {
-        await showBreakpoints(llama_api, config, models, (id: ModelId, ctx: number) => {
-            planner.max_ctx.set(id, ctx);
-        });
+        await showBreakpoints(llama_api, config, models);
     } catch (err) {
         log.error(`startup error (showBreakpoints): ${err}`);
         await shutdown('error');
@@ -90,14 +88,14 @@ try {
 }
 
 function buildLadder(initial: ModelState, ids: StrategyId[], strats: Map<StrategyId, Strategy>): Rung[] {
-    const rungs: Rung[] = [{ strategy: 'none', impl: null!, state: initial }];
+    const rungs: Rung[] = [{ strategy: 'none', impl: null!, state: initial, n_ctx_cap: -1, bytes_needed: 0 }];
     let state = initial;
     for (const id of ids) {
         const s = strats.get(id);
         if (!s) continue;
         if (!s.canApply(state)) continue;
         state = s.getNewState(state);
-        rungs.push({ strategy: id, impl: s, state });
+        rungs.push({ strategy: id, impl: s, state, n_ctx_cap: -1, bytes_needed: 0 });
     }
     return rungs;
 }
