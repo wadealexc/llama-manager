@@ -1,11 +1,11 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import { LoadStatus, type ManagerConfig, type ModelId, type Tokens } from "../config/types.js";
+import { LoadStatus, type ManagerConfig, type ModelId } from "../config/types.js";
 import { logger } from "../logger.js";
 import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { Timer } from "./timer.js";
-import type { ModelEntry, RestorePoint } from "./model-entry.js";
+import type { ModelEntry } from "./model-entry.js";
 import type { MemoryResponse } from "../client/types.js";
 import { printModelBreakpoints, walkBreakpoints } from "../show-breakpoints.js";
 
@@ -44,11 +44,6 @@ type Waiter = {
     reject: (reason: any) => void;
 }
 
-type RestoreInfo = {
-    point: RestorePoint;
-    bytes_needed: number;
-}
-
 type DeviceInfo = {
     bytes_total: number;
     bytes_avail: number;
@@ -70,8 +65,6 @@ export class Planner {
     weights_only: Set<ModelId> = new Set();
     waiting_load: Waiter[] = [];
     waiting_reload: PausedReader[] = [];
-
-    restore_info: Map<ModelId, RestoreInfo> = new Map();
 
     // TODO - may need to incorporate fit_target_overhead for 'available'
     dev_info: DeviceInfo = {
@@ -151,7 +144,7 @@ export class Planner {
                     const min_ctx = cur_cap + 1;
 
                     if (model.getMinimumRung(min_ctx) === null) {
-                        throw new Error(`unable to further context window for ${model.name} (cur: ${cur_cap})`);
+                        throw new Error(`unable to increase context window for ${model.name} (cur: ${cur_cap})`);
                     }
 
                     // queue reload to increase cap
@@ -178,30 +171,40 @@ export class Planner {
     async #withModel<T>(model: ModelEntry, body: unknown, signal: AbortSignal, t: Timer, cb: (t?: Timer) => Promise<T>): Promise<T> {
         let handle: ReadHandle;
 
-        if (this.modelIsActive(model)) {
+        if (!this.modelIsActive(model)) {
+            // load model
+            handle = await new Promise((resolve, reject) => {
+                this.waiting_load.push({ model: model.name, body, resolve, reject });
+                this.#maybeSwap(t.child(`maybeSwap (load)`));
+            });
+        } else {
             handle = this.#getHandle();
-            let tokens_in;
-            let rung;
-            try {
-                tokens_in = await model.countTokens(body, signal, t);
-                if (tokens_in === null) {
-                    throw new Error(`#withModel: failed to count tokens for request to model ${model.name}`);
-                }
+        }
 
-                rung = model.getMinimumRung(tokens_in);
-                if (rung === null) {
-                    throw new Error(`#withModel: model ${model.name} cannot serve request (tokens_in: ${tokens_in} | max capacity: ${model.getMaxCtx()})`);
-                }
-            } catch (err) {
-                handle.release();
-                throw err;
+        // Model is loaded and we have a read handle - count tokens
+        let tokens_in;
+        let rung;
+        try {
+            tokens_in = await model.countTokens(body, signal, t);
+            if (tokens_in === null) {
+                throw new Error(`#withModel: failed to count tokens for request to model ${model.name}`);
             }
 
+            rung = model.getMinimumRung(tokens_in);
+            if (rung === null) {
+                throw new Error(`#withModel: model ${model.name} cannot serve request (tokens_in: ${tokens_in} | max capacity: ${model.getMaxCtx()})`);
+            }
+        } catch (err) {
+            handle.release();
+            throw err;
+        }
+
+        try {
             // model is active. serve immediately if:
             // - model is already at optimal rung for input, OR
             // - model is at a valid rung for input and is currently generating
             //
-            // otherwise, reload model
+            // otherwise, reload model to optimal rung
             if (model.ladder_i === rung) {
                 // done
             } else if (model.ladder_i > rung && !handle.exclusive()) {
@@ -216,15 +219,7 @@ export class Planner {
                     this.#maybeReload(t);
                 });
             }
-        } else {
-            // load model
-            handle = await new Promise((resolve, reject) => {
-                this.waiting_load.push({ model: model.name, body, resolve, reject });
-                this.#maybeSwap(t.child(`maybeSwap (load)`));
-            });
-        }
 
-        try {
             return await cb(t);
         } finally {
             handle.release();
@@ -282,11 +277,13 @@ export class Planner {
 
         if (!t) t = new Timer(`maybeReload`);
 
+        let waiting_reload: PausedReader[];
+
         const signal = this.shutdown_ctrl.signal;
         const handle = this.#getHandle();
         await handle.write(async () => {
             const model = this.activeModel()!;
-            const waiting_reload = this.waiting_reload.splice(0);
+            waiting_reload = this.waiting_reload.splice(0);
             const fulfill = [];
 
             // get the minimum rung that will satisfy all readers
@@ -338,6 +335,14 @@ export class Planner {
             for (const waiter of fulfill) {
                 waiter.resolve();
             }
+        }).catch((err) => {
+            // reject requests
+            for (const waiter of waiting_reload) {
+                waiter.reject(`maybeReload error: ${err}`);
+            }
+
+            // re-throw
+            throw new Error(`maybeReload: error reloading model: ${err}`);
         }).finally(() => handle.release());
     }
 
@@ -360,16 +365,16 @@ export class Planner {
         const wait_head = this.waiting_load.at(0)!;
         const target = this.models.get(wait_head.model)!;
 
+        const to_flush: Waiter[] = [];
         const fulfill: Waiter[] = [];
 
         const handle = this.#getHandle();
         await handle.write(async () => {
             // filter out load requests that want the head model
-            const to_serve: Waiter[] = [];
             const still_waiting: Waiter[] = [];
             for (const w of this.waiting_load) {
                 if (w.model === target.name) {
-                    to_serve.push(w);
+                    to_flush.push(w);
                 } else {
                     still_waiting.push(w);
                 }
@@ -390,6 +395,11 @@ export class Planner {
                 this.#updateMem(await this.client.getMemory(target.name, signal));
             }
 
+            // if target model is not active, stash active model's kv
+            if (target.name !== this.active.model) {
+                await this.#stashActiveKV(t?.child(`stashActiveKV`));
+            }
+
             // load model weights if needed
             if (target.status === LoadStatus.UNLOADED) {
                 log.info(`maybeSwap: freeing space for ${target.name} weights`);
@@ -402,8 +412,7 @@ export class Planner {
 
             // count tokens and get minimum rung to satisfy all requests
             let rung_needed = 0;
-            const fulfill = [];
-            for (const waiter of to_serve) {
+            for (const waiter of to_flush) {
                 const tokens_in = await target.countTokens(waiter.body, signal, t?.child(`countTokens`));
                 if (tokens_in === null) {
                     waiter.reject(`failed to count tokens for request`);
@@ -442,12 +451,20 @@ export class Planner {
 
             this.active.model = target.name;
             this.weights_only.delete(target.name);
-        }).finally(() => {
-            // fulfill requests
+
+            // resolve requests
             for (const waiter of fulfill) {
                 waiter.resolve(this.#getHandle());
             }
+        }).catch((err) => {
+            // reject requests
+            for (const waiter of to_flush) {
+                waiter.reject(`maybeSwap error: ${err}`);
+            }
 
+            // re-throw
+            throw new Error(`maybeSwap: error swapping model: ${err}`);
+        }).finally(() => {
             handle.release();
         });
     }
@@ -457,34 +474,6 @@ export class Planner {
         if (this.dev_info.bytes_avail > bytes_needed) {
             log.info(`#free not needed (avail: ${fmtBytes(this.dev_info.bytes_avail)} | needed: ${fmtBytes(bytes_needed)})`);
             return;
-        }
-
-        // stash kv for currently-loaded model
-        const active = this.activeModel();
-        if (active && active.name !== target_model.name) {
-            let mem = await this.client.getMemory(active.name, this.shutdown_ctrl.signal);
-            const free_before = calcFreeBytes(mem);
-
-            log.info(`unloading kv for model: ${active.name}`);
-            const restore_point = await active.unloadKV(this.shutdown_ctrl.signal, t);
-
-            // update device memory and tracking
-            mem = await this.client.getMemory(active.name, this.shutdown_ctrl.signal);
-            const free_after = calcFreeBytes(mem);
-
-            if (restore_point) {
-                // bytes needed to restore = bytes freed when unloading KV
-                this.restore_info.set(active.name, {
-                    point: restore_point,
-                    bytes_needed: free_after - free_before,
-                });
-            }
-
-            this.#updateMem(mem);
-            this.active.model = undefined;
-            this.weights_only.add(active.name);
-
-            if (this.dev_info.bytes_avail > bytes_needed) return;
         }
 
         if (this.weights_only.size === 0) {
@@ -508,6 +497,19 @@ export class Planner {
 
         const b = bytes_needed - this.dev_info.bytes_avail;
         log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
+    }
+
+    async #stashActiveKV(t?: Timer): Promise<void> {
+        const active = this.activeModel();
+        if (!active) return;
+
+        log.info(`unloading kv for model: ${active.name}`);
+        await active.unloadKV(this.shutdown_ctrl.signal, t);
+
+        // update device memory and tracking
+        this.#updateMem(await this.client.getMemory(active.name, this.shutdown_ctrl.signal));
+        this.active.model = undefined;
+        this.weights_only.add(active.name);
     }
 
     async shutdown(): Promise<void> {
@@ -576,8 +578,7 @@ export class Planner {
 
         const handle = this.#getHandle();
         await handle.write(async () => {
-            await this.#unloadAllModels(false);
-            this.restore_info.clear();
+            await this.#unloadAllModels(true);
         }).finally(() => handle.release());
     }
 
@@ -648,8 +649,6 @@ export class Planner {
                 this.active.model = undefined;
             }
 
-            this.restore_info.delete(model.name);
-
             this.#setMemFreed(bytes_used);
         } catch (err) {
             throw new Error(`#unloadNoRestore: error unloading weights for model ${model.name}: ${err}`);
@@ -662,17 +661,7 @@ export class Planner {
             const bytes_used = calcTotalBytesForModel(mem);
 
             // unload model and update restore point, if created
-            const restore_point = await model.unloadWeights(this.shutdown_ctrl.signal, t);
-            if (restore_point) {
-                this.restore_info.set(model.name, {
-                    point: restore_point,
-                    bytes_needed: bytes_used,
-                });
-            } else if (this.restore_info.has(model.name)) {
-                // if we already had a restore point and didn't get one back from unloadWeights,
-                // this model was weights-only. we add bytes_used to the existing restore point
-                this.restore_info.get(model.name)!.bytes_needed += bytes_used;
-            }
+            await model.unloadWeights(this.shutdown_ctrl.signal, t);
 
             // remove model from tracking
             this.weights_only.delete(model.name);

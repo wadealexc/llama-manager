@@ -68,11 +68,11 @@ export class LlamaAPI {
         return await res.json() as Slot[];
     }
 
-    async saveAllSlots(model: ModelId, signal?: AbortSignal): Promise<SlotSave[]> {
+    async saveAllSlots(model: ModelId, basename: string, signal?: AbortSignal): Promise<SlotSave[]> {
         const slots = await this.getSlots(model, signal);
 
         return await Promise.all(slots.map(async (slot) => {
-            const filename = `slot-${model}-${slot.id}.bin`;
+            const filename = `${basename}-${slot.id}.bin`;
             const slot_url = this.#buildURL(`/slots/${slot.id}`) + '?action=save';
 
             const res = await fetch(slot_url, {

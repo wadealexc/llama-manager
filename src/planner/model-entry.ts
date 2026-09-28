@@ -7,18 +7,13 @@ import { logger } from "../logger.js";
 import { Timer } from "./timer.js";
 import type { Strategy } from "./types.js";
 
-export interface RestorePoint {
-    ladder_i: number;
-    n_ctx: number;
-    slots?: SlotSave[];
-}
-
 export interface Rung {
     strategy: StrategyId | 'none';
     impl: Strategy;
     state: ModelState;
     n_ctx_cap: Tokens;
     bytes_needed: number;
+    last_slots?: SlotSave[];
 }
 
 export class ModelEntry {
@@ -76,8 +71,35 @@ export class ModelEntry {
         this.#setWeightsOnly();
     }
 
-    async loadWithKV(restore: RestorePoint | null, signal: AbortSignal, t?: Timer, target_rung?: number): Promise<number> {
-        const rung_i = target_rung ?? restore?.ladder_i ?? 0;
+    async moveToRung(rung_i: number, signal: AbortSignal, t?: Timer): Promise<number> {
+        if (this.status === LoadStatus.UNLOADED) throw new Error(`moveToRung: model must be loaded`);
+
+        const params = this.paramsForRung(rung_i);
+        if (!params) throw new Error(`moveToRung: rung index out of bounds`);
+
+        // if we're increasing the rung, retain live kvcache
+        // otherwise, restore kvcache at new rung
+        const kv_restore_i = (rung_i > this.ladder_i && this.ladder_i >= 0)
+            ? this.ladder_i
+            : rung_i;
+
+        // create a restore point at the current rung
+        await this.#createRestorePoint(signal, t);
+
+        t?.start('reloadModel');
+        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
+        t?.stop();
+
+        this.ladder_i = rung_i;
+        this.status = LoadStatus.LOADED;
+
+        await this.#restoreSlots(signal, kv_restore_i, t);
+        return this.curCtx();
+    }
+
+    // NOTE: used for breakpoints; no restore functionality
+    async loadWithKV(signal: AbortSignal, t?: Timer, target_rung?: number): Promise<number> {
+        const rung_i = target_rung ?? 0;
 
         const params = this.paramsForRung(rung_i);
         if (!params) throw new Error(`loadWithKV: rung index out of bounds`);
@@ -92,41 +114,12 @@ export class ModelEntry {
         this.n_ctx = await this.client.reloadModel(params, this.name, signal);
         t?.stop();
 
-        if (restore?.slots) {
-            t?.start('restoreAllSlots');
-            await this.client.restoreAllSlots(this.name, restore.slots, signal);
-            t?.stop();
-        }
-
         this.ladder_i = rung_i;
         this.status = LoadStatus.LOADED;
         return this.curCtx();
     }
 
-    async moveToRung(rung_i: number, signal: AbortSignal, t?: Timer): Promise<number> {
-        if (this.status !== LoadStatus.LOADED) throw new Error(`moveToRung: model must be loaded`);
-
-        const params = this.paramsForRung(rung_i);
-        if (!params) throw new Error(`moveToRung: rung index out of bounds`);
-
-        t?.start('reloadModel');
-        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
-        t?.stop();
-
-        this.ladder_i = rung_i;
-        return this.curCtx();
-    }
-
-    async expandToFit(signal: AbortSignal, t?: Timer): Promise<number> {
-        if (this.status !== LoadStatus.LOADED) throw new Error(`expandToFit: model must be loaded`);
-
-        t?.start('reloadModel');
-        this.n_ctx = await this.client.reloadModel({ n_ctx: 0 }, this.name, signal);
-        t?.stop();
-
-        return this.curCtx();
-    }
-
+    // NOTE: used for breakpoints; no restore functionality
     async applyNextStrategy(signal: AbortSignal, t?: Timer): Promise<number> {
         if (this.status !== LoadStatus.LOADED) throw new Error(`applyNextStrategy: model must be loaded`);
 
@@ -142,11 +135,11 @@ export class ModelEntry {
         return this.curCtx();
     }
 
-    async unloadKV(signal: AbortSignal, t?: Timer): Promise<RestorePoint | null> {
-        if (this.status !== LoadStatus.LOADED) return null;
+    async unloadKV(signal: AbortSignal, t?: Timer): Promise<void> {
+        if (this.status !== LoadStatus.LOADED) return;
 
-        // create a restore point
-        const restore = await this.#createRestorePoint(signal, t);
+        // create a restore point at the current rung
+        await this.#createRestorePoint(signal, t);
 
         // unload kv
         t?.start('reloadModel');
@@ -154,17 +147,15 @@ export class ModelEntry {
         t?.stop();
 
         this.#setWeightsOnly();
-        return restore;
     }
 
     // unload model, saving slots and returning a restore point if model was loaded
-    async unloadWeights(signal: AbortSignal, t?: Timer): Promise<RestorePoint | null> {
-        if (this.status === LoadStatus.UNLOADED) return null;
+    async unloadWeights(signal: AbortSignal, t?: Timer): Promise<void> {
+        if (this.status === LoadStatus.UNLOADED) return;
 
         // if model is currently loaded, create restore point
-        let restore: RestorePoint | null = null;
         if (this.status === LoadStatus.LOADED) {
-            restore = await this.#createRestorePoint(signal, t)
+            await this.#createRestorePoint(signal, t)
         }
 
         t?.start('unloadModelAndWait');
@@ -172,7 +163,6 @@ export class ModelEntry {
         t?.stop();
 
         this.#setUnloaded();
-        return restore;
     }
 
     // unload a model without saving slots
@@ -186,16 +176,40 @@ export class ModelEntry {
         this.#setUnloaded();
     }
 
-    async #createRestorePoint(signal: AbortSignal, t?: Timer): Promise<RestorePoint> {
-        t?.start('saveAllSlots');
-        const restore: RestorePoint = {
-            ladder_i: this.ladder_i,
-            n_ctx: this.n_ctx,
-            slots: await this.client.saveAllSlots(this.name, signal),
-        };
-        t?.stop();
+    async #createRestorePoint(signal: AbortSignal, t?: Timer): Promise<void> {
+        if (this.status !== LoadStatus.LOADED) return;
 
-        return restore;
+        const basename = this.#getRestoreName();
+
+        try {
+            t?.start('saveAllSlots');
+            this.ladder[this.ladder_i].last_slots = await this.client.saveAllSlots(this.name, basename, signal);
+        } catch (err) {
+            this.log.error(`error creating restore point: ${err}`);
+        } finally {
+            t?.stop();
+        }
+    }
+
+    async #restoreSlots(signal: AbortSignal, src_rung: number, t?: Timer): Promise<void> {
+        if (this.status !== LoadStatus.LOADED) return;
+        if (src_rung >= this.ladder.length) throw new Error(`restoreSlots: bad src rung ${src_rung}`);
+
+        const slots = this.ladder[src_rung].last_slots;
+        if (!slots) return;
+
+        try {
+            t?.start('restoreAllSlots');
+            await this.client.restoreAllSlots(this.name, slots, signal);
+        } catch (err) {
+            this.log.error(`error restoring last slots: ${err}`);
+        } finally {
+            t?.stop();
+        }
+    }
+
+    #getRestoreName(): string {
+        return `${this.name}-rung-${this.ladder_i}`;
     }
 
     curCtx(): number {

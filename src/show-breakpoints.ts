@@ -35,7 +35,7 @@ export async function walkBreakpoints(
 
     const rungs: RungBreakpoint[] = [];
 
-    let prev = await entry.loadWithKV(null, signal, t);
+    let prev = await entry.loadWithKV(signal, t);
     let mem = await client.getMemory(entry.name, signal);
     const { weight_bytes: w0, context_bytes: c0 } = getModelMemory(mem);
     rungs.push({ 
