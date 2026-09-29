@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { parseArgs } from '../../config/parser.js';
@@ -86,7 +85,9 @@ test('GPU: real router preserves slots through configured rung transitions', { t
     // NOTE: disable hadamard rotation
     if (floor !== 'f16') process.env.LLAMA_ATTN_ROT_DISABLE = '1';
 
-    const directory = await mkdtemp(join(tmpdir(), 'llama-manager-gpu-'));
+    const artifacts_dir = join(project_root, 'logs', 'gpu-tests');
+    await mkdir(artifacts_dir, { recursive: true });
+    const directory = await mkdtemp(join(artifacts_dir, 'model-entry-'));
     const preset_path = join(directory, 'preset.ini');
     const config_path = join(directory, 'config.yaml');
     const slot_path = join(directory, 'slots');

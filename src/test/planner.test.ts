@@ -146,7 +146,7 @@ describe('Planner warm-model scheduling', () => {
         assert.equal(planner.waiting_reload.length, 0);
     });
 
-    test('stashes outgoing KV on a swap even when both models fit in memory', async () => {
+    test('unloads outgoing model on a swap even when both models fit in memory', async () => {
         const { client, model, planner } = await createFixture();
         const second = createModel(client, 'second');
         planner.models.set(second.name, second);
@@ -164,10 +164,10 @@ describe('Planner warm-model scheduling', () => {
             return true;
         });
 
-        assert.equal(planner.weights_only.has(model.name), true);
-        assert.equal(client.isLoaded(model.name), true);
+        assert.equal(planner.weights_only.has(model.name), false);
+        assert.equal(client.isLoaded(model.name), false);
         assert.deepEqual(client.getSnapshot(model.name, 0), ['first conversation']);
-        assert.deepEqual(client.operations.filter(operation => operation.kind === 'unload'), []);
+        assert.equal(client.operations.filter(operation => operation.kind === 'unload').length, 1);
         client.setLiveSlots(['second conversation'], second.name);
         client.clearOperations();
 
@@ -179,9 +179,9 @@ describe('Planner warm-model scheduling', () => {
             return true;
         });
 
-        assert.equal(planner.weights_only.has(second.name), true);
+        assert.equal(planner.weights_only.has(second.name), false);
         assert.deepEqual(client.getSnapshot(second.name, 0), ['second conversation']);
-        assert.deepEqual(client.operations.filter(operation => operation.kind === 'unload'), []);
+        assert.equal(client.operations.filter(operation => operation.kind === 'unload').length, 1);
         assert.equal(planner.active.readers, 0);
         assert.equal(planner.waiting_load.length, 0);
     });

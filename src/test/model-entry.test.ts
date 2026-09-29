@@ -65,7 +65,7 @@ describe('ModelEntry', () => {
         assert.equal(n_ctx, 8192);
         assert.equal(fixture.entry.status, LoadStatus.LOADED);
         assert.equal(fixture.entry.ladder_i, 1);
-        assert.equal(fixture.entry.curCtx(), 8192);
+        assert.equal(fixture.entry.getCurCtx(), 8192);
         assert.deepEqual(fixture.getLiveSlots(), ['saved prompt']);
         assert.deepEqual(fixture.operations.map(operation => operation.kind), ['reload', 'restore']);
 
@@ -200,7 +200,7 @@ describe('ModelEntry', () => {
         await fixture.entry.unloadKV(signal);
 
         assert.equal(fixture.entry.status, LoadStatus.WEIGHTS_ONLY);
-        assert.equal(fixture.entry.curCtx(), MIN_ALLOWED_CTX);
+        assert.equal(fixture.entry.getCurCtx(), MIN_ALLOWED_CTX);
         assert.deepEqual(fixture.getSnapshot(0), ['conversation']);
         assert.deepEqual(fixture.operations.map(operation => operation.kind), ['save', 'reload']);
 
@@ -220,7 +220,7 @@ describe('ModelEntry', () => {
 
         assert.equal(fixture.entry.status, LoadStatus.UNLOADED);
         assert.equal(fixture.entry.ladder_i, -1);
-        assert.equal(fixture.entry.curCtx(), 0);
+        assert.equal(fixture.entry.getCurCtx(), 0);
         assert.deepEqual(fixture.getSnapshot(0), ['conversation before unload']);
         assert.deepEqual(fixture.operations.map(operation => operation.kind), ['save', 'unload']);
 
@@ -242,7 +242,7 @@ describe('ModelEntry', () => {
 
         assert.equal(fixture.entry.status, LoadStatus.UNLOADED);
         assert.equal(fixture.entry.ladder_i, -1);
-        assert.equal(fixture.entry.curCtx(), 0);
+        assert.equal(fixture.entry.getCurCtx(), 0);
         assert.deepEqual(fixture.getSnapshot(0), ['previous snapshot']);
         assert.deepEqual(fixture.operations.map(operation => operation.kind), ['unload']);
     });

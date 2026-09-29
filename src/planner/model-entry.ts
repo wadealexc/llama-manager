@@ -77,9 +77,9 @@ export class ModelEntry {
         const params = this.paramsForRung(rung_i);
         if (!params) throw new Error(`moveToRung: rung index out of bounds`);
 
-        // if we're increasing the rung, retain live kvcache
+        // if we're increasing the rung or keeping the current rung, retain live kvcache
         // otherwise, restore kvcache at new rung
-        const kv_restore_i = (rung_i > this.ladder_i && this.ladder_i >= 0)
+        const kv_restore_i = (rung_i >= this.ladder_i && this.ladder_i >= 0)
             ? this.ladder_i
             : rung_i;
 
@@ -94,7 +94,7 @@ export class ModelEntry {
         this.status = LoadStatus.LOADED;
 
         await this.#restoreSlots(signal, kv_restore_i, t);
-        return this.curCtx();
+        return this.getCurCtx();
     }
 
     // NOTE: used for breakpoints; no restore functionality
@@ -104,7 +104,7 @@ export class ModelEntry {
         const params = this.paramsForRung(rung_i);
         if (!params) throw new Error(`loadWithKV: rung index out of bounds`);
 
-        if (this.status === LoadStatus.LOADED) return this.curCtx();
+        if (this.status === LoadStatus.LOADED) return this.getCurCtx();
 
         if (this.status === LoadStatus.UNLOADED) {
             await this.loadWeights(signal, t);
@@ -116,7 +116,7 @@ export class ModelEntry {
 
         this.ladder_i = rung_i;
         this.status = LoadStatus.LOADED;
-        return this.curCtx();
+        return this.getCurCtx();
     }
 
     // NOTE: used for breakpoints; no restore functionality
@@ -132,7 +132,7 @@ export class ModelEntry {
         t?.stop();
 
         this.ladder_i = next_rung;
-        return this.curCtx();
+        return this.getCurCtx();
     }
 
     async unloadKV(signal: AbortSignal, t?: Timer): Promise<void> {
@@ -212,10 +212,6 @@ export class ModelEntry {
         return `${this.name}-rung-${this.ladder_i}`;
     }
 
-    curCtx(): number {
-        return this.n_ctx;
-    }
-
     async countTokens(body: unknown, signal: AbortSignal, t?: Timer): Promise<number | null> {
         if (this.status === LoadStatus.UNLOADED) throw new Error(`countTokens: model ${this.name} is not loaded`);
 
@@ -259,6 +255,10 @@ export class ModelEntry {
         if (cap === -1) return null;
 
         return cap;
+    }
+
+    getCurCtx(): number {
+        return this.n_ctx;
     }
 
     // returns the free space needed to load the model to `rung`, in bytes,

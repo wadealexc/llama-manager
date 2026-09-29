@@ -139,15 +139,15 @@ export class Planner {
             // failure indicates the response was truncated and we need to increase the ctx window
             while (!success) {
                 try {
-                    // cur_cap + 1 will push the model to the next rung
-                    const cur_cap = model.getCtxCap(model.ladder_i)!;
-                    const min_ctx = cur_cap + 1;
+                    // cur_ctx + 1 will ensure we free up memory by evicting models/applying strats
+                    const cur_ctx = model.getCurCtx();
+                    const min_ctx = cur_ctx + 1;
 
                     if (model.getMinimumRung(min_ctx) === null) {
-                        throw new Error(`unable to increase context window for ${model.name} (cur: ${cur_cap})`);
+                        throw new Error(`unable to increase context window for ${model.name} (cur: ${cur_ctx})`);
                     }
 
-                    // queue reload to increase cap
+                    // queue model reload
                     await new Promise<void>((resolve, reject) => {
                         this.waiting_reload.push({ min_ctx, resolve, reject });
                         this.#maybeReload(t);
@@ -299,37 +299,23 @@ export class Planner {
                 fulfill.push(waiter);
             }
 
-            const cur_cap = model.getCtxCap(model.ladder_i);
-            const new_cap = model.getCtxCap(rung_needed);
+            const cur_ctx = model.getCurCtx();
+            const new_ctx = model.getCtxCap(rung_needed);
 
             const strats = model.ladder.map(r => r.strategy as string);
             const diff: string[] = rung_needed > model.ladder_i
                 ? strats.slice(model.ladder_i, rung_needed)
                 : strats.slice(rung_needed, model.ladder_i).reverse();
 
-            // free space for kv, if needed
-            const bytes_needed = model.getBytesNeeded(rung_needed)!;
-            if (bytes_needed < 0) {
-                log.info(`loading ${model.name} to rung ${rung_needed} frees ${fmtBytes(bytes_needed)}`);
-            } else if (bytes_needed > this.dev_info.bytes_avail) {
-                log.info(`freeing ${fmtBytes(bytes_needed)} for model ${model.name}`);
-                await this.#free(model, bytes_needed, t?.child(`free (kv)`));
-
-                if (bytes_needed > this.dev_info.bytes_avail) {
-                    log.warn(`maybeReload: unable to free all requested bytes; attempting reload (still needed: ${fmtBytes(bytes_needed - this.dev_info.bytes_avail)})`);
-                }
-            }
+            // unload any other active models
+            await this.#unloadAllModels(true, model.name, t?.child(`unloadAllModels`));
 
             // reload model
-            if (rung_needed !== model.ladder_i) {
-                const action = rung_needed > model.ladder_i ? "applying" : "removing";
-                log.info(`${model.name}: ${action} strategies [${diff.join(", ")}]; new ctx cap: ${new_cap}`);
+            const action = rung_needed >= model.ladder_i ? "applying" : "removing";
+            log.info(`${model.name}: ${action} strategies [${diff.join(", ")}]; new ctx cap: ${new_ctx}`);
 
-                await model.moveToRung(rung_needed, signal, t.child(`moveToRung`));
-                this.#updateMem(await this.client.getMemory(model.name, signal));
-            } else {
-                log.info(`maybeReload: ${model.name} does not need reload (cur ctx cap: ${cur_cap} | rung: ${rung_needed})`);
-            }
+            await model.moveToRung(rung_needed, signal, t.child(`moveToRung`));
+            this.#updateMem(await this.client.getMemory(model.name, signal));
 
             // flush queue
             for (const waiter of fulfill) {
@@ -382,11 +368,13 @@ export class Planner {
 
             this.waiting_load = still_waiting;
 
+            // unload any other active models
+            await this.#unloadAllModels(true, target.name, t?.child(`unloadAllModels`));
+
             // if target model has not been loaded before, we don't know how much space we need.
             // evict all models and load target, then calculate breakpoints
             if (target.getMaxCtx() === null) {
-                log.info(`first load of ${target.name}; clearing GPU and calculating breakpoints`);
-                await this.#unloadAllModels(true, target.name, t?.child(`unloadAllModels`));
+                log.info(`first load of ${target.name}; calculating breakpoints`);
 
                 const breakpoints = await walkBreakpoints(this.client, target, signal, t?.child(`walkBreakpoints`));
                 console.log(printModelBreakpoints(breakpoints));
@@ -395,16 +383,8 @@ export class Planner {
                 this.#updateMem(await this.client.getMemory(target.name, signal));
             }
 
-            // if target model is not active, stash active model's kv
-            if (target.name !== this.active.model) {
-                await this.#stashActiveKV(t?.child(`stashActiveKV`));
-            }
-
             // load model weights if needed
             if (target.status === LoadStatus.UNLOADED) {
-                log.info(`maybeSwap: freeing space for ${target.name} weights`);
-                await this.#free(target, target.bytes_needed_no_kv!, t?.child(`free (weights)`));
-
                 log.info(`maybeSwap: loading weights for ${target.name}`);
                 await target.loadWeights(signal, t?.child(`loadWeights`));
                 this.#updateMem(await this.client.getMemory(target.name, signal));
@@ -427,19 +407,6 @@ export class Planner {
 
                 if (min_rung > rung_needed) rung_needed = min_rung;
                 fulfill.push(waiter);
-            }
-
-            // free space for kv, if needed
-            const bytes_needed = target.getBytesNeeded(rung_needed)!;
-            if (bytes_needed < 0) {
-                log.info(`loading ${target.name} to rung ${rung_needed} frees ${fmtBytes(bytes_needed)}`);
-            } else if (bytes_needed > this.dev_info.bytes_avail) {
-                log.info(`freeing ${fmtBytes(bytes_needed)} for model ${target.name}`);
-                await this.#free(target, bytes_needed, t?.child(`free (kv)`));
-
-                if (bytes_needed > this.dev_info.bytes_avail) {
-                    throw new Error(`maybeSwap: unable to free all requested bytes`);
-                }
             }
 
             // reload model to target rung
@@ -467,49 +434,6 @@ export class Planner {
         }).finally(() => {
             handle.release();
         });
-    }
-
-    // free space on the gpu by stashing idle models' kvcaches and/or evicting weights
-    async #free(target_model: ModelEntry, bytes_needed: number, t?: Timer): Promise<void> {
-        if (this.dev_info.bytes_avail > bytes_needed) {
-            log.info(`#free not needed (avail: ${fmtBytes(this.dev_info.bytes_avail)} | needed: ${fmtBytes(bytes_needed)})`);
-            return;
-        }
-
-        if (this.weights_only.size === 0) {
-            const b = bytes_needed - this.dev_info.bytes_avail;
-            log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
-            return;
-        }
-
-        log.info(`unloading weights for idle models`);
-        t = t?.child('unloadWeights');
-
-        // evict weights for all weights-only models
-        for (const id of [...this.weights_only.keys()]) {
-            if (id === target_model.name) continue;
-            const model = this.models.get(id)!;
-
-            await this.#unloadWithRestore(model, t);
-
-            if (this.dev_info.bytes_avail > bytes_needed) return;
-        }
-
-        const b = bytes_needed - this.dev_info.bytes_avail;
-        log.error(`#free requires ${fmtBytes(b)} bytes, but found no more models to unload`);
-    }
-
-    async #stashActiveKV(t?: Timer): Promise<void> {
-        const active = this.activeModel();
-        if (!active) return;
-
-        log.info(`unloading kv for model: ${active.name}`);
-        await active.unloadKV(this.shutdown_ctrl.signal, t);
-
-        // update device memory and tracking
-        this.#updateMem(await this.client.getMemory(active.name, this.shutdown_ctrl.signal));
-        this.active.model = undefined;
-        this.weights_only.add(active.name);
     }
 
     async shutdown(): Promise<void> {
