@@ -32,6 +32,22 @@ If you're on Linux+CUDA like me, you can use this script:
 
 ---
 
+### Run Tests 
+
+Basic unit tests do not require a model/GPU, and use mocked llama-server calls to test llama-manager internals:
+
+```
+npm run test
+```
+
+GPU tests start a llama-server process, load models, and perform inference while testing more comprehensive llama-manager workflows. GPU tests can be configured by copying `.env.gpu-test.example` to `.env.gpu-test`, and adding paths to models on your machine.
+
+When your env is set up, you can run gpu tests with this command:
+
+```
+npm run test:gpu
+```
+
 ### Run
 
 Supply args/config as either/both CLI args, or YAML.
