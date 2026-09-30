@@ -47,7 +47,7 @@ async function loadModel(server: ApiServer, req: Request, res: ExpressResponse):
     res.on('close', () => ac.abort());
     req.on('aborted', () => ac.abort());
 
-    await server.planner.serveModel({}, model, ac.signal, async (_b: unknown, client: Client, signal: AbortSignal, _isFinal: boolean) => {
+    await server.planner.serveModel({ messages: [] }, model, ac.signal, async (_b: unknown, client: Client, signal: AbortSignal, _isFinal: boolean) => {
         res.json({ success: true });
         return true;
     });
