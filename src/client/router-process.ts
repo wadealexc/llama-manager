@@ -135,12 +135,17 @@ export class RouterProcess {
             ): Promise<boolean> => {
                 try { process.kill(-pid, signal) } catch { }
 
-                return Promise.race([
-                    exited.then(() => true),
-                    new Promise<boolean>((resolve) => {
-                        setTimeout(() => resolve(false), grace_period_ms);
-                    }),
-                ]);
+                let timeout: ReturnType<typeof setTimeout>;
+                try {
+                    return await Promise.race([
+                        exited.then(() => true),
+                        new Promise<boolean>((resolve) => {
+                            timeout = setTimeout(() => resolve(false), grace_period_ms);
+                        }),
+                    ]);
+                } finally {
+                    clearTimeout(timeout!);
+                }
             };
 
             // try a graceful shutdown first (SIGTERM)

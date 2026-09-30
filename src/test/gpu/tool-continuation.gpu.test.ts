@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { ApiServer } from '../../api/server.js';
+import type { CompletionChunk, CompletionRequest } from '../../api/types.js';
 import { buildConfig } from '../../config/build.js';
 import { parseArgs } from '../../config/parser.js';
 import { RouterProcess } from '../../client/router-process.js';
@@ -22,7 +26,65 @@ function optionalPath(key: string): string | undefined {
     return process.env[key]?.trim() ? requiredPath(key) : undefined;
 }
 
-test('GPU: llama-server accepts a tool-call continuation after planner growth', { timeout: 1200000 }, async () => {
+type StreamFrame = CompletionChunk & { done?: boolean };
+
+type UpstreamAttempt = {
+    rung: number;
+    body: CompletionRequest;
+    status: number;
+    text: string;
+};
+
+type CallbackAttempt = {
+    rung: number;
+    is_final: boolean;
+    success: boolean;
+};
+
+function parseFrames(text: string): StreamFrame[] {
+    return text.split(/\r?\n\r?\n/).flatMap(event => {
+        const data = event.split(/\r?\n/).find(line => line.startsWith('data: '))?.slice(6);
+        if (!data) return [];
+        if (data === '[DONE]') return [{ choices: [], done: true }];
+        return [JSON.parse(data) as StreamFrame];
+    });
+}
+
+function toolDeltas(frames: StreamFrame[]): unknown[] {
+    return frames.flatMap(frame => frame.choices?.flatMap(choice => choice.delta?.tool_calls ?? []) ?? []);
+}
+
+function finishReasons(frames: StreamFrame[]): string[] {
+    return frames.flatMap(frame => frame.choices?.flatMap(choice => choice.finish_reason ? [choice.finish_reason] : []) ?? []);
+}
+
+async function findBody(client: Planner['client'], model: string, base: Record<string, unknown>, payload: string, margin: number): Promise<{ body: CompletionRequest; tokens: number }> {
+    const target = 1024 - margin;
+    let low = 0;
+    let high = target * 2;
+    let best: { body: CompletionRequest; tokens: number } | undefined;
+
+    while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        const body = {
+            ...base,
+            messages: [{ role: 'user', content: `Ignore this context filler: ${'hello '.repeat(mid)}\nUse the record_text tool to record this exact text without summarizing or shortening it: ${payload}` }],
+        };
+        const tokens = await client.countTokens(body, model);
+        if (tokens <= target) {
+            best = { body, tokens };
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    assert.ok(best, `request exceeds baseline capacity with a margin of ${margin} tokens`);
+    assert.ok(best.tokens > target - 8, `unable to place prompt near the baseline boundary: ${best.tokens} vs ${target}`);
+    return best;
+}
+
+test('GPU: manager discards an interrupted tool call and streams the regenerated call after growth', { timeout: 1200000 }, async () => {
     const root = resolve(import.meta.dirname, '../../..');
     const model_path = requiredPath('MODEL');
     const mmproj_path = optionalPath('MMPROJ');
@@ -43,7 +105,10 @@ test('GPU: llama-server accepts a tool-call continuation after planner growth', 
     const preset_path = join(directory, 'preset.ini');
     const trace_path = join(directory, 'trace.json');
     let router: RouterProcess | undefined;
+    let planner: Planner | undefined;
+    let api: ApiServer | undefined;
     let succeeded = false;
+    const attempts: { margin: number; tokens: number; upstream: UpstreamAttempt[]; callbacks: CallbackAttempt[]; outward_status: number; outward_text: string }[] = [];
 
     try {
         await writeFile(config_path, JSON.stringify({ router: { 'llama-log-dir': join(directory, 'logs') } }));
@@ -71,6 +136,7 @@ test('GPU: llama-server accepts a tool-call continuation after planner growth', 
         config.router.poll_timeout_ms = 30000;
         config.model_load.poll_timeout_ms = 180000;
         config.sleep_idle_seconds = 0;
+        config.port = 0;
         router = new RouterProcess(config.router, config.model_load);
         const client = await router.start(preset_path);
         const model_cfg = config.models[config.default_model];
@@ -86,27 +152,15 @@ test('GPU: llama-server accepts a tool-call continuation after planner growth', 
         await entry.loadWithKV(signal);
         await entry.applyNextStrategy(signal);
         rungs[1].n_ctx_cap = (await client.getSlots(entry.name, signal))[0].n_ctx;
-        assert.ok(rungs[1].n_ctx_cap > 1024, `q8 rung must exceed 1024 tokens, got ${rungs[1].n_ctx_cap}`);
+        assert.ok(rungs[1].n_ctx_cap > 2048, `q8 rung needs enough room to complete a tool call: ${rungs[1].n_ctx_cap}`);
         await entry.unloadHard();
         await entry.loadWeights(signal);
         await entry.moveToRung(0, signal);
         entry.n_ctx = await client.reloadModel({ ...entry.paramsForRung(0), n_ctx: 1024 }, entry.name, signal);
         rungs[0].n_ctx_cap = (await client.getSlots(entry.name, signal))[0].n_ctx;
-        assert.ok(rungs[0].n_ctx_cap >= 1024 && rungs[0].n_ctx_cap < rungs[1].n_ctx_cap);
+        assert.equal(rungs[0].n_ctx_cap, 1024);
 
-        const initial_body = {
-            model: entry.name,
-            messages: [{ role: 'user', content: 'Say hello in one short sentence.' }],
-            stream: false,
-            max_tokens: 32,
-            temperature: 0,
-            chat_template_kwargs: { enable_thinking: false },
-        };
-        const tokens = await client.countTokens(initial_body, entry.name, signal);
-        assert.ok(tokens < rungs[0].n_ctx_cap - 32,
-            `initial request requires ${tokens} tokens; baseline capacity is ${rungs[0].n_ctx_cap}`);
-
-        const planner = new Planner(client, config, new Map([[entry.name, entry]]));
+        planner = new Planner(client, config, new Map([[entry.name, entry]]));
         const memory = await client.getMemory(entry.name, signal);
         const gpu = memory.devices.find(device => device.type !== 'cpu');
         assert.ok(gpu, 'no GPU memory reported');
@@ -114,65 +168,127 @@ test('GPU: llama-server accepts a tool-call continuation after planner growth', 
         planner.dev_info.bytes_avail = gpu.free;
         planner.active.model = entry.name;
 
-        const attempts: { rung: number; status: number; body: unknown; response: string }[] = [];
-        await planner.serveModel(initial_body, entry, signal, async (_body, completion_client, request_signal, isFinal) => {
-            assert.equal(isFinal, false, 'planner could not grow the context for the continuation');
-            if (attempts.length === 0) {
-                assert.equal(entry.ladder_i, 0);
-                const response = await completion_client.completions(initial_body, entry.name, request_signal);
-                const text = await response.text();
-                attempts.push({ rung: entry.ladder_i, status: response.status, body: initial_body, response: text });
-                await writeFile(trace_path, JSON.stringify(attempts, null, 2));
-                assert.ok(response.ok, `initial completion failed (${response.status}): ${text}`);
-                const result = JSON.parse(text) as { choices?: { message?: unknown }[] };
-                assert.ok(result.choices?.[0]?.message, `initial completion has no assistant message: ${text}`);
-                return false;
-            }
+        let current_attempt: typeof attempts[number] | undefined;
+        const captures: Promise<void>[] = [];
+        const complete = client.completions.bind(client);
+        client.completions = async (body, model, request_signal) => {
+            const rung = entry.ladder_i;
+            const response = await complete(body, model, request_signal);
+            const upstream: UpstreamAttempt = { rung, body: structuredClone(body) as CompletionRequest, status: response.status, text: '' };
+            current_attempt?.upstream.push(upstream);
+            captures.push(response.clone().text().then(text => { upstream.text = text; }));
+            return response;
+        };
 
-            assert.equal(entry.ladder_i, 1, 'planner did not advance to the next rung');
-            const continuation_body = {
-                ...initial_body,
-                messages: [
-                    ...initial_body.messages,
-                    {
-                        role: 'assistant',
-                        content: '',
-                        tool_calls: [{
-                            id: 'call_partial',
-                            type: 'function',
-                            function: { name: 'say_hello', arguments: '{"name":"hel' },
-                        }],
-                    },
-                ],
-                tools: [{
-                    type: 'function',
-                    function: {
-                        name: 'say_hello',
-                        description: 'Say hello to someone.',
-                        parameters: {
-                            type: 'object',
-                            properties: { name: { type: 'string' } },
-                            required: ['name'],
-                        },
-                    },
-                }],
-                tool_choice: 'required',
-                continue_final_message: true,
-                add_generation_prompt: false,
-            };
-            const response = await completion_client.completions(continuation_body, entry.name, request_signal);
-            const text = await response.text();
-            attempts.push({ rung: entry.ladder_i, status: response.status, body: continuation_body, response: text });
-            await writeFile(trace_path, JSON.stringify(attempts, null, 2));
-            assert.ok(response.ok, `tool-call continuation rejected (${response.status}): ${text}`);
-            const result = JSON.parse(text) as { choices?: { message?: unknown }[] };
-            assert.ok(result.choices?.[0]?.message, `tool-call continuation has no assistant message: ${text}`);
-            return true;
+        const serve_model = planner.serveModel.bind(planner);
+        planner.serveModel = async (body, model, client_signal, cb) => serve_model(body, model, client_signal, async (request_body, request_client, request_signal, is_final) => {
+            const rung = entry.ladder_i;
+            const success = await cb(request_body, request_client, request_signal, is_final);
+            current_attempt?.callbacks.push({ rung, is_final, success });
+            return success;
         });
-        assert.equal(attempts.length, 2, 'expected an initial completion and one continuation');
+
+        api = new ApiServer(planner, config);
+        await api.start();
+        const server = api.server!;
+        if (!server.listening) await once(server, 'listening');
+        const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/chat/completions`;
+        const payload = 'The quick brown fox jumps over the lazy dog. '.repeat(24);
+        const base = {
+            model: entry.name,
+            stream: true,
+            max_tokens: 512,
+            temperature: 0,
+            seed: 42,
+            reasoning_effort: 'none',
+            chat_template_kwargs: { enable_thinking: false },
+            tools: [{
+                type: 'function',
+                function: {
+                    name: 'record_text',
+                    description: 'Record the supplied text without modification.',
+                    parameters: {
+                        type: 'object',
+                        properties: { text: { type: 'string', description: 'The complete text to record, copied exactly from the user message.' } },
+                        required: ['text'],
+                    },
+                },
+            }],
+            tool_choice: 'required',
+        };
+
+        let covered = false;
+        for (const margin of [96, 128, 160, 224, 64]) {
+            if (entry.ladder_i !== 0) await entry.moveToRung(0, signal);
+            entry.n_ctx = await client.reloadModel({ ...entry.paramsForRung(0), n_ctx: 1024 }, entry.name, signal);
+            const { body, tokens } = await findBody(client, entry.name, base, payload, margin);
+            assert.ok(tokens < rungs[0].n_ctx_cap);
+            const attempt = { margin, tokens, upstream: [] as UpstreamAttempt[], callbacks: [] as CallbackAttempt[], outward_status: 0, outward_text: '' };
+            attempts.push(attempt);
+            current_attempt = attempt;
+
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            attempt.outward_status = response.status;
+            attempt.outward_text = await response.text();
+            await Promise.all(captures.splice(0));
+            current_attempt = undefined;
+            await writeFile(trace_path, JSON.stringify(attempts, null, 2));
+
+            const first = attempt.upstream[0];
+            const second = attempt.upstream[1];
+            if (!first || !second || first.status !== 200 || second.status !== 200) continue;
+            const first_frames = parseFrames(first.text);
+            const second_frames = parseFrames(second.text);
+            if (first.rung !== 0 || second.rung !== 1 ||
+                !finishReasons(first_frames).includes('length') || toolDeltas(first_frames).length === 0 ||
+                !finishReasons(second_frames).includes('tool_calls')) continue;
+
+            assert.equal(response.status, 200, attempt.outward_text);
+            assert.equal(attempt.callbacks[0]?.rung, 0);
+            assert.equal(attempt.callbacks[0]?.success, false);
+            assert.equal(attempt.callbacks[1]?.rung, 1);
+            assert.equal(attempt.callbacks[1]?.success, true);
+            assert.ok(attempt.callbacks.every(call => !call.is_final));
+            assert.ok(!second.body.messages.at(-1)?.tool_calls, 'partial tool calls were included in the continuation request');
+            assert.equal(second.body.tool_choice, 'required');
+            assert.deepEqual(second.body.tools, base.tools);
+
+            const outward = parseFrames(attempt.outward_text);
+            assert.deepEqual(toolDeltas(outward), toolDeltas(second_frames), 'the outward stream included abandoned tool-call deltas');
+            assert.deepEqual(finishReasons(outward), ['tool_calls']);
+            const usage = outward.filter(frame => frame.usage);
+            assert.equal(usage.length, 1);
+            assert.equal(usage[0].usage?.prompt_tokens, tokens);
+            assert.equal(usage[0].usage?.total_tokens, tokens + usage[0].usage!.completion_tokens);
+            assert.equal(outward.filter(frame => frame.done).length, 1);
+            const first_tool = first_frames.findIndex(frame => frame.choices?.[0]?.delta?.tool_calls?.length);
+            const prefix_frames = first_frames.slice(0, first_tool);
+            const first_content = prefix_frames.map(frame => frame.choices?.[0]?.delta?.content ?? '').join('');
+            const first_reasoning = prefix_frames.map(frame => frame.choices?.[0]?.delta?.reasoning_content ?? '').join('');
+            if (first_content || first_reasoning) {
+                const outward_content = outward.map(frame => frame.choices?.[0]?.delta?.content ?? '').join('');
+                const outward_reasoning = outward.map(frame => frame.choices?.[0]?.delta?.reasoning_content ?? '').join('');
+                assert.ok(outward_content.startsWith(first_content));
+                assert.ok(outward_reasoning.startsWith(first_reasoning));
+                const continuation = second.body.messages.at(-1);
+                assert.equal(continuation?.role, 'assistant');
+                assert.ok(continuation.content?.includes(first_content));
+                assert.ok(continuation.reasoning_content?.includes(first_reasoning));
+            }
+            covered = true;
+            break;
+        }
+
+        assert.ok(covered, `no prompt margin produced a truncated tool call followed by a completed retry; see ${trace_path}`);
         succeeded = true;
     } finally {
         try {
+            await api?.shutdown();
+            await planner?.shutdown();
             await router?.shutdown();
         } catch (err) {
             succeeded = false;
@@ -181,6 +297,7 @@ test('GPU: llama-server accepts a tool-call continuation after planner growth', 
             if (succeeded) {
                 await rm(directory, { recursive: true, force: true });
             } else {
+                await writeFile(trace_path, JSON.stringify(attempts, null, 2));
                 console.error(`GPU test artifacts preserved: ${directory}`);
             }
         }
