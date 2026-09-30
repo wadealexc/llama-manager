@@ -83,7 +83,6 @@ Models are swapped out in response to requests: when a request comes in for a mo
   - If you do not specify a precision argument, the minimum is set to `q4_0` (this will not be used unless space is needed).
 - When a model is loaded for the first time, llama-manager calculates strategy breakpoints and displays them as a printed table. Use `--calc-breakpoints` to do this on startup, instead.
 - Models unload after 10 minutes of idle by default, which also resets kvcache and strategies. Pass `--sleep-idle-seconds <n>` to change it (`0` disables).
-  - NOTE: Currently, idle acts as a 'reset' for strategy application, so running with a timeout is recommended.
 - `-c` is ignored: context is sized reactively as strategies are applied
 - CLI args take priority over YAML
 - Unknown YAML fields/CLI args are passed to llama-server
@@ -147,7 +146,6 @@ The llama.cpp work is admittedly a little messy in places. I'm still working on 
 
 - Expects inference to be performed on a single GPU; does not support CPU inference. If you want support for CPU/multi-device, please open an issue.
 - Hadamard rotation is disabled to simplify llama.cpp-side slot restore code.
-- Strategy application is not optimized to serve multiple users - degradation strategies are applied model-wide rather than per-request. Fixing this requires more granular kvcache and model management (see Future Work below).
 - I've only tested this extensively on my server. YMMV; please open an issue if you find bugs or crashes. My specs:
   - Ubuntu Server
   - RTX 5090
