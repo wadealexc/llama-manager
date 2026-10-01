@@ -210,8 +210,15 @@ export class Planner {
             } else if (model.ladder_i > rung && !handle.exclusive()) {
                 // done
             } else {
-                const new_cap = model.getCtxCap(rung);
-                log.info(`${model.name}: tokens_in ${tokens_in} requires capacity increase to ${new_cap}`);
+                const cur_ctx = model.getCurCtx();
+                const new_ctx = model.getCtxCap(rung)!;
+                const ctx_str = `(cur ctx: ${cur_ctx} | new ctx: ${new_ctx})`;
+
+                if (cur_ctx >= new_ctx) {
+                    log.info(`${model.name}: tokens_in ${tokens_in} can be served at better rung ${ctx_str}`);
+                } else {
+                    log.info(`${model.name}: tokens_in ${tokens_in} requires capacity increase ${ctx_str}`);
+                }
 
                 // capacity change needed: reload model before serving
                 await new Promise<void>((resolve, reject) => {
@@ -393,7 +400,7 @@ export class Planner {
             // count tokens and get minimum rung to satisfy all requests
             let rung_needed = 0;
             for (const waiter of to_flush) {
-                const tokens_in = await target.countTokens(waiter.body, signal, t?.child(`countTokens`));
+                const tokens_in = await target.countTokens(waiter.body, signal, t);
                 if (tokens_in === null) {
                     waiter.reject(`failed to count tokens for request`);
                     continue;
