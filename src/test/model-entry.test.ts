@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { LoadStatus } from '../config/types.js';
+import { LoadStatus, type ModelState } from '../config/types.js';
 import { MIN_ALLOWED_CTX } from '../llama-cpp-constants.js';
 import { ModelEntry } from '../planner/model-entry.js';
 import { LlamaAPIMock, type Operation } from './llama-api-mock.js';
@@ -19,22 +19,24 @@ type Fixture = {
 function createFixture(): Fixture {
     const client = new LlamaAPIMock();
     const name = 'model';
-    const entry = new ModelEntry(client, name, [], [
-        {
-            strategy: 'none',
-            impl: null!,
-            state: { kv_unified: true, cache_type_k: 'f16', cache_type_v: 'f16' },
-            n_ctx_cap: 4096,
-            bytes_needed: 8192,
-        },
-        {
-            strategy: 'quantize-kv-q8',
-            impl: null!,
-            state: { kv_unified: true, cache_type_k: 'q8_0', cache_type_v: 'q8_0' },
-            n_ctx_cap: 8192,
-            bytes_needed: 12288,
-        },
-    ]);
+
+    const initial_state: ModelState = {
+        kv_unified: true,
+        cache_type_k: 'f16',
+        cache_type_v: 'f16',
+        model_variant: name,
+    };
+
+    const entry = new ModelEntry(client, name, [], initial_state, [], new Map());
+    entry.ladder[0].n_ctx_cap = 4096;
+    entry.ladder[0].bytes_needed = 8192;
+
+    entry.ladder.push({
+        strategy: 'quantize-kv-q8',
+        state: { model_variant: name, kv_unified: true, cache_type_k: 'q8_0', cache_type_v: 'q8_0' },
+        n_ctx_cap: 8192,
+        bytes_needed: 12288,
+    });
 
     return {
         entry,
@@ -82,7 +84,8 @@ describe('ModelEntry', () => {
 
     test('upshifts with the just-saved live slots rather than an older destination snapshot', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.setLiveSlots(['live prompt', 'generated tokens']);
         fixture.seedSnapshot(1, ['older prompt']);
         fixture.clearOperations();
@@ -106,7 +109,8 @@ describe('ModelEntry', () => {
 
     test('downshifts to the destination rung snapshot while retaining the source snapshot', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.setLiveSlots(['baseline conversation']);
         await fixture.entry.moveToRung(1, signal);
         fixture.setLiveSlots(['long conversation']);
@@ -128,7 +132,8 @@ describe('ModelEntry', () => {
 
     test('repeated saves replace only the snapshot belonging to that rung', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.seedSnapshot(1, ['rung one snapshot']);
         fixture.setLiveSlots(['first rung zero snapshot']);
         await fixture.entry.unloadKV(signal);
@@ -146,7 +151,8 @@ describe('ModelEntry', () => {
 
     test('continues a rung transition when saving fails', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.setLiveSlots(['live prompt']);
         fixture.failNext('save');
         fixture.clearOperations();
@@ -178,7 +184,8 @@ describe('ModelEntry', () => {
 
     test('propagates a reload failure without committing a new rung', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.setLiveSlots(['live prompt']);
         fixture.failNext('reload');
         fixture.clearOperations();
@@ -193,7 +200,8 @@ describe('ModelEntry', () => {
 
     test('stashes slots on KV unload and restores them on reactivation', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.setLiveSlots(['conversation']);
         fixture.clearOperations();
 
@@ -212,7 +220,8 @@ describe('ModelEntry', () => {
 
     test('unloads weights with a saved snapshot for the next activation', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.setLiveSlots(['conversation before unload']);
         fixture.clearOperations();
 
@@ -233,7 +242,8 @@ describe('ModelEntry', () => {
 
     test('hard unload resets runtime state without saving or erasing existing snapshots', async () => {
         const fixture = createFixture();
-        await fixture.entry.loadWithKV(signal);
+        await fixture.entry.loadWeights(signal);
+        await fixture.entry.applyRung(0, signal);
         fixture.seedSnapshot(0, ['previous snapshot']);
         fixture.setLiveSlots(['new conversation']);
         fixture.clearOperations();

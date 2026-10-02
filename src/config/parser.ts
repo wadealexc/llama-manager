@@ -3,7 +3,7 @@ import { basename } from "node:path";
 import { load as yamlLoad } from "js-yaml";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
-import { STRATEGY_IDS, type ConfigSource, type Mode, type ModelId, type RawModel, type StrategyId } from "./types.js";
+import { RESERVED_VARIANT_NAMES, STRATEGY_IDS, type ConfigSource, type Strategy, type Mode, type ModelId, type RawModel, type StrategyId } from "./types.js";
 import { hasValue, isManagerBoolFlag, isManagerValueFlag, isModelSource, isRecognized, maybeReject, normalizeFlag } from "./flags.js";
 
 const log: ConsolaInstance = logger.withTag('parser');
@@ -15,7 +15,8 @@ interface ManagerFlags {
     host?: string;
     port?: number;
     sleep_idle_seconds?: number;
-    ladder?: StrategyId[];
+    ladder?: Strategy[];
+    model_variants?: Record<string, string>;
     slot_save_path?: string;
     idle: boolean;
     calc_breakpoints: boolean;
@@ -65,6 +66,10 @@ function parseRouterArgs(argv: string[]): ParsedArgs {
 
     parseLlamaArgs(argv, flags, () => { });
 
+    if (Object.keys(flags.model_variants ?? {}).length > 0) {
+        throw new Error(`--model-variant is only supported in single-model mode (pass --model/--model-url)`);
+    }
+
     return { mode: 'router', ...flags };
 }
 
@@ -81,6 +86,10 @@ function parseServerArgs(argv: string[]): ParsedArgs {
     };
 
     parseLlamaArgs(argv, state, (key, value) => setEntryValue(state, key, value));
+
+    if (Object.keys(state.model_variants ?? {}).length > 0) {
+        state.entry['model-variants'] = state.model_variants;
+    }
 
     if (state.model_sources.size === 0) {
         throw new Error(`server mode requires a model source (-m/--model or -mu/--model-url)`);
@@ -188,6 +197,15 @@ function handleManagerValue(state: ManagerFlags, name: string, value: string): v
         case 'slot-save-path':
             state.slot_save_path = value;
             return;
+        case 'model-variant': {
+            const variant = parseModelVariant(value);
+            if (state.model_variants === undefined) state.model_variants = {};
+            if (state.model_variants[variant.name] !== undefined) {
+                throw new Error(`duplicate --model-variant for '${variant.name}'`);
+            }
+            state.model_variants[variant.name] = variant.path;
+            return;
+        }
     }
 }
 
@@ -237,17 +255,52 @@ function setEntryValue(state: ServerState, key: string, value: string | number |
     state.entry[key] = value;
 }
 
-function parseLadder(value: string): StrategyId[] {
-    const ids = value.split(',').map(s => s.trim()).filter(s => s !== '');
-    if (ids.length === 0) {
-        throw new Error(`--ladder requires at least one strategy id (supported: ${STRATEGY_IDS.join(', ')})`);
+function parseLadder(value: string): Strategy[] {
+    const tokens = value.split(',').map(s => s.trim()).filter(s => s !== '');
+    if (tokens.length === 0) {
+        throw new Error(`--ladder requires at least one step (supported: ${STRATEGY_IDS.join(', ')}, swap-model:<name>)`);
     }
-    for (const id of ids) {
-        if (!STRATEGY_IDS.includes(id as StrategyId)) {
-            throw new Error(`unknown strategy id '${id}' (--ladder supports: ${STRATEGY_IDS.join(', ')})`);
+    return tokens.map(parseLadderStep);
+}
+
+export function parseLadderStep(token: string): Strategy {
+    const step = token.trim();
+
+    if (step.startsWith('swap-model:')) {
+        const variant = step.slice('swap-model:'.length);
+        if (variant === '' || /\s/.test(variant)) {
+            throw new Error(`malformed ladder step '${token}' (expected swap-model:<name>)`);
         }
+        return { kind: 'swap-model', variant };
     }
-    return ids as StrategyId[];
+
+    if (STRATEGY_IDS.includes(step as StrategyId)) {
+        return { kind: 'reload-model', id: step as StrategyId };
+    }
+
+    throw new Error(`unknown ladder step '${token}' (supported: ${STRATEGY_IDS.join(', ')}, swap-model:<name>)`);
+}
+
+function parseModelVariant(value: string): { name: string; path: string } {
+    const eq = value.indexOf('=');
+    if (eq <= 0) {
+        throw new Error(`--model-variant expects name=<path>, got '${value}'`);
+    }
+
+    const name = value.slice(0, eq).trim();
+    const path = value.slice(eq + 1).trim();
+
+    if (name === '' || /\s/.test(name)) {
+        throw new Error(`invalid model-variant name in '${value}'`);
+    }
+    if (RESERVED_VARIANT_NAMES.has(name)) {
+        throw new Error(`model-variant name '${name}' is reserved`);
+    }
+    if (path === '') {
+        throw new Error(`model-variant '${name}' has an empty path`);
+    }
+
+    return { name, path };
 }
 
 function deriveModelId(source: string): ModelId {

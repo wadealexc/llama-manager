@@ -1,13 +1,13 @@
 import type { LlamaAPI } from "../../client/llama-api.js";
 import type { StrategyId } from "../../config/types.js";
-import type { Strategy } from "../types.js";
+import type { StrategyImpl } from "../types.js";
 import { DisableSpec } from "./disable-spec.js";
 import { MmprojToCPU } from "./mmproj-to-cpu.js";
 import { QuantizeKvQ4 } from "./quantize-kv-q4.js";
 import { QuantizeKvQ8 } from "./quantize-kv-q8.js";
 
-export function createStrategies(client: LlamaAPI): Map<StrategyId, Strategy> {
-    return new Map<StrategyId, Strategy>([
+export function createStrategies(client: LlamaAPI): Map<StrategyId, StrategyImpl> {
+    return new Map<StrategyId, StrategyImpl>([
         ['disable-spec', new DisableSpec(client)],
         ['mmproj-to-cpu', new MmprojToCPU(client)],
         ['quantize-kv-q8', new QuantizeKvQ8(client)],

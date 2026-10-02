@@ -2,11 +2,11 @@ import type { ConsolaInstance } from "consola";
 import { logger } from "../../logger.js";
 import type { LlamaAPI } from "../../client/llama-api.js";
 import { isSpecEnabled, type ModelState, type StrategyId } from "../../config/types.js";
-import type { Strategy } from "../types.js";
+import type { StrategyImpl } from "../types.js";
 
 const log: ConsolaInstance = logger.withTag('disable-spec');
 
-export class DisableSpec implements Strategy {
+export class DisableSpec implements StrategyImpl {
 
     id: StrategyId = 'disable-spec';
 

@@ -6,9 +6,7 @@ import { logger } from "./logger.js";
 import { Planner } from "./planner/planner.js";
 import { ApiServer } from "./api/server.js";
 import { ModelEntry } from "./planner/model-entry.js";
-import type { Rung } from "./planner/model-entry.js";
-import type { ModelId, ModelState, StrategyId } from "./config/types.js";
-import type { Strategy } from "./planner/types.js";
+import type { ModelId } from "./config/types.js";
 import { createStrategies } from "./planner/strategies/index.js";
 import { parseArgvAndConfig } from "./cli.js";
 
@@ -30,11 +28,8 @@ const [parsed, config] = await parseArgvAndConfig(
     DEFAULT_CONFIG_PATH
 );
 
-// TODO: temporarily disabling hadamard rotation to simplify strategy implementation
-const has_kv_quantize_strat = Object.values(config.models).some(m => m.ladder.some(id => ['quantize-kv-q8', 'quantize-kv-q4'].includes(id)));
-if (has_kv_quantize_strat) {
-    process.env.LLAMA_ATTN_ROT_DISABLE = '1';
-}
+// TODO: disable hadamard rotation to simplify strategy implementation
+process.env.LLAMA_ATTN_ROT_DISABLE = '1';
 
 // start llama-server in router mode
 router = new RouterProcess(config.router, config.model_load);
@@ -42,12 +37,17 @@ const llama_api = await router.start(PRESET_PATH);
 
 const strategies = createStrategies(llama_api);
 
-// define models from config
+// build models from config
 const models = new Map<ModelId, ModelEntry>();
 for (const [name, cfg] of Object.entries(config.models)) {
-    const rungs = buildLadder(cfg.initial_state, cfg.ladder, strategies);
-    const entry = new ModelEntry(llama_api, name, cfg.aliases, rungs);
-    models.set(name, entry);
+    models.set(name, new ModelEntry(
+        llama_api,
+        name,
+        cfg.aliases,
+        cfg.initial_state,
+        cfg.ladder,
+        strategies,
+    ));
 }
 
 if (models.size === 0) {
@@ -85,19 +85,6 @@ try {
     log.error(`startup error: ${err}`);
     await shutdown('error');
     process.exit(1);
-}
-
-function buildLadder(initial: ModelState, ids: StrategyId[], strats: Map<StrategyId, Strategy>): Rung[] {
-    const rungs: Rung[] = [{ strategy: 'none', impl: null!, state: initial, n_ctx_cap: -1, bytes_needed: 0 }];
-    let state = initial;
-    for (const id of ids) {
-        const s = strats.get(id);
-        if (!s) continue;
-        if (!s.canApply(state)) continue;
-        state = s.getNewState(state);
-        rungs.push({ strategy: id, impl: s, state, n_ctx_cap: -1, bytes_needed: 0 });
-    }
-    return rungs;
 }
 
 /* -------------------- STOP SERVER -------------------- */

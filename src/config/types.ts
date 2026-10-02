@@ -13,6 +13,12 @@ export type StrategyId =
 const STRATEGY_IDS: StrategyId[] = ['disable-spec', 'mmproj-to-cpu', 'quantize-kv-q8', 'quantize-kv-q4'];
 export { STRATEGY_IDS };
 
+export type Strategy =
+    | { kind: 'reload-model'; id: StrategyId }
+    | { kind: 'swap-model'; variant: string };
+
+export const RESERVED_VARIANT_NAMES = new Set(['model', 'model-url']);
+
 export enum LoadStatus {
     UNLOADED,
     WEIGHTS_ONLY,
@@ -40,7 +46,9 @@ export type ModelState = Pick<ReloadParams,
     | 'kv_unified'
     | 'mmproj'
     | 'spec'
->;
+> & {
+    model_variant: string;
+};
 
 export function isSpecEnabled(state: ModelState): boolean {
     return !!state.spec && !!state.spec.types?.length && !state.spec.types.includes('none');
@@ -54,10 +62,16 @@ export function isMmprojOnCPU(state: ModelState): boolean {
     return state.mmproj?.mmproj_offload === false;
 }
 
+export interface ModelVariant {
+    router_id: ModelId;
+    path: string;
+}
+
 export interface ModelConfig {
     name: ModelId;
     aliases: string[];
-    ladder: StrategyId[];
+    variants: Record<string, ModelVariant>;
+    ladder: Strategy[];
     initial_state: ModelState;
 }
 
@@ -74,7 +88,7 @@ export interface ConfigSource {
     port?: number;
     sleep_idle_seconds?: number;
     default_model?: ModelId;
-    ladder_override?: StrategyId[];
+    ladder_override?: Strategy[];
     bin_override?: string;
 }
 

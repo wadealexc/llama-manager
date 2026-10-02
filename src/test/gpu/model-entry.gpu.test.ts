@@ -5,14 +5,11 @@ import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { parseArgs } from '../../config/parser.js';
 import { buildConfig } from '../../config/build.js';
-import { LoadStatus, type ModelState, type StrategyId } from '../../config/types.js';
-import type { LlamaAPI } from '../../client/llama-api.js';
+import { LoadStatus } from '../../config/types.js';
 import type { SlotRestore } from '../../client/types.js';
 import { RouterProcess } from '../../client/router-process.js';
-import { ModelEntry, type Rung } from '../../planner/model-entry.js';
+import { ModelEntry } from '../../planner/model-entry.js';
 import { createStrategies } from '../../planner/strategies/index.js';
-import type { Strategy } from '../../planner/types.js';
-
 function requiredPath(key: string): string {
     const value = process.env[key]?.trim();
     assert.ok(value, `set ${key} in .env.gpu-test`);
@@ -25,21 +22,8 @@ function optionalPath(key: string): string | undefined {
     return process.env[key]?.trim() ? requiredPath(key) : undefined;
 }
 
-function buildLadder(initial_state: ModelState, ids: StrategyId[], strategies: Map<StrategyId, Strategy>): Rung[] {
-    const rungs: Rung[] = [{ strategy: 'none', impl: null!, state: initial_state, n_ctx_cap: -1, bytes_needed: 0 }];
-    let state = initial_state;
-    for (const id of ids) {
-        const strategy = strategies.get(id);
-        assert.ok(strategy, `missing strategy ${id}`);
-        if (!strategy.canApply(state)) continue;
-        state = strategy.getNewState(state);
-        rungs.push({ strategy: id, impl: strategy, state, n_ctx_cap: -1, bytes_needed: 0 });
-    }
-    return rungs;
-}
-
-async function chat(client: LlamaAPI, model: string): Promise<void> {
-    const response = await client.completions({
+async function chat(model: ModelEntry): Promise<void> {
+    const response = await model.completions({
         messages: [
             { role: 'system', content: 'Answer briefly.' },
             { role: 'user', content: 'What is two plus two?' },
@@ -47,7 +31,7 @@ async function chat(client: LlamaAPI, model: string): Promise<void> {
         stream: false,
         max_tokens: 32,
         temperature: 0,
-    }, model);
+    }, new AbortController().signal);
     const text = await response.text();
     assert.ok(response.ok, `completion failed (${response.status}): ${text}`);
     const result = JSON.parse(text) as { choices?: { message?: unknown }[] };
@@ -131,8 +115,14 @@ test('GPU: real router preserves slots through configured rung transitions', { t
         };
         const model_cfg = config.models[config.default_model];
         assert.ok(model_cfg);
-        const entry = new ModelEntry(client, model_cfg.name, model_cfg.aliases,
-            buildLadder(model_cfg.initial_state, model_cfg.ladder, createStrategies(client)));
+        const entry = new ModelEntry(
+            client, 
+            model_cfg.name, 
+            model_cfg.aliases, 
+            model_cfg.initial_state, 
+            model_cfg.ladder, 
+            createStrategies(client)
+        );
         const rung_ids = entry.ladder.map(rung => rung.strategy);
         if (mmproj_path) assert.ok(rung_ids.includes('mmproj-to-cpu'), 'mmproj strategy was not configured');
         if (spec_type && spec_type !== 'none') assert.ok(rung_ids.includes('disable-spec'), 'spec strategy was not configured');
@@ -142,7 +132,7 @@ test('GPU: real router preserves slots through configured rung transitions', { t
         await entry.loadWeights(signal);
         await entry.moveToRung(0, signal);
         assert.equal(entry.status, LoadStatus.LOADED);
-        await chat(client, entry.name);
+        await chat(entry);
 
         for (let rung_i = 1; rung_i < entry.ladder.length; rung_i++) {
             console.log(`${entry.name} moving to rung ${rung_i} (${entry.ladder[rung_i].strategy})`);
@@ -152,7 +142,7 @@ test('GPU: real router preserves slots through configured rung transitions', { t
             assert.ok(n_ctx > 0, `rung ${rung_i} has no context`);
             assert.equal(entry.ladder_i, rung_i);
             assertRestored(entry, source, restores);
-            await chat(client, entry.name);
+            await chat(entry);
             console.log(`GPU transition covered: ${entry.ladder[rung_i].strategy} (${n_ctx} tokens)`);
         }
 
@@ -161,7 +151,7 @@ test('GPU: real router preserves slots through configured rung transitions', { t
         await entry.moveToRung(0, signal);
         assert.equal(entry.ladder_i, 0);
         assertRestored(entry, 0, restores);
-        await chat(client, entry.name);
+        await chat(entry);
         console.log(`GPU transition covered: ${entry.ladder[final_rung].strategy} → baseline`);
         succeeded = true;
     } finally {

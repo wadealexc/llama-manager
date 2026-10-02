@@ -12,12 +12,7 @@ import { printModelBreakpoints, walkBreakpoints } from "../show-breakpoints.js";
 
 const log: ConsolaInstance = logger.withTag('planner');
 
-export interface Client {
-    completions(body: unknown, model: ModelId, signal: AbortSignal): Promise<Response>;
-    countTokens(body: unknown, model: ModelId, signal: AbortSignal): Promise<number>;
-}
-
-type PlannerCallback = (body: unknown, client: Client, signal: AbortSignal, isFinal: boolean) => Promise<boolean>;
+type PlannerCallback = (body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => Promise<boolean>;
 
 type ActiveState = {
     pending: boolean;
@@ -99,7 +94,7 @@ export class Planner {
             throw new Error(`serveDefault: unable to load weights for model ${model.name}: ${err}`);
         }
 
-        this.#updateMem(await this.client.getMemory(model.name, this.shutdown_ctrl.signal));
+        await this.#updateMemory(model);
 
         // first load: calculate breakpoints
         const breakpoints = await walkBreakpoints(this.client, model, this.shutdown_ctrl.signal, t?.child(`walkBreakpoints`));
@@ -109,8 +104,7 @@ export class Planner {
         const n_ctx = await model.moveToRung(0, this.shutdown_ctrl.signal, t?.child(`moveToRung(0)`));
         log.info(`serving ${model.name} with a context window of ${n_ctx} tokens`);
 
-        // update memory info
-        this.#updateMem(await this.client.getMemory(model.name, this.shutdown_ctrl.signal));
+        await this.#updateMemory(model);
 
         this.active = {
             pending: false,
@@ -122,7 +116,10 @@ export class Planner {
         this.#startIdleTimer();
     }
 
-    async serveModel(body: unknown, model: ModelEntry, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
+    async serveModel(body: unknown, model_name: string, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
+        const model = this.resolve(model_name);
+        if (!model) throw new Error(`serveModel: unknown model ${model_name}`);
+        
         this.#cancelIdleTimer();
 
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
@@ -133,7 +130,7 @@ export class Planner {
             // TODO: this timer name is wrong when caller is from tokenize/input_tokens/etc
             // FIX: allow caller to pass label.
             t?.start('completions callback');
-            let success = await cb(body, this.client, signal, false);
+            let success = await cb(body, model, signal, false);
             t?.stop();
 
             // failure indicates the response was truncated and we need to increase the ctx window
@@ -154,12 +151,12 @@ export class Planner {
                     });
                 } catch {
                     // if unable to grow, inform via callback
-                    success = await cb(body, this.client, signal, true);
+                    success = await cb(body, model, signal, true);
                     break;
                 }
 
                 t?.start('completions callback');
-                success = await cb(body, this.client, signal, false);
+                success = await cb(body, model, signal, false);
                 t?.stop();
             }
         }).finally(() => {
@@ -322,7 +319,7 @@ export class Planner {
             log.info(`${model.name}: ${action} strategies [${diff.join(", ")}]; new ctx cap: ${new_ctx}`);
 
             await model.moveToRung(rung_needed, signal, t.child(`moveToRung`));
-            this.#updateMem(await this.client.getMemory(model.name, signal));
+            await this.#updateMemory(model);
 
             // flush queue
             for (const waiter of fulfill) {
@@ -387,14 +384,14 @@ export class Planner {
                 console.log(printModelBreakpoints(breakpoints));
 
                 await target.moveToRung(0, signal, t?.child(`moveToRung(0)`));
-                this.#updateMem(await this.client.getMemory(target.name, signal));
+                await this.#updateMemory(target);
             }
 
             // load model weights if needed
             if (target.status === LoadStatus.UNLOADED) {
                 log.info(`maybeSwap: loading weights for ${target.name}`);
                 await target.loadWeights(signal, t?.child(`loadWeights`));
-                this.#updateMem(await this.client.getMemory(target.name, signal));
+                await this.#updateMemory(target);
             }
 
             // count tokens and get minimum rung to satisfy all requests
@@ -421,7 +418,7 @@ export class Planner {
             const new_cap = target.getCtxCap(rung_needed);
             log.info(`${target.name}: applying strategies [${strats.join(", ")}]; new ctx cap: ${new_cap}`);
             await target.moveToRung(rung_needed, signal, t.child(`moveToRung`));
-            this.#updateMem(await this.client.getMemory(target.name, signal));
+            await this.#updateMemory(target);
 
             this.active.model = target.name;
             this.weights_only.delete(target.name);
@@ -569,7 +566,7 @@ export class Planner {
 
     async #unloadNoRestore(model: ModelEntry, t?: Timer): Promise<void> {
         try {
-            const mem = await this.client.getMemory(model.name, this.shutdown_ctrl.signal);
+            const mem = await model.getMemory(this.shutdown_ctrl.signal);
             const bytes_used = calcTotalBytesForModel(mem);
 
             await model.unloadHard(t);
@@ -588,7 +585,7 @@ export class Planner {
 
     async #unloadWithRestore(model: ModelEntry, t?: Timer): Promise<void> {
         try {
-            const mem = await this.client.getMemory(model.name, this.shutdown_ctrl.signal);
+            const mem = await model.getMemory(this.shutdown_ctrl.signal);
             const bytes_used = calcTotalBytesForModel(mem);
 
             // unload model and update restore point, if created
@@ -619,7 +616,9 @@ export class Planner {
         }
     }
 
-    #updateMem(mem: MemoryResponse): void {
+    async #updateMemory(model: ModelEntry): Promise<void> {
+        const mem = await model.getMemory(this.shutdown_ctrl.signal);
+
         if (this.dev_info.bytes_total === 0) {
             log.info(`first model loaded`);
             this.dev_info.bytes_total = calcTotalBytesOnDevice(mem);

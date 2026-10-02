@@ -2,11 +2,11 @@ import type { ConsolaInstance } from "consola";
 import { logger } from "../../logger.js";
 import type { LlamaAPI } from "../../client/llama-api.js";
 import type { ModelState, StrategyId } from "../../config/types.js";
-import type { Strategy } from "../types.js";
+import type { StrategyImpl } from "../types.js";
 
 const log: ConsolaInstance = logger.withTag('quantize-kv-q8');
 
-export class QuantizeKvQ8 implements Strategy {
+export class QuantizeKvQ8 implements StrategyImpl {
 
     id: StrategyId = 'quantize-kv-q8';
 

@@ -10,7 +10,7 @@ import type { CompletionChunk, CompletionRequest } from '../../api/types.js';
 import { buildConfig } from '../../config/build.js';
 import { parseArgs } from '../../config/parser.js';
 import { RouterProcess } from '../../client/router-process.js';
-import { ModelEntry, type Rung } from '../../planner/model-entry.js';
+import { ModelEntry } from '../../planner/model-entry.js';
 import { Planner } from '../../planner/planner.js';
 import { createStrategies } from '../../planner/strategies/index.js';
 
@@ -58,7 +58,7 @@ function finishReasons(frames: StreamFrame[]): string[] {
     return frames.flatMap(frame => frame.choices?.flatMap(choice => choice.finish_reason ? [choice.finish_reason] : []) ?? []);
 }
 
-async function findBody(client: Planner['client'], model: string, base: Record<string, unknown>, payload: string, margin: number): Promise<{ body: CompletionRequest; tokens: number }> {
+async function findBody(model: ModelEntry, base: Record<string, unknown>, payload: string, margin: number): Promise<{ body: CompletionRequest; tokens: number }> {
     const target = 1024 - margin;
     let low = 0;
     let high = target * 2;
@@ -70,7 +70,8 @@ async function findBody(client: Planner['client'], model: string, base: Record<s
             ...base,
             messages: [{ role: 'user', content: `Ignore this context filler: ${'hello '.repeat(mid)}\nUse the record_text tool to record this exact text without summarizing or shortening it: ${payload}` }],
         };
-        const tokens = await client.countTokens(body, model);
+        const tokens = await model.countTokens(body, new AbortController().signal);
+        assert.ok(tokens !== null, `countTokens failed for model: ${model.name}`);
         if (tokens <= target) {
             best = { body, tokens };
             low = mid + 1;
@@ -81,6 +82,7 @@ async function findBody(client: Planner['client'], model: string, base: Record<s
 
     assert.ok(best, `request exceeds baseline capacity with a margin of ${margin} tokens`);
     assert.ok(best.tokens > target - 8, `unable to place prompt near the baseline boundary: ${best.tokens} vs ${target}`);
+    best.body.model = model.curVariant();
     return best;
 }
 
@@ -141,27 +143,32 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         const client = await router.start(preset_path);
         const model_cfg = config.models[config.default_model];
         assert.ok(model_cfg);
-        const strategy = createStrategies(client).get('quantize-kv-q8');
-        assert.ok(strategy);
-        const rungs: Rung[] = [
-            { strategy: 'none', impl: null!, state: model_cfg.initial_state, n_ctx_cap: -1, bytes_needed: 0 },
-            { strategy: 'quantize-kv-q8', impl: strategy, state: strategy.getNewState(model_cfg.initial_state), n_ctx_cap: -1, bytes_needed: 0 },
-        ];
-        const entry = new ModelEntry(client, model_cfg.name, model_cfg.aliases, rungs);
+        const strategies = createStrategies(client);
+        assert.ok(strategies.get('quantize-kv-q8'));
+        const entry = new ModelEntry(
+            client, 
+            model_cfg.name, 
+            model_cfg.aliases, 
+            model_cfg.initial_state,
+            model_cfg.ladder,
+            strategies,
+        );
+        const rungs = entry.ladder;
         const signal = new AbortController().signal;
-        await entry.loadWithKV(signal);
-        await entry.applyNextStrategy(signal);
-        rungs[1].n_ctx_cap = (await client.getSlots(entry.name, signal))[0].n_ctx;
+        await entry.loadWeights(signal);
+        await entry.applyRung(0, signal);
+        await entry.applyNextRung(signal);
+        rungs[1].n_ctx_cap = (await entry.getSlots(signal))[0].n_ctx;
         assert.ok(rungs[1].n_ctx_cap > 2048, `q8 rung needs enough room to complete a tool call: ${rungs[1].n_ctx_cap}`);
         await entry.unloadHard();
         await entry.loadWeights(signal);
         await entry.moveToRung(0, signal);
         entry.n_ctx = await client.reloadModel({ ...entry.paramsForRung(0), n_ctx: 1024 }, entry.name, signal);
-        rungs[0].n_ctx_cap = (await client.getSlots(entry.name, signal))[0].n_ctx;
+        rungs[0].n_ctx_cap = (await entry.getSlots(signal))[0].n_ctx;
         assert.equal(rungs[0].n_ctx_cap, 1024);
 
         planner = new Planner(client, config, new Map([[entry.name, entry]]));
-        const memory = await client.getMemory(entry.name, signal);
+        const memory = await entry.getMemory(signal);
         const gpu = memory.devices.find(device => device.type !== 'cpu');
         assert.ok(gpu, 'no GPU memory reported');
         planner.dev_info.bytes_total = gpu.total;
@@ -221,7 +228,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         for (const margin of [96, 128, 160, 224, 64]) {
             if (entry.ladder_i !== 0) await entry.moveToRung(0, signal);
             entry.n_ctx = await client.reloadModel({ ...entry.paramsForRung(0), n_ctx: 1024 }, entry.name, signal);
-            const { body, tokens } = await findBody(client, entry.name, base, payload, margin);
+            const { body, tokens } = await findBody(entry, base, payload, margin);
             assert.ok(tokens < rungs[0].n_ctx_cap);
             const attempt = { margin, tokens, upstream: [] as UpstreamAttempt[], callbacks: [] as CallbackAttempt[], outward_status: 0, outward_text: '' };
             attempts.push(attempt);

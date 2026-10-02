@@ -2,11 +2,11 @@ import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../../client/llama-api.js";
 import { hasMmproj, isMmprojOnCPU, type ModelState, type StrategyId } from "../../config/types.js";
 import { logger } from "../../logger.js";
-import type { Strategy } from "../types.js";
+import type { StrategyImpl } from "../types.js";
 
 const log: ConsolaInstance = logger.withTag('mmproj-to-cpu');
 
-export class MmprojToCPU implements Strategy {
+export class MmprojToCPU implements StrategyImpl {
 
     id: StrategyId = 'mmproj-to-cpu';
 

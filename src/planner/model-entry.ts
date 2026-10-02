@@ -1,15 +1,15 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import type { ReloadParams, SlotSave } from "../client/types.js";
-import { LoadStatus, type ModelId, type ModelState, type StrategyId, type Tokens } from "../config/types.js";
+import type { MemoryResponse, ReloadParams, Slot, SlotSave } from "../client/types.js";
+import { LoadStatus, type ModelId, type ModelState, type Strategy, type StrategyId, type Tokens } from "../config/types.js";
 import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { logger } from "../logger.js";
 import { Timer } from "./timer.js";
-import type { Strategy } from "./types.js";
+import type { StrategyImpl } from "./types.js";
 
 export interface Rung {
-    strategy: StrategyId | 'none';
-    impl: Strategy;
+    strategy: StrategyId | 'swap-model';
+    impl?: StrategyImpl;
     state: ModelState;
     n_ctx_cap: Tokens;
     bytes_needed: number;
@@ -33,32 +33,90 @@ export class ModelEntry {
     // TODO: clean up first-load semantics
     bytes_needed_no_kv?: number;
 
-    constructor(client: LlamaAPI, name: ModelId, aliases: string[], ladder: Rung[]) {
+    constructor(
+        client: LlamaAPI, 
+        name: ModelId, 
+        aliases: string[], 
+        initial_state: ModelState,
+        ladder: Strategy[],
+        impls: Map<StrategyId, StrategyImpl>
+    ) {
         this.log = logger.withTag(name);
 
         this.client = client;
         this.name = name;
         this.aliases = aliases;
-        this.ladder = ladder;
+        this.ladder = this.#buildLadder(initial_state, ladder, impls);
+    }
+
+    #buildLadder(initial_state: ModelState, ladder: Strategy[], strats: Map<StrategyId, StrategyImpl>): Rung[] {
+        if (initial_state.model_variant === undefined) {
+            throw new Error(`#buildLadder: expected initial model variant for ${this.name}`);
+        }
+
+        let state = initial_state;
+
+        const rungs: Rung[] = [{
+            strategy: 'swap-model',
+            state,
+            n_ctx_cap: -1,
+            bytes_needed: 0,
+        }];
+
+        for (const [i, item] of ladder.entries()) {
+            if (item.kind === 'reload-model') {
+                const s = strats.get(item.id);
+                if (!s) throw new Error(`#buildLadder: unrecognized strategy: ${item.id}`);
+
+                if (!s.canApply(state)) {
+                    this.log.warn(`cannot apply strategy ${item.id} at pos ${i}; skipping`);
+                    continue;
+                }
+
+                state = s.getNewState(state);
+                rungs.push({
+                    strategy: item.id,
+                    impl: s,
+                    state,
+                    n_ctx_cap: -1,
+                    bytes_needed: 0,
+                });
+            } else {
+                // TODO
+                state = structuredClone(state);
+                state.model_variant = item.variant;
+                state.cache_type_k = 'f16';
+                state.cache_type_v = 'f16';
+
+                rungs.push({
+                    strategy: 'swap-model',
+                    state,
+                    n_ctx_cap: -1,
+                    bytes_needed: 0,
+                })
+            }
+        }
+
+        return rungs;
     }
 
     async loadWeights(signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status !== LoadStatus.UNLOADED) return;
 
         t?.start(`loadModelAndWait`);
-        await this.client.loadModelAndWait(this.name, signal);
+        await this.client.loadModelAndWait(this.curVariant(), signal);
         t?.stop();
 
         // record bytes for weights-only, if needed
         // TODO: combine with breakpoint calculation
         if (!this.bytes_needed_no_kv) {
-            const mem = await this.client.getMemory(this.name, signal);
+            const mem = await this.client.getMemory(this.curVariant(), signal);
             let weight_bytes = 0;
             let context_bytes = 0;
             for (const dev of mem.devices) {
                 if (dev.type === "cpu") continue;
-                for (const name of ["main", "spec", "mmproj"] as const) {
-                    const c = dev.components[name];
+                for (const comp of ["main", "spec", "mmproj"] as const) {
+                    const c = dev.components[comp];
                     if (!c) continue;
                     weight_bytes += c.model;
                     context_bytes += c.context + c.compute;
@@ -73,66 +131,62 @@ export class ModelEntry {
 
     async moveToRung(rung_i: number, signal: AbortSignal, t?: Timer): Promise<number> {
         if (this.status === LoadStatus.UNLOADED) throw new Error(`moveToRung: model must be loaded`);
+        if (!this.hasRung(rung_i)) throw new Error(`moveToRung: rung index out of bounds`);
 
-        const params = this.paramsForRung(rung_i);
-        if (!params) throw new Error(`moveToRung: rung index out of bounds`);
-
-        // if we're increasing the rung or keeping the current rung, retain live kvcache
-        // otherwise, restore kvcache at new rung
-        const kv_restore_i = (rung_i >= this.ladder_i && this.ladder_i >= 0)
-            ? this.ladder_i
-            : rung_i;
+        const cur_i = this.ladder_i;
 
         // create a restore point at the current rung
         await this.#createRestorePoint(signal, t);
 
-        t?.start('reloadModel');
-        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
-        t?.stop();
+        await this.#applyRung(rung_i, signal, t);
 
-        this.ladder_i = rung_i;
-        this.status = LoadStatus.LOADED;
-
+        // if we're increasing the rung or keeping the current rung, retain live kvcache
+        // otherwise, restore kvcache at new rung
+        const kv_restore_i = (rung_i >= cur_i && cur_i >= 0) ? cur_i : rung_i;
         await this.#restoreSlots(signal, kv_restore_i, t);
+
         return this.getCurCtx();
     }
 
-    // NOTE: used for breakpoints; no restore functionality
-    async loadWithKV(signal: AbortSignal, t?: Timer, target_rung?: number): Promise<number> {
-        const rung_i = target_rung ?? 0;
+    // identical to moveToRung, except without creating or using a restore point
+    async applyRung(rung_i: number, signal: AbortSignal, t?: Timer): Promise<number> {
+        if (this.status === LoadStatus.UNLOADED) throw new Error(`applyRung: model must be loaded`);
+        if (!this.hasRung(rung_i)) throw new Error(`applyRung: rung index out of bounds`);
 
-        const params = this.paramsForRung(rung_i);
-        if (!params) throw new Error(`loadWithKV: rung index out of bounds`);
+        await this.#applyRung(rung_i, signal, t);
+        return this.getCurCtx();
+    }
 
-        if (this.status === LoadStatus.LOADED) return this.getCurCtx();
+    // identical to applyRung, except that it applies the next rung in the ladder
+    async applyNextRung(signal: AbortSignal, t?: Timer): Promise<number> {
+        return await this.applyRung(this.ladder_i + 1, signal, t);
+    }
 
-        if (this.status === LoadStatus.UNLOADED) {
-            await this.loadWeights(signal, t);
+    async #applyRung(i: number, signal: AbortSignal, t?: Timer): Promise<void> {
+        const dest_state = this.stateAtRung(i)!;
+        const cur_variant = this.curVariant();
+        const new_variant = dest_state.model_variant;
+
+        // swap model variant
+        if (cur_variant !== new_variant) {
+            t?.start(`unloadModelAndWait ${cur_variant}`);
+            await this.client.unloadModelAndWait(cur_variant);
+            t?.stop();
+
+            t?.start(`loadModelAndWait ${new_variant}`);
+            await this.client.loadModelAndWait(new_variant, signal);
+            t?.stop();
         }
 
+        const { model_variant, ...state } = structuredClone(dest_state);
+        const params: ReloadParams = { ...state, n_ctx: 0 };
+
         t?.start('reloadModel');
-        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
+        this.n_ctx = await this.client.reloadModel(params, new_variant, signal);
         t?.stop();
 
-        this.ladder_i = rung_i;
+        this.ladder_i = i;
         this.status = LoadStatus.LOADED;
-        return this.getCurCtx();
-    }
-
-    // NOTE: used for breakpoints; no restore functionality
-    async applyNextStrategy(signal: AbortSignal, t?: Timer): Promise<number> {
-        if (this.status !== LoadStatus.LOADED) throw new Error(`applyNextStrategy: model must be loaded`);
-
-        const next_rung = this.ladder_i + 1;
-        const params = this.paramsForRung(next_rung);
-        if (!params) throw new Error(`applyNextStrategy: model has no more strategies`);
-
-        t?.start('reloadModel');
-        this.n_ctx = await this.client.reloadModel(params, this.name, signal);
-        t?.stop();
-
-        this.ladder_i = next_rung;
-        return this.getCurCtx();
     }
 
     async unloadKV(signal: AbortSignal, t?: Timer): Promise<void> {
@@ -143,7 +197,7 @@ export class ModelEntry {
 
         // unload kv
         t?.start('reloadModel');
-        await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, this.name, signal);
+        await this.client.reloadModel({ n_ctx: MIN_ALLOWED_CTX }, this.curVariant(), signal);
         t?.stop();
 
         this.#setWeightsOnly();
@@ -159,7 +213,7 @@ export class ModelEntry {
         }
 
         t?.start('unloadModelAndWait');
-        await this.client.unloadModelAndWait(this.name);
+        await this.client.unloadModelAndWait(this.curVariant());
         t?.stop();
 
         this.#setUnloaded();
@@ -170,7 +224,7 @@ export class ModelEntry {
         if (this.status === LoadStatus.UNLOADED) return;
 
         t?.start('unloadModelAndWait');
-        await this.client.unloadModelAndWait(this.name);
+        await this.client.unloadModelAndWait(this.curVariant());
         t?.stop();
 
         this.#setUnloaded();
@@ -179,11 +233,11 @@ export class ModelEntry {
     async #createRestorePoint(signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status !== LoadStatus.LOADED) return;
 
-        const basename = this.#getRestoreName();
+        const path_base = this.#getRestoreName();
 
         try {
             t?.start('saveAllSlots');
-            this.ladder[this.ladder_i].last_slots = await this.client.saveAllSlots(this.name, basename, signal);
+            this.ladder[this.ladder_i].last_slots = await this.client.saveAllSlots(this.curVariant(), path_base, signal);
         } catch (err) {
             this.log.error(`error creating restore point: ${err}`);
         } finally {
@@ -200,7 +254,7 @@ export class ModelEntry {
 
         try {
             t?.start('restoreAllSlots');
-            await this.client.restoreAllSlots(this.name, slots, signal);
+            await this.client.restoreAllSlots(this.curVariant(), slots, signal);
         } catch (err) {
             this.log.error(`error restoring last slots: ${err}`);
         } finally {
@@ -212,12 +266,16 @@ export class ModelEntry {
         return `${this.name}-rung-${this.ladder_i}`;
     }
 
+    async completions(body: unknown, signal: AbortSignal, t?: Timer): Promise<Response> {
+        return await this.client.completions(body, this.curVariant(), signal);
+    }
+
     async countTokens(body: unknown, signal: AbortSignal, t?: Timer): Promise<number | null> {
         if (this.status === LoadStatus.UNLOADED) throw new Error(`countTokens: model ${this.name} is not loaded`);
 
         t?.start('countTokens');
         try {
-            return await this.client.countTokens(body, this.name, signal);
+            return await this.client.countTokens(body, this.curVariant(), signal);
         } catch (err: any) {
             this.log.error(`countTokens error: ${err}`);
             return null;
@@ -226,14 +284,32 @@ export class ModelEntry {
         }
     }
 
+    async getMemory(signal: AbortSignal): Promise<MemoryResponse> {
+        return await this.client.getMemory(this.curVariant(), signal);
+    }
+
+    async getSlots(signal: AbortSignal): Promise<Slot[]> {
+        return await this.client.getSlots(this.curVariant(), signal);
+    }
+
+    curVariant(): string {
+        if (this.ladder_i === -1) return this.name;
+        else return this.ladder[this.ladder_i].state.model_variant;
+    }
+
+    stateAtRung(i: number): ModelState | undefined {
+        return this.ladder[i]?.state;
+    }
+
     paramsForRung(rung_i: number): ReloadParams | undefined {
         const state = this.ladder[rung_i]?.state;
         if (!state) return undefined;
 
+        const { model_variant, ...rest } = structuredClone(state);
         return {
-            ...structuredClone(state),
+            ...rest,
             n_ctx: 0,
-        };
+        }
     }
 
     getMinimumRung(tokens: Tokens): number | null {
@@ -261,6 +337,10 @@ export class ModelEntry {
         return this.n_ctx;
     }
 
+    hasRung(i: number): boolean {
+        return i >= 0 && i < this.ladder.length;
+    }
+
     // returns the free space needed to load the model to `rung`, in bytes,
     // considering the model's current load status.
     // NOTE: returns null if model has not been first-loaded yet.
@@ -280,7 +360,7 @@ export class ModelEntry {
         return total - this.ladder[this.ladder_i]!.bytes_needed;
     }
 
-    hasNextStrategy(): boolean {
+    hasNextRung(): boolean {
         return this.ladder.length - 1 > this.ladder_i;
     }
 

@@ -5,14 +5,14 @@ import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { buildConfig } from '../../config/build.js';
 import { parseArgs } from '../../config/parser.js';
-import { LoadStatus, type ManagerConfig, type ModelConfig, type ModelState, type RawModel, type StrategyId } from '../../config/types.js';
+import { LoadStatus, type ManagerConfig, type ModelConfig, type RawModel, type StrategyId } from '../../config/types.js';
 import type { LlamaAPI } from '../../client/llama-api.js';
 import { RouterProcess } from '../../client/router-process.js';
 import type { SlotRestore } from '../../client/types.js';
-import { ModelEntry, type Rung } from '../../planner/model-entry.js';
+import { ModelEntry } from '../../planner/model-entry.js';
 import { Planner } from '../../planner/planner.js';
 import { createStrategies } from '../../planner/strategies/index.js';
-import type { Strategy } from '../../planner/types.js';
+import type { StrategyImpl } from '../../planner/types.js';
 import { walkBreakpoints } from '../../show-breakpoints.js';
 
 function requiredPath(key: string): string {
@@ -44,17 +44,15 @@ function modelFields(path: string, mmproj?: string, spec_type?: string, draft?: 
     return fields;
 }
 
-function makeEntry(client: LlamaAPI, cfg: ModelConfig, strategies: Map<StrategyId, Strategy>): ModelEntry {
-    const rungs: Rung[] = [{ strategy: 'none', impl: null!, state: cfg.initial_state, n_ctx_cap: -1, bytes_needed: 0 }];
-    let state: ModelState = cfg.initial_state;
-    for (const id of cfg.ladder) {
-        const strategy = strategies.get(id);
-        assert.ok(strategy, `missing strategy ${id}`);
-        if (!strategy.canApply(state)) continue;
-        state = strategy.getNewState(state);
-        rungs.push({ strategy: id, impl: strategy, state, n_ctx_cap: -1, bytes_needed: 0 });
-    }
-    return new ModelEntry(client, cfg.name, cfg.aliases, rungs);
+function makeEntry(client: LlamaAPI, cfg: ModelConfig, strategies: Map<StrategyId, StrategyImpl>): ModelEntry {
+    return new ModelEntry(
+        client,
+        cfg.name,
+        cfg.aliases,
+        cfg.initial_state,
+        cfg.ladder,
+        strategies,
+    );
 }
 
 type Fixture = {
@@ -154,12 +152,12 @@ let iter = 0;
 
 async function serve(planner: Planner, model: ModelEntry, messages: { role: string; content: string }[], min_ctx?: number): Promise<void> {
     const body = { model: model.name, messages, stream: false, max_tokens: 32, temperature: 0 };
-    await planner.serveModel(body, model, new AbortController().signal, async (_body, client, signal, isFinal) => {
+    await planner.serveModel(body, model.name, new AbortController().signal, async (_body, model, signal, isFinal) => {
         iter++;
         if (iter > 10) throw new Error(`max iter reached`);
         console.log(`${model.name} is at ctx: ${model.getCurCtx()}`);
 
-        const response = await client.completions(body, model.name, signal);
+        const response = await model.completions(body, signal);
         const text = await response.text();
         if (!response.ok) {
             let context_exceeded = false;
@@ -174,7 +172,7 @@ async function serve(planner: Planner, model: ModelEntry, messages: { role: stri
         const result = JSON.parse(text) as { choices?: { message?: unknown }[] };
         assert.ok(result.choices?.[0]?.message, `${model.name} completion has no assistant message: ${text}`);
         if (min_ctx !== undefined) {
-            const live = (await planner.client.getSlots(model.name, signal))[0]?.n_ctx ?? 0;
+            const live = (await model.getSlots(signal))[0]?.n_ctx ?? 0;
             assert.ok(live >= min_ctx, `${model.name} live context ${live} is smaller than required ${min_ctx}`);
         }
         return true;
@@ -192,7 +190,7 @@ async function activateA(fixture: Fixture, signal: AbortSignal): Promise<Planner
     const planner = new Planner(client, config, new Map([[a.name, a], [b.name, b]]));
     await a.loadWeights(signal);
     await a.moveToRung(0, signal);
-    const memory = await client.getMemory(a.name, signal);
+    const memory = await a.getMemory(signal);
     const gpu = memory.devices.find(device => device.type !== 'cpu');
     assert.ok(gpu, 'no GPU memory reported');
     planner.dev_info.bytes_total = gpu.total;
@@ -227,7 +225,7 @@ test('GPU: planner serves A → B → A with one KV and restores A slots', { tim
     });
 });
 
-async function findPrompt(client: LlamaAPI, model: ModelEntry, lower: number, upper: number): Promise<{
+async function findPrompt(model: ModelEntry, lower: number, upper: number): Promise<{
     messages: { role: string; content: string }[];
     tokens: number;
 }> {
@@ -236,7 +234,8 @@ async function findPrompt(client: LlamaAPI, model: ModelEntry, lower: number, up
     while (low <= high) {
         const mid = Math.floor((low + high) / 2);
         const messages = [{ role: 'user', content: 'hello '.repeat(mid) }];
-        const tokens = await client.countTokens({ model: model.name, messages, max_tokens: 32 }, model.name);
+        const tokens = await model.countTokens({ model: model.name, messages, max_tokens: 32 }, new AbortController().signal);
+        assert.ok(tokens !== null, `countTokens failed for model ${model.name}`);
         if (tokens <= lower) {
             low = mid + 1;
         } else if (tokens + 32 >= upper) {
@@ -260,7 +259,7 @@ test('GPU: planner serves an input between live and measured capacity after evic
         const live = (await client.getSlots(a.name, signal))[0]?.n_ctx;
         assert.ok(live && measured > live + 64,
             `setup requires measured capacity > live capacity + 64 (measured: ${measured}, live: ${live})`);
-        const { messages, tokens } = await findPrompt(client, a, live, measured);
+        const { messages, tokens } = await findPrompt(a, live, measured);
         console.log(`GPU capacity case: measured=${measured}, live=${live}, prompt=${tokens}`);
 
         const planner = new Planner(client, fixture.config, new Map([[a.name, a], [b.name, b]]));

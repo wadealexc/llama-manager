@@ -1,5 +1,5 @@
 import type { LlamaAPI } from "./client/llama-api.js";
-import type { ManagerConfig, ModelId } from "./config/types.js";
+import { LoadStatus, type ManagerConfig, type ModelId } from "./config/types.js";
 import type { ModelEntry } from "./planner/model-entry.js";
 import type { MemoryResponse } from "./client/types.js";
 import { readdir, unlink } from "node:fs/promises";
@@ -31,12 +31,11 @@ export async function walkBreakpoints(
     signal: AbortSignal,
     t?: Timer,
 ): Promise<ModelBreakpoints> {
-    await entry.loadWeights(signal, t);
-
     const rungs: RungBreakpoint[] = [];
 
-    let prev = await entry.loadWithKV(signal, t);
-    let mem = await client.getMemory(entry.name, signal);
+    await entry.loadWeights(signal, t);
+    let prev = await entry.applyRung(0, signal, t);
+    let mem = await entry.getMemory(signal);
     const { weight_bytes: w0, context_bytes: c0 } = getModelMemory(mem);
     rungs.push({ 
         i: 0, 
@@ -53,27 +52,27 @@ export async function walkBreakpoints(
     const n_ctx_train = infos.find(info => info.id === entry.name)?.meta?.n_ctx_train;
 
     const getNCtxSeq = async (): Promise<number> => {
-        const slots = await client.getSlots(entry.name, signal).catch(() => undefined);
+        const slots = await entry.getSlots(signal).catch(() => undefined);
         return slots?.[0]?.n_ctx ?? -1;
     };
 
     let idx = 0;
     // set rung capacity to slot ctx
-    const n_ctx_seq = await getNCtxSeq();
-    entry.ladder[idx]!.n_ctx_cap = n_ctx_seq;
+    let prev_seq = await getNCtxSeq();
+    entry.ladder[idx]!.n_ctx_cap = prev_seq;
     entry.ladder[idx]!.bytes_needed = w0 + c0;
     idx++;
 
-    if (n_ctx_train !== undefined && n_ctx_seq >= n_ctx_train) {
+    if (n_ctx_train !== undefined && prev_seq >= n_ctx_train) {
         log.info(`max ctx per seq reached for ${entry.name} (${n_ctx_train}); no strategies needed`);
 
         entry.ladder.splice(1);
     }
 
-    while (entry.hasNextStrategy()) {
+    while (entry.hasNextRung()) {
         log.info(`${entry.name}: applying ${entry.ladder[entry.ladder_i + 1].strategy}`);
-        const n_ctx = await entry.applyNextStrategy(signal, t);
-        mem = await client.getMemory(entry.name, signal);
+        const n_ctx = await entry.applyNextRung(signal, t);
+        mem = await entry.getMemory(signal);
         const { weight_bytes, context_bytes } = getModelMemory(mem);
         rungs.push({
             i: rungs.length,
@@ -89,6 +88,15 @@ export async function walkBreakpoints(
         const n_ctx_seq = await getNCtxSeq();
         entry.ladder[idx]!.n_ctx_cap = n_ctx_seq;
         entry.ladder[idx]!.bytes_needed = weight_bytes + context_bytes;
+
+        if (n_ctx_seq <= prev_seq) {
+            throw new Error(
+                `walkBreakpoints: model ${entry.name}: rung ${idx} ('${entry.ladder[idx]!.strategy}' | variant ${entry.curVariant()}) ` +
+                `measured ${n_ctx_seq} ctx, which does not exceed the previous rung's ${prev_seq}`
+            );
+        }
+
+        prev_seq = n_ctx_seq;
         idx++;
 
         if (n_ctx_train !== undefined && n_ctx_seq >= n_ctx_train) {
@@ -128,8 +136,6 @@ export async function showBreakpoints(
             results.push(result);
             record?.(name, result.rungs.at(-1)!.n_ctx);
             log.info(`${name}: done`);
-        } catch (err) {
-            log.error(`error processing model ${name}: ${err}`);
         } finally {
             try { await entry.unloadHard(); } catch { }
         }

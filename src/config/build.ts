@@ -5,11 +5,11 @@ import type { AddressInfo } from "node:net";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
 import { DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
-import { STRATEGY_IDS, type ConfigSource, type ManagerConfig, type ModelConfig, type ModelState, type RawModel, type StrategyId } from "./types.js";
+import { RESERVED_VARIANT_NAMES, STRATEGY_IDS, hasMmproj, isMmprojOnCPU, isSpecEnabled, type ConfigSource, type Strategy, type ManagerConfig, type ModelConfig, type ModelState, type ModelVariant, type RawModel, type StrategyId } from "./types.js";
 import type { ReloadParams, SpeculativeType } from "../client/types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { maybeReject, normalizeFlag } from "./flags.js";
-import { parseRouterConfig, type ParsedArgs } from "./parser.js";
+import { parseLadderStep, parseRouterConfig, type ParsedArgs } from "./parser.js";
 
 const log: ConsolaInstance = logger.withTag('config');
 
@@ -24,6 +24,8 @@ const MANAGER_FIELDS = new Set([
     "cache-type-v",
     "ctv",
     "slot-save-path",
+    "model-variants",
+    "model-variant",
 ]);
 
 const SUPPORTED_KV_PRECISION = ['f16', 'q8_0', 'q4_0'];
@@ -34,6 +36,7 @@ type SpecDraft = NonNullable<ReloadParams['spec']>['draft'];
 type InterpretedEntry = {
     entry: RawModel;
     aliases: string[];
+    variants: Record<string, string>;
     cache_floor: 'f16' | 'q8_0' | 'q4_0';
 };
 
@@ -52,20 +55,42 @@ export async function buildConfig(
 
     const interpreted = new Map<string, InterpretedEntry>();
     for (const [id, raw] of Object.entries(raw_models)) {
-        interpreted.set(id, interpretEntry(raw));
+        interpreted.set(id, interpretEntry(id, raw));
     }
 
-    for (const interp of interpreted.values()) {
-        if (!('ladder' in interp.entry)) {
-            interp.entry['ladder'] = source.ladder_override ?? deriveLadder(interp.entry, interp.cache_floor);
+    for (const [id, interp] of interpreted) {
+        const has_variants = Object.keys(interp.variants).length > 0;
+        const explicit = 'ladder' in interp.entry
+            ? interp.entry['ladder'] as Strategy[]
+            : source.ladder_override;
+
+        if (has_variants && explicit === undefined) {
+            throw new Error(`model '${id}' declares model-variants and requires an explicit ladder with swap-model steps ('ladder' in the model config or --ladder)`);
         }
+
+        const steps = explicit ?? deriveLadder(interp.entry, interp.cache_floor);
+
+        if (has_variants) {
+            validateVariantLadder(id, steps, interp.variants, buildInitialState(id, interp.entry));
+        } else {
+            for (let i = 0; i < steps.length; i++) {
+                const step = steps[i];
+                if (step.kind === 'swap-model') {
+                    throw new Error(`model '${id}': ladder step ${i} switches to variant '${step.variant}' but the model declares no model-variants`);
+                }
+            }
+        }
+
+        interp.entry['ladder'] = steps;
     }
 
     validateAliases(interpreted);
 
+    const model_variants = resolveVariants(interpreted);
+
     const models: Record<string, ModelConfig> = {};
     for (const [id, interp] of interpreted) {
-        models[id] = buildEntry(id, interp.entry, interp.aliases);
+        models[id] = buildEntry(id, interp.entry, interp.aliases, model_variants[id]);
     }
 
     const model_keys = Object.keys(models);
@@ -115,7 +140,11 @@ export async function buildConfig(
     mkdirSync(config.router.slot_save_path, { recursive: true });
 
     // write generated router preset to file
-    writeFileSync(preset_out_path, buildIni(rawModelsOf(interpreted), config.router.slot_save_path), "utf8");
+    const preset_models: Record<string, PresetModel> = {};
+    for (const [id, interp] of interpreted) {
+        preset_models[id] = { entry: interp.entry, variants: model_variants[id] };
+    }
+    writeFileSync(preset_out_path, buildIni(preset_models, config.router.slot_save_path), "utf8");
     return config;
 }
 
@@ -168,9 +197,10 @@ function buildSource(parsed: ParsedArgs, default_config_path: string): ConfigSou
 
 // canonicalizes config keys, rejects unsupported fields, warns about manager-owned fields, etc
 // unrecognized keys pass through as llama.cpp args
-function interpretEntry(raw: RawModel): InterpretedEntry {
+function interpretEntry(name: string, raw: RawModel): InterpretedEntry {
     const entry: RawModel = {};
     const aliases: string[] = [];
+    const variants: Record<string, string> = {};
 
     let cache_type_k: string | undefined;
     let cache_type_v: string | undefined;
@@ -187,17 +217,18 @@ function interpretEntry(raw: RawModel): InterpretedEntry {
                 entry['alias'] = value;
                 break;
             case 'ladder': {
-                const ids = Array.isArray(value)
-                    ? value.map(String)
-                    : String(value).split(',').map(s => s.trim()).filter(s => s !== '');
-                for (const id of ids) {
-                    if (!STRATEGY_IDS.includes(id as StrategyId)) {
-                        throw new Error(`unknown strategy id '${id}' in 'ladder' (supported: ${STRATEGY_IDS.join(', ')})`);
-                    }
-                }
-                entry['ladder'] = ids;
+                const tokens = Array.isArray(value)
+                    ? value.map(v => String(v))
+                    : String(value).split(',');
+                entry['ladder'] = tokens
+                    .map(s => s.trim())
+                    .filter(s => s !== '')
+                    .map(parseLadderStep);
                 break;
             }
+            case 'model-variants':
+                parseModelVariants(name, value, variants);
+                break;
             case 'ctx-size':
                 log.error(`'ctx-size' is ignored; context is sized reactively. run with --calc-breakpoints to see achievable context sizes`);
                 break;
@@ -258,7 +289,37 @@ function interpretEntry(raw: RawModel): InterpretedEntry {
         }
     }
 
-    return { entry, aliases, cache_floor: precisionFloor(cache_type_k, cache_type_v) };
+    if (Object.keys(variants).length > 0) {
+        const baseline = entry['model'] ?? entry['model-url'];
+        if (typeof baseline !== 'string' || baseline === '') {
+            throw new Error(`model '${name}': model-variants requires a baseline model source ('model' or 'model-url')`);
+        }
+    }
+
+    return { entry, aliases, variants, cache_floor: precisionFloor(cache_type_k, cache_type_v) };
+}
+
+function parseModelVariants(name: string, value: unknown, out: Record<string, string>): void {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`model '${name}': 'model-variants' must be a map of variant name to local GGUF path`);
+    }
+
+    for (const [variant, path] of Object.entries(value as Record<string, unknown>)) {
+        if (variant.trim() === '' || /\s/.test(variant)) {
+            throw new Error(`model '${name}': invalid model-variant name '${variant}'`);
+        }
+        if (RESERVED_VARIANT_NAMES.has(variant)) {
+            throw new Error(`model '${name}': model-variant name '${variant}' is reserved`);
+        }
+        if (typeof path !== 'string' || path.trim() === '') {
+            throw new Error(`model '${name}': model-variant '${variant}' must be a nonempty local GGUF path`);
+        }
+        out[variant] = path;
+    }
+
+    if (Object.keys(out).length === 0) {
+        throw new Error(`model '${name}': 'model-variants' must not be empty`);
+    }
 }
 
 function precisionFloor(ctk?: string, ctv?: string): 'f16' | 'q8_0' | 'q4_0' {
@@ -274,14 +335,90 @@ function precisionFloor(ctk?: string, ctv?: string): 'f16' | 'q8_0' | 'q4_0' {
     return floor as 'f16' | 'q8_0' | 'q4_0';
 }
 
-function deriveLadder(entry: RawModel, floor: 'f16' | 'q8_0' | 'q4_0'): StrategyId[] {
+function deriveLadder(entry: RawModel, floor: 'f16' | 'q8_0' | 'q4_0'): Strategy[] {
     const ladder: StrategyId[] = [];
     if (getHasSpec(entry)) ladder.push('disable-spec');
     if (getHasMmproj(entry)) ladder.push('mmproj-to-cpu');
 
-    if (floor === 'f16') return ladder;
-    if (floor === 'q8_0') return [...ladder, 'quantize-kv-q8'];
-    return [...ladder, 'quantize-kv-q8', 'quantize-kv-q4'];
+    if (floor === 'q8_0') {
+        ladder.push('quantize-kv-q8');
+    } else if (floor === 'q4_0') {
+        ladder.push('quantize-kv-q8');
+        ladder.push('quantize-kv-q4');
+    }
+
+    return ladder.map(id => ({ kind: 'reload-model', id }));
+}
+
+function validateVariantLadder(
+    name: string,
+    steps: Strategy[],
+    variants: Record<string, string>,
+    initial: ModelState,
+): void {
+    let state = initial;
+    const switched = new Set<string>();
+
+    steps.forEach((step, i) => {
+        if (step.kind === 'swap-model') {
+            if (!(step.variant in variants)) {
+                throw new Error(`model '${name}': ladder step ${i} switches to unknown variant '${step.variant}' (declared: ${Object.keys(variants).join(', ')})`);
+            }
+            if (switched.has(step.variant)) {
+                throw new Error(`model '${name}': ladder step ${i} switches to variant '${step.variant}' more than once`);
+            }
+            switched.add(step.variant);
+            step.variant = variantRouterId(name, step.variant);
+            state = { ...state, model_variant: step.variant, cache_type_k: 'f16', cache_type_v: 'f16' };
+            return;
+        }
+
+        if (!strategyApplicable(step.id, state)) {
+            throw new Error(`model '${name}': ladder step ${i} ('${step.id}') is not applicable at that point in the ladder`);
+        }
+        state = applyStrategy(step.id, state);
+    });
+
+    for (const variant of Object.keys(variants)) {
+        if (!switched.has(variant)) {
+            throw new Error(`model '${name}': declared variant '${variant}' is not used by the ladder`);
+        }
+    }
+}
+
+function strategyApplicable(id: StrategyId, state: ModelState): boolean {
+    switch (id) {
+        case 'disable-spec':
+            return isSpecEnabled(state);
+        case 'mmproj-to-cpu':
+            return hasMmproj(state) && !isMmprojOnCPU(state);
+        case 'quantize-kv-q8':
+            return state.cache_type_k === 'f16' && state.cache_type_v === 'f16';
+        case 'quantize-kv-q4':
+            return (state.cache_type_k === 'f16' || state.cache_type_k === 'q8_0')
+                && (state.cache_type_v === 'f16' || state.cache_type_v === 'q8_0');
+    }
+}
+
+function applyStrategy(id: StrategyId, state: ModelState): ModelState {
+    const next = structuredClone(state);
+    switch (id) {
+        case 'disable-spec':
+            next.spec = { types: ['none'] };
+            break;
+        case 'mmproj-to-cpu':
+            next.mmproj = { ...next.mmproj, mmproj_offload: false };
+            break;
+        case 'quantize-kv-q8':
+            next.cache_type_k = 'q8_0';
+            next.cache_type_v = 'q8_0';
+            break;
+        case 'quantize-kv-q4':
+            next.cache_type_k = 'q4_0';
+            next.cache_type_v = 'q4_0';
+            break;
+    }
+    return next;
 }
 
 function validateAliases(interpreted: Map<string, InterpretedEntry>): void {
@@ -313,63 +450,118 @@ function aliasValues(value: unknown): string[] {
     return [String(value)];
 }
 
-function buildEntry(name: string, raw: RawModel, aliases: string[]): ModelConfig {
-    const initial_state: ModelState = {
+function buildEntry(name: string, raw: RawModel, aliases: string[], variants: Record<string, ModelVariant>): ModelConfig {
+    return {
+        name,
+        aliases,
+        variants,
+        ladder: (raw['ladder'] as Strategy[]) ?? [],
+        initial_state: buildInitialState(name, raw),
+    };
+}
+
+function buildInitialState(name: string, raw: RawModel): ModelState {
+    const state: ModelState = {
         kv_unified: getKvUnified(raw),
         cache_type_k: DEFAULT_KV_PRECISION,
         cache_type_v: DEFAULT_KV_PRECISION,
+        model_variant: name,
     };
 
     if (getHasSpec(raw)) {
-        initial_state.spec = {
+        state.spec = {
             types: getSpecTypes(raw),
             draft: getSpecDraft(raw),
         };
     }
 
     if (getHasMmproj(raw)) {
-        initial_state.mmproj = { 
+        state.mmproj = { 
             path: getMmprojPath(raw),
             mmproj_offload: true 
         };
     }
 
-    return {
-        name,
-        aliases,
-        ladder: (raw['ladder'] as StrategyId[]) ?? [],
-        initial_state,
-    };
+    return state;
 }
 
-function rawModelsOf(interpreted: Map<string, InterpretedEntry>): Record<string, RawModel> {
-    const out: Record<string, RawModel> = {};
+function resolveVariants(interpreted: Map<string, InterpretedEntry>): Record<string, Record<string, ModelVariant>> {
+    const public_names = new Set<string>();
     for (const [id, interp] of interpreted) {
-        out[id] = interp.entry;
+        public_names.add(id);
+        for (const alias of interp.aliases) {
+            public_names.add(alias);
+        }
     }
+
+    const out: Record<string, Record<string, ModelVariant>> = {};
+    const private_ids = new Set<string>();
+
+    for (const [id, interp] of interpreted) {
+        const map: Record<string, ModelVariant> = {};
+        for (const [variant, path] of Object.entries(interp.variants)) {
+            const router_id = variantRouterId(id, variant);
+            if (public_names.has(router_id)) {
+                throw new Error(`generated router id '${router_id}' (model '${id}', variant '${variant}') collides with a public model id or alias`);
+            }
+            if (private_ids.has(router_id)) {
+                throw new Error(`generated router id '${router_id}' (model '${id}', variant '${variant}') collides with another generated router id`);
+            }
+            private_ids.add(router_id);
+            map[variant] = { router_id, path };
+        }
+        out[id] = map;
+    }
+
     return out;
 }
 
-function buildIni(raw: Record<string, RawModel>, slot_save_path: string): string {
+function variantRouterId(model: string, variant: string): string {
+    return `${model}__${variant}`;
+}
+
+type PresetModel = {
+    entry: RawModel;
+    variants: Record<string, ModelVariant>;
+};
+
+function buildIni(models: Record<string, PresetModel>, slot_save_path: string): string {
     const sections: string[] = [];
 
-    for (const [name, entry] of Object.entries(raw)) {
-        const lines = [
-            `[${name}]`,
-            `${CTX_KEY} = ${MIN_ALLOWED_CTX}`,
-            `cache-type-k = ${DEFAULT_KV_PRECISION}`,
-            `cache-type-v = ${DEFAULT_KV_PRECISION}`,
-            `slot-save-path = ${slot_save_path}`,
-        ];
-
-        for (const [key, value] of Object.entries(entry)) {
-            if (MANAGER_FIELDS.has(key)) continue;
-            lines.push(`${key} = ${iniValue(value)}`);
+    for (const [name, model] of Object.entries(models)) {
+        sections.push(presetSection(name, model.entry, slot_save_path));
+        for (const variant of Object.values(model.variants)) {
+            sections.push(presetSection(variant.router_id, variantSection(model.entry, variant.path), slot_save_path));
         }
-        sections.push(lines.join("\n"));
     }
 
     return sections.join("\n\n") + "\n";
+}
+
+function presetSection(id: string, entry: RawModel, slot_save_path: string): string {
+    const lines = [
+        `[${id}]`,
+        `${CTX_KEY} = ${MIN_ALLOWED_CTX}`,
+        `cache-type-k = ${DEFAULT_KV_PRECISION}`,
+        `cache-type-v = ${DEFAULT_KV_PRECISION}`,
+        `slot-save-path = ${slot_save_path}`,
+    ];
+
+    for (const [key, value] of Object.entries(entry)) {
+        if (MANAGER_FIELDS.has(key)) continue;
+        lines.push(`${key} = ${iniValue(value)}`);
+    }
+
+    return lines.join("\n");
+}
+
+function variantSection(entry: RawModel, path: string): RawModel {
+    const out: RawModel = { model: path };
+    for (const [key, value] of Object.entries(entry)) {
+        if (key === 'model' || key === 'model-url' || key === 'alias') continue;
+        out[key] = value;
+    }
+    return out;
 }
 
 function iniValue(v: unknown): string {

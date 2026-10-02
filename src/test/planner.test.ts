@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import type { ManagerConfig } from '../config/types.js';
+import type { ManagerConfig, ModelState } from '../config/types.js';
 import { ModelEntry } from '../planner/model-entry.js';
 import { Planner } from '../planner/planner.js';
 import { LlamaAPIMock } from './llama-api-mock.js';
@@ -22,22 +22,25 @@ async function waitFor(condition: () => boolean): Promise<void> {
 }
 
 function createModel(client: LlamaAPIMock, name: string): ModelEntry {
-    return new ModelEntry(client, name, [], [
-        {
-            strategy: 'none',
-            impl: null!,
-            state: { kv_unified: true, cache_type_k: 'f16', cache_type_v: 'f16' },
-            n_ctx_cap: 4096,
-            bytes_needed: 8192,
-        },
-        {
-            strategy: 'quantize-kv-q8',
-            impl: null!,
-            state: { kv_unified: true, cache_type_k: 'q8_0', cache_type_v: 'q8_0' },
-            n_ctx_cap: 8192,
-            bytes_needed: 12288,
-        },
-    ]);
+    const initial_state: ModelState = {
+        kv_unified: true,
+        cache_type_k: 'f16',
+        cache_type_v: 'f16',
+        model_variant: name,
+    };
+
+    const entry = new ModelEntry(client, name, [], initial_state, [], new Map());
+    entry.ladder[0].n_ctx_cap = 4096;
+    entry.ladder[0].bytes_needed = 8192;
+
+    entry.ladder.push({
+        strategy: 'quantize-kv-q8',
+        state: { model_variant: name, kv_unified: true, cache_type_k: 'q8_0', cache_type_v: 'q8_0' },
+        n_ctx_cap: 8192,
+        bytes_needed: 12288,
+    });
+    
+    return entry;
 }
 
 async function createFixture(rung_i: number = 0) {
@@ -64,9 +67,9 @@ async function createFixture(rung_i: number = 0) {
     const planner = new Planner(client, config, new Map([[model.name, model]]));
     const signal = new AbortController().signal;
 
-    await model.loadWithKV(signal);
-    if (rung_i !== 0) await model.moveToRung(rung_i, signal);
-    const memory = await client.getMemory(model.name, signal);
+    await model.loadWeights(signal);
+    await model.applyRung(rung_i, signal);
+    const memory = await model.getMemory(signal);
     planner.active.model = model.name;
     planner.dev_info.bytes_total = memory.devices[0].total;
     planner.dev_info.bytes_avail = memory.devices[0].free;
@@ -82,7 +85,7 @@ describe('Planner warm-model scheduling', () => {
         client.setLiveSlots(['long conversation'], model.name);
         let seen_rung = -1;
 
-        await planner.serveModel({ tokens: 1000 }, model, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
             seen_rung = model.ladder_i;
             return true;
         });
@@ -102,7 +105,7 @@ describe('Planner warm-model scheduling', () => {
         client.setLiveSlots(['live conversation'], model.name);
         let seen_rung = -1;
 
-        await planner.serveModel({ tokens: 5000 }, model, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 5000 }, model.name, new AbortController().signal, async () => {
             seen_rung = model.ladder_i;
             return true;
         });
@@ -119,7 +122,7 @@ describe('Planner warm-model scheduling', () => {
         const { client, model, planner } = await createFixture(1);
         const started = deferred<void>();
         const finish = deferred<void>();
-        const busy = planner.serveModel({ tokens: 6000 }, model, new AbortController().signal, async () => {
+        const busy = planner.serveModel({ tokens: 6000 }, model.name, new AbortController().signal, async () => {
             started.resolve();
             await finish.promise;
             return true;
@@ -128,7 +131,7 @@ describe('Planner warm-model scheduling', () => {
         try {
             await started.promise;
             let seen_rung = -1;
-            await planner.serveModel({ tokens: 1000 }, model, new AbortController().signal, async () => {
+            await planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
                 seen_rung = model.ladder_i;
                 return true;
             });
@@ -153,11 +156,11 @@ describe('Planner warm-model scheduling', () => {
         await second.loadWeights(new AbortController().signal);
         planner.weights_only.add(second.name);
         client.setLiveSlots(['first conversation'], model.name);
-        const memory = await client.getMemory(second.name);
+        const memory = await second.getMemory(new AbortController().signal);
         planner.dev_info.bytes_avail = memory.devices[0].free;
         client.clearOperations();
 
-        await planner.serveModel({ tokens: 1000 }, second, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, second.name, new AbortController().signal, async () => {
             assert.equal(planner.active.model, second.name);
             assert.equal(client.hasKV(model.name), false);
             assert.equal(client.hasKV(second.name), true);
@@ -171,7 +174,7 @@ describe('Planner warm-model scheduling', () => {
         client.setLiveSlots(['second conversation'], second.name);
         client.clearOperations();
 
-        await planner.serveModel({ tokens: 1000 }, model, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
             assert.equal(planner.active.model, model.name);
             assert.equal(client.hasKV(second.name), false);
             assert.equal(client.hasKV(model.name), true);
@@ -193,10 +196,10 @@ describe('Planner warm-model scheduling', () => {
         planner.models.set(second.name, second);
         client.total_bytes = 12000;
         planner.dev_info.bytes_total = client.total_bytes;
-        planner.dev_info.bytes_avail = (await client.getMemory(model.name)).devices[0].free;
+        planner.dev_info.bytes_avail = (await model.getMemory(new AbortController().signal)).devices[0].free;
         client.clearOperations();
 
-        await planner.serveModel({ tokens: 1000 }, second, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, second.name, new AbortController().signal, async () => {
             assert.equal(planner.active.model, second.name);
             assert.equal(client.hasKV(second.name), true);
             assert.equal(client.isLoaded(model.name), false);
@@ -216,13 +219,13 @@ describe('Planner warm-model scheduling', () => {
         planner.models.set(second.name, second);
         await second.loadWeights(new AbortController().signal);
         planner.weights_only.add(second.name);
-        const memory = await client.getMemory(second.name);
+        const memory = await second.getMemory(new AbortController().signal);
         planner.dev_info.bytes_avail = memory.devices[0].free;
         client.clearOperations();
 
         const started = deferred<void>();
         const finish = deferred<void>();
-        const generating = planner.serveModel({ tokens: 1000 }, model, new AbortController().signal, async () => {
+        const generating = planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
             started.resolve();
             await finish.promise;
             return true;
@@ -230,7 +233,7 @@ describe('Planner warm-model scheduling', () => {
 
         try {
             await started.promise;
-            const queued = planner.serveModel({ tokens: 1000 }, second, new AbortController().signal, async () => true);
+            const queued = planner.serveModel({ tokens: 1000 }, second.name, new AbortController().signal, async () => true);
             await waitFor(() => planner.waiting_load.length === 1);
 
             assert.equal(planner.active.model, model.name);
@@ -258,7 +261,7 @@ describe('Planner warm-model scheduling', () => {
         const finish = deferred<void>();
         const slow_rungs: number[] = [];
         const fast_rungs: number[] = [];
-        const slow = planner.serveModel({ tokens: 1000 }, model, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
+        const slow = planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
             assert.equal(isFinal, false);
             slow_rungs.push(model.ladder_i);
             if (slow_rungs.length === 1) {
@@ -271,7 +274,7 @@ describe('Planner warm-model scheduling', () => {
 
         try {
             await started.promise;
-            const fast = planner.serveModel({ tokens: 1000 }, model, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
+            const fast = planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
                 assert.equal(isFinal, false);
                 fast_rungs.push(model.ladder_i);
                 return fast_rungs.length > 1;

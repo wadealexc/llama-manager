@@ -30,8 +30,9 @@ Flags:
   --host <host>              external listen host (default: 127.0.0.1)
   --port <port>              external listen port (default: 8080)
   --sleep-idle-seconds <n>   unload all models after n idle seconds (default: 600)
-  --ladder <id,...>          override the derived strategy ladder
-    (default: [disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4])
+  --ladder <step,...>        override the derived strategy ladder
+    (steps: disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4, swap-model:<name>)
+  --model-variant <n=path>   local GGUF weight variant for single-model mode (repeatable)
   --slot-save-path <path>    directory for kvcache save/restore files
   --bin <path>               path to the llama-server binary
   --config <path>            supply a config file. router mode reads models from it;

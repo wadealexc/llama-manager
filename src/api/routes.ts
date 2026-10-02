@@ -1,8 +1,8 @@
 import type { Express, Request, Response as ExpressResponse } from "express";
 import type { ApiServer } from "./server.js";
-import type { Client } from "../planner/planner.js";
 import { SSERelay } from "./sse-relay.js";
 import type { CompletionChunk, CompletionRequest } from "./types.js";
+import type { ModelEntry } from "../planner/model-entry.js";
 
 export function registerRoutes(app: Express, server: ApiServer): void {
     app.get('/v1/models', (req, res) => listModels(server, req, res));
@@ -37,8 +37,7 @@ async function loadModel(server: ApiServer, req: Request, res: ExpressResponse):
         return;
     }
 
-    const model = server.planner.resolve(model_name);
-    if (!model) {
+    if (!server.planner.resolve(model_name)) {
         sendError(res, 404, 'invalid_request', `unable to resolve model ${model_name}`);
         return;
     }
@@ -47,7 +46,7 @@ async function loadModel(server: ApiServer, req: Request, res: ExpressResponse):
     res.on('close', () => ac.abort());
     req.on('aborted', () => ac.abort());
 
-    await server.planner.serveModel({ messages: [] }, model, ac.signal, async (_b: unknown, client: Client, signal: AbortSignal, _isFinal: boolean) => {
+    await server.planner.serveModel({ messages: [] }, model_name, ac.signal, async (_b: unknown, model: ModelEntry, signal: AbortSignal, _isFinal: boolean) => {
         res.json({ success: true });
         return true;
     });
@@ -66,9 +65,8 @@ async function countTokens(server: ApiServer, req: Request, res: ExpressResponse
         return;
     }
 
-    const model = server.planner.resolve(model_name);
-    if (!model) {
-        sendError(res, 400, 'invalid_request', `unable to resolve model ${model_name}`);
+    if (!server.planner.resolve(model_name)) {
+        sendError(res, 404, 'invalid_request', `unable to resolve model ${model_name}`);
         return;
     }
 
@@ -76,10 +74,11 @@ async function countTokens(server: ApiServer, req: Request, res: ExpressResponse
     res.on('close', () => ac.abort());
     req.on('aborted', () => ac.abort());
 
-    await server.planner.serveModel(body, model, ac.signal, async (_body: unknown, client: Client, signal: AbortSignal, _isFinal: boolean) => {
-        let tokens: number;
+    await server.planner.serveModel(body, model_name, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, _isFinal: boolean) => {
+        let tokens;
         try {
-            tokens = await client.countTokens(body, model.name, signal);
+            tokens = await model.countTokens(body, signal);
+            if (tokens === null) throw new Error(`error counting tokens for: ${model_name}`);
         } catch (err) {
             sendUpstreamError(res, false, err);
             return true;
@@ -103,8 +102,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         return;
     }
 
-    const model = server.planner.resolve(model_name);
-    if (!model) {
+    if (!server.planner.resolve(model_name)) {
         sendError(res, 404, 'invalid_request', `unable to resolve model ${model_name}`);
         return;
     }
@@ -124,7 +122,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         isFinal: false,
     };
 
-    await server.planner.serveModel(body, model, ac.signal, async (_body: unknown, client: Client, signal: AbortSignal, isFinal: boolean) => {
+    await server.planner.serveModel(body, model_name, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => {
         if (res.writableEnded) return true;
 
         req_info.isFinal = isFinal;
@@ -136,7 +134,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
 
         if (req_info.pending) {
             try {
-                const exhausted = await continuePending(req_info, client, model.name, signal);
+                const exhausted = await continuePending(req_info, model, signal);
                 if (exhausted) {
                     finishAtTokenLimit(req_info, res, exhausted);
                     return true;
@@ -165,7 +163,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
             const req_body = is_stream
                 ? { ...(req_info.body as {}), stream_options: { include_usage: true } }
                 : req_info.body;
-            upstream = await client.completions(req_body, model.name, signal);
+            upstream = await model.completions(req_body, signal);
         } catch (err) {
             sendUpstreamError(res, is_stream, err);
             return true;
@@ -388,9 +386,10 @@ function finishPending(req: ReqInfo, res: ExpressResponse): void {
     }
 }
 
-async function continuePending(req: ReqInfo, client: Client, model: string, signal: AbortSignal): Promise<PendingAttempt | undefined> {
+async function continuePending(req: ReqInfo, model: ModelEntry, signal: AbortSignal): Promise<PendingAttempt | undefined> {
     const pending = req.pending!;
-    const original = await client.countTokens(req.body, model, signal);
+    const original = await model.countTokens(req.body, signal);
+    if (original === null) throw new Error(`continuePending: error counting tokens`);
     req.original_prompt_tokens ??= original;
 
     if (!pending.content && !pending.reasoning) {
@@ -402,11 +401,13 @@ async function continuePending(req: ReqInfo, client: Client, model: string, sign
     if (!base.continue_final_message) {
         applyTruncation({ ...req, body: base }, "", "");
     }
-    const before = await client.countTokens(base, model, signal);
+    const before = await model.countTokens(base, signal);
+    if (before === null) throw new Error(`continuePending: error counting tokens`);
 
     const next = structuredClone(req.body);
     applyTruncation({ ...req, body: next }, pending.content, pending.reasoning);
-    const after = await client.countTokens(next, model, signal);
+    const after = await model.countTokens(next, signal);
+    if (after === null) throw new Error(`continuePending: error counting tokens`);
     const retained_tokens = Math.max(0, after - before);
 
     req.body = next;
