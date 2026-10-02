@@ -119,7 +119,7 @@ export class Planner {
     async serveModel(body: unknown, model_name: string, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const model = this.resolve(model_name);
         if (!model) throw new Error(`serveModel: unknown model ${model_name}`);
-        
+
         this.#cancelIdleTimer();
 
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
@@ -288,10 +288,9 @@ export class Planner {
         await handle.write(async () => {
             const model = this.activeModel()!;
             waiting_reload = this.waiting_reload.splice(0);
-            const fulfill = [];
-
-            // get the minimum rung that will satisfy all readers
+            const fulfill: PausedReader[] = [];
             let rung_needed = 0;
+            let min_ctx = 0;
             for (const waiter of waiting_reload) {
                 const min_rung = model.getMinimumRung(waiter.min_ctx);
                 if (min_rung === null) {
@@ -300,17 +299,32 @@ export class Planner {
                 }
 
                 if (min_rung > rung_needed) rung_needed = min_rung;
+                min_ctx = Math.max(min_ctx, waiter.min_ctx);
                 fulfill.push(waiter);
             }
 
+            if (fulfill.length === 0) return;
+
             await this.#unloadAllModels(true, model.name, t?.child(`unloadAllModels`));
 
-            await model.moveToRung(rung_needed, signal, t.child(`moveToRung`));
-            await this.#updateMemory(model);
+            let cur_ctx = model.getCurCtx();
+            while (true) {
+                await model.moveToRung(rung_needed, signal, t.child(`moveToRung(${rung_needed})`));
+                await this.#updateMemory(model);
 
-            // flush queue
+                cur_ctx = model.getCurCtx();
+                if (cur_ctx >= min_ctx || !model.hasRung(rung_needed + 1)) break;
+
+                log.warn(`${model.name}: rung ${rung_needed} reloaded to ctx ${cur_ctx}, below required ${min_ctx}; trying rung ${rung_needed + 1}`);
+                rung_needed++;
+            }
+
             for (const waiter of fulfill) {
-                waiter.resolve();
+                if (cur_ctx >= waiter.min_ctx) {
+                    waiter.resolve();
+                } else {
+                    waiter.reject(`unable to expand to ctx ${waiter.min_ctx} (actual ctx: ${cur_ctx})`);
+                }
             }
         }).catch((err) => {
             // reject requests
