@@ -15,7 +15,7 @@ export { STRATEGY_IDS };
 
 export type Strategy =
     | { kind: 'reload-model'; id: StrategyId }
-    | { kind: 'swap-model'; variant: string };
+    | { kind: 'swap-model'; variant: string; router_id?: ModelId };
 
 export const RESERVED_VARIANT_NAMES = new Set(['model', 'model-url']);
 

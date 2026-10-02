@@ -3,6 +3,9 @@ import type { ApiServer } from "./server.js";
 import { SSERelay } from "./sse-relay.js";
 import type { CompletionChunk, CompletionRequest } from "./types.js";
 import type { ModelEntry } from "../planner/model-entry.js";
+import { logger } from "../logger.js";
+
+const log = logger.withTag('api');
 
 export function registerRoutes(app: Express, server: ApiServer): void {
     app.get('/v1/models', (req, res) => listModels(server, req, res));
@@ -102,7 +105,8 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         return;
     }
 
-    if (!server.planner.resolve(model_name)) {
+    const logical_model = server.planner.resolve(model_name);
+    if (!logical_model) {
         sendError(res, 404, 'invalid_request', `unable to resolve model ${model_name}`);
         return;
     }
@@ -118,16 +122,18 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
     let headers_set = false;
     const req_info: ReqInfo = {
         body,
+        logical_model: logical_model.name,
+        outcome: 'error',
         completion_tokens_total: 0,
         isFinal: false,
     };
-
     await server.planner.serveModel(body, model_name, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => {
         if (res.writableEnded) return true;
 
         req_info.isFinal = isFinal;
 
         if (isFinal && req_info.pending) {
+            log.info(`${model.curVariant()}: context growth unavailable; returning pending response`);
             finishPending(req_info, res);
             return true;
         }
@@ -158,6 +164,10 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
             headers_set = true;
         }
 
+        req_info.upstream_usage = undefined;
+        req_info.finish_reason = undefined;
+        req_info.physical_model = model.curVariant();
+
         let upstream: Response;
         try {
             const req_body = is_stream
@@ -172,6 +182,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         if (!upstream.ok || (is_stream && !upstream.body)) {
             const text = await upstream.text().catch(() => '');
             if (isContextExceeded(text) && !req_info.isFinal) {
+                log.info(`${req_info.physical_model}: context exceeded; requesting growth`);
                 return false;
             }
             sendUpstreamError(res, is_stream, text || `upstream returned ${upstream.status}`);
@@ -183,11 +194,21 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         } else {
             return await nonStreamCompletion(req_info, upstream, res);
         }
+    }).finally(() => {
+        const outcome = !res.writableEnded && ac.signal.aborted ? 'aborted' : req_info.outcome;
+        logCompletion(req_info, req_info.finish_reason ?? outcome, true);
     });
 }
 
 type ReqInfo = {
     body: CompletionRequest;
+    logical_model: string;
+    physical_model?: string;
+    input_tokens?: number;
+    upstream_usage?: CompletionChunk['usage'];
+    final_usage?: CompletionChunk['usage'];
+    finish_reason?: string;
+    outcome: 'completed' | 'error';
     completion_tokens_total: number;
     continued?: boolean;
     original_prompt_tokens?: number;
@@ -227,12 +248,15 @@ async function streamCompletion(
                     finishStream(req, res, buffered_frames, pending_finish);
                 } else {
                     flushFrames(res, buffered_frames);
+                    req.outcome = 'completed';
                     finishSSEResponse(res);
                 }
                 return true;
             }
 
             const json = frame.data as CompletionChunk;
+            json.model = req.logical_model;
+            captureUsage(req, json, pending_finish?.choices[0]?.finish_reason);
             const choice = json.choices[0];
 
             if (pending_finish) {
@@ -283,6 +307,7 @@ async function streamCompletion(
             finishStream(req, res, buffered_frames, pending_finish);
         } else {
             flushFrames(res, buffered_frames);
+            req.outcome = 'completed';
             finishSSEResponse(res);
         }
         return true;
@@ -306,6 +331,8 @@ async function nonStreamCompletion(
         return true;
     }
 
+    json.model = req.logical_model;
+    captureUsage(req, json);
     const choice = json.choices[0];
     const finish_reason = choice?.finish_reason;
     const completion_tokens = json.usage?.completion_tokens ?? 0;
@@ -338,9 +365,38 @@ async function nonStreamCompletion(
         }
     }
 
+    req.outcome = 'completed';
     res.write(JSON.stringify(json));
     res.end();
     return true;
+}
+
+function captureUsage(req: ReqInfo, chunk: CompletionChunk, finish_reason?: string): void {
+    req.finish_reason = chunk.choices[0]?.finish_reason ?? finish_reason ?? req.finish_reason;
+    if (!chunk.usage || req.upstream_usage) return;
+
+    req.upstream_usage = structuredClone(chunk.usage);
+    req.input_tokens ??= chunk.usage.prompt_tokens;
+}
+
+function logCompletion(req: ReqInfo, finish_reason: string, is_final: boolean = false): void {
+    const usage = req.upstream_usage;
+    const input_tokens = is_final ? req.input_tokens : usage?.prompt_tokens;
+    const output_tokens = is_final
+        ? req.final_usage?.completion_tokens ?? (usage ? req.completion_tokens_total + usage.completion_tokens : undefined)
+        : usage?.completion_tokens;
+    const cached_tokens = usage?.prompt_tokens_details?.cached_tokens;
+    log.info(`${req.physical_model ?? req.logical_model}: finish (${finish_reason}) | input ${input_tokens ?? 'unknown'} toks (${cached_tokens ?? 'unknown'} cached) | output ${output_tokens ?? 'unknown'} toks`);
+}
+
+function logDiscardedToolCalls(req: ReqInfo, pending: PendingAttempt): void {
+    const discarded = pending.kind === 'stream'
+        ? pending.frames.length
+        : pending.response.choices[0]?.message?.tool_calls?.length ?? 0;
+    if (discarded > 0) {
+        const unit = pending.kind === 'stream' ? 'buffered frames' : 'tool calls';
+        log.info(`${req.physical_model}: discarded interrupted tool-call output (${discarded} ${unit})`);
+    }
 }
 
 function flushFrames(res: ExpressResponse, frames: string[]): void {
@@ -350,14 +406,17 @@ function flushFrames(res: ExpressResponse, frames: string[]): void {
 }
 
 function correctUsage(req: ReqInfo, chunk: CompletionChunk): void {
-    if (!chunk.usage || req.original_prompt_tokens === undefined) return;
-
-    chunk.usage.prompt_tokens = req.original_prompt_tokens;
-    chunk.usage.completion_tokens += req.completion_tokens_total;
-    chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
+    if (!chunk.usage) return;
+    if (req.original_prompt_tokens !== undefined) {
+        chunk.usage.prompt_tokens = req.original_prompt_tokens;
+        chunk.usage.completion_tokens += req.completion_tokens_total;
+        chunk.usage.total_tokens = chunk.usage.prompt_tokens + chunk.usage.completion_tokens;
+    }
+    req.final_usage = structuredClone(chunk.usage);
 }
 
 function finishStream(req: ReqInfo, res: ExpressResponse, frames: string[], finish: CompletionChunk, usage?: CompletionChunk): void {
+    req.outcome = 'completed';
     flushFrames(res, frames);
     res.write(`data: ${JSON.stringify(finish)}\n\n`);
     if (usage) {
@@ -381,6 +440,7 @@ function finishPending(req: ReqInfo, res: ExpressResponse): void {
             message.reasoning_content = (last.reasoning_content ?? "") + (message.reasoning_content ?? "");
         }
         correctUsage(req, pending.response);
+        req.outcome = 'completed';
         res.write(JSON.stringify(pending.response));
         res.end();
     }
@@ -393,6 +453,8 @@ async function continuePending(req: ReqInfo, model: ModelEntry, signal: AbortSig
     req.original_prompt_tokens ??= original;
 
     if (!pending.content && !pending.reasoning) {
+        logCompletion(req, req.finish_reason ?? 'unknown');
+        logDiscardedToolCalls(req, pending);
         req.pending = undefined;
         return;
     }
@@ -417,10 +479,13 @@ async function continuePending(req: ReqInfo, model: ModelEntry, signal: AbortSig
     }
     req.continued = true;
     req.pending = undefined;
+    if (req.body.max_tokens !== 0) logCompletion(req, req.finish_reason ?? 'unknown');
+    logDiscardedToolCalls(req, pending);
     if (req.body.max_tokens === 0) return pending;
 }
 
 function finishAtTokenLimit(req: ReqInfo, res: ExpressResponse, pending: PendingAttempt): void {
+    req.outcome = 'completed';
     const completion_tokens = req.completion_tokens_total;
     const prompt_tokens = req.original_prompt_tokens!;
     const usage = {
@@ -428,6 +493,7 @@ function finishAtTokenLimit(req: ReqInfo, res: ExpressResponse, pending: Pending
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
     };
+    req.final_usage = usage;
 
     if (pending.kind === 'stream') {
         res.write(`data: ${JSON.stringify(pending.finish)}\n\n`);

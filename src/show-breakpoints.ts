@@ -70,13 +70,13 @@ export async function walkBreakpoints(
     }
 
     while (entry.hasNextRung()) {
-        log.info(`${entry.name}: applying ${entry.ladder[entry.ladder_i + 1].strategy}`);
+        log.info(`${entry.name}: applying ${entry.rungLabel(entry.ladder_i + 1)}`);
         const n_ctx = await entry.applyNextRung(signal, t);
         mem = await entry.getMemory(signal);
         const { weight_bytes, context_bytes } = getModelMemory(mem);
         rungs.push({
             i: rungs.length,
-            strategy_name: entry.ladder[entry.ladder_i].strategy as string,
+            strategy_name: entry.rungLabel(entry.ladder_i),
             n_ctx: n_ctx,
             gain: n_ctx - prev,
             weight_gib: weight_bytes / (1024 ** 3),
@@ -91,7 +91,7 @@ export async function walkBreakpoints(
 
         if (n_ctx_seq <= prev_seq) {
             throw new Error(
-                `walkBreakpoints: model ${entry.name}: rung ${idx} ('${entry.ladder[idx]!.strategy}' | variant ${entry.curVariant()}) ` +
+                `walkBreakpoints: model ${entry.name}: rung ${idx} ('${entry.rungLabel(idx)}' | variant ${entry.curVariant()}) ` +
                 `measured ${n_ctx_seq} ctx, which does not exceed the previous rung's ${prev_seq}`
             );
         }
@@ -199,6 +199,7 @@ Stringify a model's strategy ladder for printing:
 */
 export function printModelBreakpoints(model: ModelBreakpoints): string {
     const PAD = " ";
+    const strategy_width = 24;
 
     let out = "";
 
@@ -206,10 +207,13 @@ export function printModelBreakpoints(model: ModelBreakpoints): string {
     const baseline_str = fmtNum(baseline);
     const device_str = `device: ${model.device_total_gib.toFixed(0)} GiB`;
 
-    const rows = [PAD + "i".padStart(2) + "  strategy        ctx (tokens)    gain (tokens)       weights / ctx GiB"];
+    const rows = [PAD + "i".padStart(2) + "  " + "strategy".padEnd(strategy_width) + " " + "ctx (tokens)".padStart(12) + "  " + "gain (tokens)".padStart(15) + "       " + "weights / ctx GiB".padStart(17)];
     for (const rung of model.rungs) {
         const i_str = String(rung.i).padStart(2);
-        const strat = rung.strategy_name.padEnd(15);
+        const label = Array.from(rung.strategy_name);
+        const strat = (label.length > strategy_width
+            ? label.slice(0, strategy_width - 1).join('') + '…'
+            : rung.strategy_name).padEnd(strategy_width);
         const ctx = fmtNum(rung.n_ctx).padStart(12);
         const gain = rung.gain > 0 ? `(+${fmtNum(rung.gain)})` : "";
         const gain_padded = gain.padStart(15);

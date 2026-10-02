@@ -8,7 +8,8 @@ import { Timer } from "./timer.js";
 import type { StrategyImpl } from "./types.js";
 
 export interface Rung {
-    strategy: StrategyId | 'swap-model';
+    strategy: StrategyId | 'swap-model' | 'baseline';
+    variant_name: string;
     impl?: StrategyImpl;
     state: ModelState;
     n_ctx_cap: Tokens;
@@ -34,9 +35,9 @@ export class ModelEntry {
     bytes_needed_no_kv?: number;
 
     constructor(
-        client: LlamaAPI, 
-        name: ModelId, 
-        aliases: string[], 
+        client: LlamaAPI,
+        name: ModelId,
+        aliases: string[],
         initial_state: ModelState,
         ladder: Strategy[],
         impls: Map<StrategyId, StrategyImpl>
@@ -47,57 +48,6 @@ export class ModelEntry {
         this.name = name;
         this.aliases = aliases;
         this.ladder = this.#buildLadder(initial_state, ladder, impls);
-    }
-
-    #buildLadder(initial_state: ModelState, ladder: Strategy[], strats: Map<StrategyId, StrategyImpl>): Rung[] {
-        if (initial_state.model_variant === undefined) {
-            throw new Error(`#buildLadder: expected initial model variant for ${this.name}`);
-        }
-
-        let state = initial_state;
-
-        const rungs: Rung[] = [{
-            strategy: 'swap-model',
-            state,
-            n_ctx_cap: -1,
-            bytes_needed: 0,
-        }];
-
-        for (const [i, item] of ladder.entries()) {
-            if (item.kind === 'reload-model') {
-                const s = strats.get(item.id);
-                if (!s) throw new Error(`#buildLadder: unrecognized strategy: ${item.id}`);
-
-                if (!s.canApply(state)) {
-                    this.log.warn(`cannot apply strategy ${item.id} at pos ${i}; skipping`);
-                    continue;
-                }
-
-                state = s.getNewState(state);
-                rungs.push({
-                    strategy: item.id,
-                    impl: s,
-                    state,
-                    n_ctx_cap: -1,
-                    bytes_needed: 0,
-                });
-            } else {
-                // TODO
-                state = structuredClone(state);
-                state.model_variant = item.variant;
-                state.cache_type_k = 'f16';
-                state.cache_type_v = 'f16';
-
-                rungs.push({
-                    strategy: 'swap-model',
-                    state,
-                    n_ctx_cap: -1,
-                    bytes_needed: 0,
-                })
-            }
-        }
-
-        return rungs;
     }
 
     async loadWeights(signal: AbortSignal, t?: Timer): Promise<void> {
@@ -134,6 +84,7 @@ export class ModelEntry {
         if (!this.hasRung(rung_i)) throw new Error(`moveToRung: rung index out of bounds`);
 
         const cur_i = this.ladder_i;
+        this.#logTransition(rung_i);
 
         // create a restore point at the current rung
         await this.#createRestorePoint(signal, t);
@@ -237,7 +188,9 @@ export class ModelEntry {
 
         try {
             t?.start('saveAllSlots');
-            this.ladder[this.ladder_i].last_slots = await this.client.saveAllSlots(this.curVariant(), path_base, signal);
+            const slots = await this.client.saveAllSlots(this.curVariant(), path_base, signal);
+            this.ladder[this.ladder_i].last_slots = slots;
+            this.log.info(`saved slots at rung ${this.ladder_i} | ${slots.map(slot => `${slot.id_slot}=${slot.n_saved} tokens`).join(', ')}`);
         } catch (err) {
             this.log.error(`error creating restore point: ${err}`);
         } finally {
@@ -254,7 +207,8 @@ export class ModelEntry {
 
         try {
             t?.start('restoreAllSlots');
-            await this.client.restoreAllSlots(this.curVariant(), slots, signal);
+            const restored = await this.client.restoreAllSlots(this.curVariant(), slots, signal);
+            this.log.info(`restored rung ${src_rung} slots into rung ${this.ladder_i} | ${restored.map(slot => `${slot.id_slot}=${slot.n_restored} tokens`).join(', ')}`);
         } catch (err) {
             this.log.error(`error restoring last slots: ${err}`);
         } finally {
@@ -295,6 +249,30 @@ export class ModelEntry {
     curVariant(): string {
         if (this.ladder_i === -1) return this.name;
         else return this.ladder[this.ladder_i].state.model_variant;
+    }
+
+    rungLabel(i: number): string {
+        const rung = this.ladder[i];
+        return rung.strategy === 'swap-model'
+            ? `swap-model:${rung.variant_name}`
+            : rung.strategy;
+    }
+
+    #logTransition(dest_i: number): void {
+        const src_i = this.ladder_i;
+        const labels = this.ladder.map((_, i) => this.rungLabel(i));
+        const crossed = dest_i > src_i
+            ? labels.slice(Math.max(0, src_i) + 1, dest_i + 1)
+            : labels.slice(dest_i + 1, src_i + 1).reverse();
+        const action = dest_i === src_i ? 'reloading' : dest_i > src_i ? 'applying' : 'removing';
+        const strategies = crossed.join(', ');
+        if (src_i === -1) {
+            this.log.info(`initializing model to rung ${dest_i}${strategies ? `: applying [${strategies}]` : ''}`);
+        } else if (src_i === dest_i) {
+            this.log.info(`reloading at current rung (${src_i})`);
+        } else {
+            this.log.info(`rung ${src_i} → ${dest_i}: ${action}${strategies ? ` [${strategies}]` : ''}`);
+        }
     }
 
     stateAtRung(i: number): ModelState | undefined {
@@ -373,5 +351,61 @@ export class ModelEntry {
         this.status = LoadStatus.UNLOADED;
         this.n_ctx = 0;
         this.ladder_i = -1;
+    }
+
+    #buildLadder(initial_state: ModelState, ladder: Strategy[], strats: Map<StrategyId, StrategyImpl>): Rung[] {
+        if (initial_state.model_variant === undefined) {
+            throw new Error(`#buildLadder: expected initial model variant for ${this.name}`);
+        }
+
+        let state = initial_state;
+        let variant_name = 'baseline';
+
+        const rungs: Rung[] = [{
+            strategy: 'baseline',
+            variant_name,
+            state,
+            n_ctx_cap: -1,
+            bytes_needed: 0,
+        }];
+
+        for (const [i, item] of ladder.entries()) {
+            if (item.kind === 'reload-model') {
+                const s = strats.get(item.id);
+                if (!s) throw new Error(`#buildLadder: unrecognized strategy: ${item.id}`);
+
+                if (!s.canApply(state)) {
+                    this.log.warn(`cannot apply strategy ${item.id} at pos ${i}; skipping`);
+                    continue;
+                }
+
+                state = s.getNewState(state);
+                rungs.push({
+                    strategy: item.id,
+                    variant_name,
+                    impl: s,
+                    state,
+                    n_ctx_cap: -1,
+                    bytes_needed: 0,
+                });
+            } else {
+                if (!item.router_id) throw new Error(`#buildLadder: expected router id for variant ${item.variant}`);
+                state = structuredClone(state);
+                state.model_variant = item.router_id;
+                variant_name = item.variant;
+                state.cache_type_k = 'f16';
+                state.cache_type_v = 'f16';
+
+                rungs.push({
+                    strategy: 'swap-model',
+                    variant_name,
+                    state,
+                    n_ctx_cap: -1,
+                    bytes_needed: 0,
+                })
+            }
+        }
+
+        return rungs;
     }
 }

@@ -296,11 +296,18 @@ function parseModelVariant(value: string): { name: string; path: string } {
     if (RESERVED_VARIANT_NAMES.has(name)) {
         throw new Error(`model-variant name '${name}' is reserved`);
     }
-    if (path === '') {
-        throw new Error(`model-variant '${name}' has an empty path`);
-    }
+    validateVariantPath(path, `model-variant '${name}'`);
 
     return { name, path };
+}
+
+export function validateVariantPath(path: unknown, label: string): asserts path is string {
+    if (typeof path !== 'string' || path.trim() === '') {
+        throw new Error(`${label} must be a nonempty local GGUF path`);
+    }
+    if (/^[a-z][a-z0-9+.-]*:/i.test(path.trim()) && !/^[a-z]:[\\/]/i.test(path.trim())) {
+        throw new Error(`${label} must be a local GGUF path, not a URL`);
+    }
 }
 
 function deriveModelId(source: string): ModelId {

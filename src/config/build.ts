@@ -9,7 +9,7 @@ import { RESERVED_VARIANT_NAMES, STRATEGY_IDS, hasMmproj, isMmprojOnCPU, isSpecE
 import type { ReloadParams, SpeculativeType } from "../client/types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { maybeReject, normalizeFlag } from "./flags.js";
-import { parseLadderStep, parseRouterConfig, type ParsedArgs } from "./parser.js";
+import { parseLadderStep, parseRouterConfig, validateVariantPath, type ParsedArgs } from "./parser.js";
 
 const log: ConsolaInstance = logger.withTag('config');
 
@@ -68,7 +68,7 @@ export async function buildConfig(
             throw new Error(`model '${id}' declares model-variants and requires an explicit ladder with swap-model steps ('ladder' in the model config or --ladder)`);
         }
 
-        const steps = explicit ?? deriveLadder(interp.entry, interp.cache_floor);
+        const steps = structuredClone(explicit ?? deriveLadder(interp.entry, interp.cache_floor));
 
         if (has_variants) {
             validateVariantLadder(id, steps, interp.variants, buildInitialState(id, interp.entry));
@@ -311,9 +311,7 @@ function parseModelVariants(name: string, value: unknown, out: Record<string, st
         if (RESERVED_VARIANT_NAMES.has(variant)) {
             throw new Error(`model '${name}': model-variant name '${variant}' is reserved`);
         }
-        if (typeof path !== 'string' || path.trim() === '') {
-            throw new Error(`model '${name}': model-variant '${variant}' must be a nonempty local GGUF path`);
-        }
+        validateVariantPath(path, `model '${name}': model-variant '${variant}'`);
         out[variant] = path;
     }
 
@@ -368,8 +366,8 @@ function validateVariantLadder(
                 throw new Error(`model '${name}': ladder step ${i} switches to variant '${step.variant}' more than once`);
             }
             switched.add(step.variant);
-            step.variant = variantRouterId(name, step.variant);
-            state = { ...state, model_variant: step.variant, cache_type_k: 'f16', cache_type_v: 'f16' };
+            step.router_id = variantRouterId(name, step.variant);
+            state = { ...state, model_variant: step.router_id, cache_type_k: 'f16', cache_type_v: 'f16' };
             return;
         }
 

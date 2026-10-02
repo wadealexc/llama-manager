@@ -1,9 +1,13 @@
 export interface CompletionChunk {
+    model?: string;
     choices: CompletionChoice[];
     usage?: {
         completion_tokens: number;
         prompt_tokens: number;
         total_tokens: number;
+        prompt_tokens_details?: {
+            cached_tokens?: number;
+        };
     };
 }
 

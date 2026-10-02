@@ -33,6 +33,7 @@ function createFixture(): Fixture {
 
     entry.ladder.push({
         strategy: 'quantize-kv-q8',
+        variant_name: 'baseline',
         state: { model_variant: name, kv_unified: true, cache_type_k: 'q8_0', cache_type_v: 'q8_0' },
         n_ctx_cap: 8192,
         bytes_needed: 12288,

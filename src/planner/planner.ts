@@ -303,20 +303,7 @@ export class Planner {
                 fulfill.push(waiter);
             }
 
-            const cur_ctx = model.getCurCtx();
-            const new_ctx = model.getCtxCap(rung_needed);
-
-            const strats = model.ladder.map(r => r.strategy as string);
-            const diff: string[] = rung_needed > model.ladder_i
-                ? strats.slice(model.ladder_i, rung_needed)
-                : strats.slice(rung_needed, model.ladder_i).reverse();
-
-            // unload any other active models
             await this.#unloadAllModels(true, model.name, t?.child(`unloadAllModels`));
-
-            // reload model
-            const action = rung_needed >= model.ladder_i ? "applying" : "removing";
-            log.info(`${model.name}: ${action} strategies [${diff.join(", ")}]; new ctx cap: ${new_ctx}`);
 
             await model.moveToRung(rung_needed, signal, t.child(`moveToRung`));
             await this.#updateMemory(model);
@@ -413,10 +400,6 @@ export class Planner {
                 fulfill.push(waiter);
             }
 
-            // reload model to target rung
-            const strats = target.ladder.map(r => r.strategy as string).slice(0, rung_needed);
-            const new_cap = target.getCtxCap(rung_needed);
-            log.info(`${target.name}: applying strategies [${strats.join(", ")}]; new ctx cap: ${new_cap}`);
             await target.moveToRung(rung_needed, signal, t.child(`moveToRung`));
             await this.#updateMemory(target);
 
