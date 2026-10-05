@@ -188,7 +188,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         };
 
         const serve_model = planner.serveModel.bind(planner);
-        planner.serveModel = async (body, model, client_signal, cb) => serve_model(body, model, client_signal, async (request_body, request_client, request_signal, is_final) => {
+        planner.serveModel = async (body, model, task, client_signal, cb) => serve_model(body, model, task, client_signal, async (request_body, request_client, request_signal, is_final) => {
             const rung = entry.ladder_i;
             const success = await cb(request_body, request_client, request_signal, is_final);
             current_attempt?.callbacks.push({ rung, is_final, success });

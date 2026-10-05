@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { ManagerConfig, ModelState } from '../config/types.js';
 import { ModelEntry } from '../planner/model-entry.js';
-import { Planner } from '../planner/planner.js';
+import { ModelTask, Planner } from '../planner/planner.js';
 import { LlamaAPIMock } from './llama-api-mock.js';
 
 function deferred<T>() {
@@ -79,6 +79,222 @@ async function createFixture(rung_i: number = 0) {
     return { client, model, planner };
 }
 
+describe('Planner non-generation tasks', () => {
+    test('tokenizes a short input without downshifting or disturbing the live conversation', async () => {
+        const { client, model, planner } = await createFixture(1);
+        model.ladder[0].last_slots = client.seedSnapshot(model.name, 0, ['older baseline conversation']);
+        model.ladder[1].last_slots = client.seedSnapshot(model.name, 1, ['older q8 conversation']);
+        client.setLiveSlots(['long conversation', 'latest generated tokens'], model.name);
+        const snapshots_before = structuredClone(client.snapshots);
+        const saved_slots_before = structuredClone(model.ladder.map(rung => rung.last_slots));
+        let callback_count = 0;
+        let counted_tokens: number | null = null;
+
+        await planner.serveModel({ tokens: 1000 }, model.name, ModelTask.TOKENIZE, new AbortController().signal, async (body, active_model, signal, is_final) => {
+            callback_count++;
+            assert.equal(is_final, false);
+            assert.equal(active_model.ladder_i, 1);
+            counted_tokens = await active_model.countTokens(body, signal);
+            return true;
+        });
+
+        assert.equal(callback_count, 1);
+        assert.equal(counted_tokens, 1000);
+        assert.equal(model.ladder_i, 1);
+        assert.equal(model.getCurCtx(), 8192);
+        assert.deepEqual(client.getLiveSlots(model.name), ['long conversation', 'latest generated tokens']);
+        assert.deepEqual(client.snapshots, snapshots_before);
+        assert.deepEqual(model.ladder.map(rung => rung.last_slots), saved_slots_before);
+        assert.deepEqual(client.operations, [{ kind: 'count', model: model.name, tokens: 1000 }]);
+        assert.equal(planner.active.readers, 0);
+        assert.equal(planner.waiting_load.length, 0);
+        assert.equal(planner.waiting_reload.length, 0);
+
+        let completion_count = 0;
+        await planner.serveModel({ tokens: 6000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async (_body, active_model, _signal, is_final) => {
+            completion_count++;
+            assert.equal(is_final, false);
+            assert.equal(active_model.ladder_i, 1);
+            assert.deepEqual(client.getLiveSlots(active_model.name), ['long conversation', 'latest generated tokens']);
+            return true;
+        });
+
+        assert.equal(completion_count, 1);
+        assert.equal(model.ladder_i, 1);
+        assert.equal(model.getCurCtx(), 8192);
+        assert.deepEqual(client.getLiveSlots(model.name), ['long conversation', 'latest generated tokens']);
+        assert.deepEqual(client.snapshots, snapshots_before);
+        assert.deepEqual(model.ladder.map(rung => rung.last_slots), saved_slots_before);
+        assert.deepEqual(client.operations, [
+            { kind: 'count', model: model.name, tokens: 1000 },
+            { kind: 'count', model: model.name, tokens: 6000 },
+        ]);
+        assert.equal(planner.active.pending, false);
+        assert.equal(planner.active.readers, 0);
+        assert.equal(planner.waiting_load.length, 0);
+        assert.equal(planner.waiting_reload.length, 0);
+    });
+
+    test('tokenizes an input above the current context without upshifting', async () => {
+        const { client, model, planner } = await createFixture();
+        client.setLiveSlots(['baseline conversation'], model.name);
+        let callback_count = 0;
+        let counted_tokens: number | null = null;
+
+        await planner.serveModel({ tokens: 5000 }, model.name, ModelTask.TOKENIZE, new AbortController().signal, async (body, active_model, signal, is_final) => {
+            callback_count++;
+            assert.equal(is_final, false);
+            assert.equal(active_model.ladder_i, 0);
+            counted_tokens = await active_model.countTokens(body, signal);
+            return true;
+        });
+
+        assert.equal(callback_count, 1);
+        assert.equal(counted_tokens, 5000);
+        assert.equal(model.ladder_i, 0);
+        assert.equal(model.getCurCtx(), 4096);
+        assert.deepEqual(client.getLiveSlots(model.name), ['baseline conversation']);
+        assert.equal(client.snapshots.size, 0);
+        assert.deepEqual(client.operations, [{ kind: 'count', model: model.name, tokens: 5000 }]);
+        assert.equal(planner.active.pending, false);
+        assert.equal(planner.active.readers, 0);
+        assert.equal(planner.waiting_load.length, 0);
+        assert.equal(planner.waiting_reload.length, 0);
+    });
+
+    test('tokenizes an input above maximum measured capacity without rejecting it', async () => {
+        const { client, model, planner } = await createFixture();
+        client.setLiveSlots(['baseline conversation'], model.name);
+        assert.equal(model.getMaxCtx(), 8192);
+        let callback_count = 0;
+        let counted_tokens: number | null = null;
+
+        await planner.serveModel({ tokens: 9000 }, model.name, ModelTask.TOKENIZE, new AbortController().signal, async (body, active_model, signal, is_final) => {
+            callback_count++;
+            assert.equal(is_final, false);
+            assert.equal(active_model.ladder_i, 0);
+            counted_tokens = await active_model.countTokens(body, signal);
+            return true;
+        });
+
+        assert.equal(callback_count, 1);
+        assert.equal(counted_tokens, 9000);
+        assert.equal(model.ladder_i, 0);
+        assert.equal(model.getCurCtx(), 4096);
+        assert.deepEqual(client.getLiveSlots(model.name), ['baseline conversation']);
+        assert.equal(client.snapshots.size, 0);
+        assert.deepEqual(client.operations, [{ kind: 'count', model: model.name, tokens: 9000 }]);
+        assert.equal(planner.active.pending, false);
+        assert.equal(planner.active.readers, 0);
+        assert.equal(planner.waiting_load.length, 0);
+        assert.equal(planner.waiting_reload.length, 0);
+    });
+
+    test('wakes an active model with empty messages without counting tokens or reloading', async () => {
+        const { client, model, planner } = await createFixture(1);
+        model.ladder[0].last_slots = client.seedSnapshot(model.name, 0, ['older baseline conversation']);
+        client.setLiveSlots(['long conversation'], model.name);
+        const snapshots_before = structuredClone(client.snapshots);
+        const saved_slots_before = structuredClone(model.ladder.map(rung => rung.last_slots));
+        let callback_count = 0;
+
+        await planner.serveModel({ messages: [] }, model.name, ModelTask.WAKE, new AbortController().signal, async (_body, active_model, _signal, is_final) => {
+            callback_count++;
+            assert.equal(is_final, false);
+            assert.equal(active_model.ladder_i, 1);
+            return true;
+        });
+
+        assert.equal(callback_count, 1);
+        assert.equal(model.ladder_i, 1);
+        assert.equal(model.getCurCtx(), 8192);
+        assert.deepEqual(client.getLiveSlots(model.name), ['long conversation']);
+        assert.deepEqual(client.snapshots, snapshots_before);
+        assert.deepEqual(model.ladder.map(rung => rung.last_slots), saved_slots_before);
+        assert.deepEqual(client.operations, []);
+        assert.equal(planner.active.pending, false);
+        assert.equal(planner.active.readers, 0);
+        assert.equal(planner.waiting_load.length, 0);
+        assert.equal(planner.waiting_reload.length, 0);
+    });
+
+    test('serves tokenization queued during a reload without reinitializing the active model', { timeout: 5000 }, async () => {
+        const { client, model, planner } = await createFixture();
+        client.setLiveSlots(['live conversation', 'generated tokens'], model.name);
+        const release_reload = deferred<void>();
+        const reload_model = client.reloadModel.bind(client);
+        let reload_entered = false;
+        let completion_count = 0;
+        let tokenization_count = 0;
+        let completion_rung = -1;
+        let tokenization_rung = -1;
+        let counted_tokens: number | null = null;
+        let tokenizing: Promise<void> | undefined;
+
+        client.reloadModel = async (params, model_name, signal) => {
+            reload_entered = true;
+            await release_reload.promise;
+            return await reload_model(params, model_name, signal);
+        };
+
+        const generating = planner.serveModel({ tokens: 5000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async (_body, active_model, _signal, is_final) => {
+            completion_count++;
+            completion_rung = active_model.ladder_i;
+            assert.equal(is_final, false);
+            assert.deepEqual(client.getLiveSlots(active_model.name), ['live conversation', 'generated tokens']);
+            return true;
+        });
+
+        try {
+            await waitFor(() => reload_entered);
+            assert.equal(planner.active.pending, true);
+            assert.equal(completion_count, 0);
+
+            tokenizing = planner.serveModel({ tokens: 1000 }, model.name, ModelTask.TOKENIZE, new AbortController().signal, async (body, active_model, signal, is_final) => {
+                tokenization_count++;
+                tokenization_rung = active_model.ladder_i;
+                assert.equal(is_final, false);
+                assert.deepEqual(client.getLiveSlots(active_model.name), ['live conversation', 'generated tokens']);
+                counted_tokens = await active_model.countTokens(body, signal);
+                return true;
+            });
+
+            await waitFor(() => planner.waiting_load.length === 1);
+            assert.equal(planner.active.pending, true);
+            assert.equal(completion_count, 0);
+            assert.equal(tokenization_count, 0);
+
+            release_reload.resolve();
+            await Promise.all([generating, tokenizing]);
+        } finally {
+            release_reload.resolve();
+            await Promise.allSettled(tokenizing ? [generating, tokenizing] : [generating]);
+            client.reloadModel = reload_model;
+        }
+
+        assert.equal(completion_count, 1);
+        assert.equal(tokenization_count, 1);
+        assert.equal(completion_rung, 1);
+        assert.equal(tokenization_rung, 1);
+        assert.equal(counted_tokens, 1000);
+        assert.equal(model.ladder_i, 1);
+        assert.equal(model.getCurCtx(), 8192);
+        assert.deepEqual(client.getLiveSlots(model.name), ['live conversation', 'generated tokens']);
+        assert.deepEqual(client.getSnapshot(model.name, 0), ['live conversation', 'generated tokens']);
+        assert.equal(client.getSnapshot(model.name, 1), undefined);
+        assert.deepEqual(client.operations.map(operation => operation.kind), ['count', 'save', 'reload', 'restore', 'memory', 'count']);
+        assert.deepEqual(client.operations.filter(operation => operation.kind === 'count'), [
+            { kind: 'count', model: model.name, tokens: 5000 },
+            { kind: 'count', model: model.name, tokens: 1000 },
+        ]);
+        assert.equal(planner.active.model, model.name);
+        assert.equal(planner.active.pending, false);
+        assert.equal(planner.active.readers, 0);
+        assert.equal(planner.waiting_load.length, 0);
+        assert.equal(planner.waiting_reload.length, 0);
+    });
+});
+
 describe('Planner warm-model scheduling', () => {
     test('downshifts an unoccupied model to the minimum sufficient rung', async () => {
         const { client, model, planner } = await createFixture(1);
@@ -86,7 +302,7 @@ describe('Planner warm-model scheduling', () => {
         client.setLiveSlots(['long conversation'], model.name);
         let seen_rung = -1;
 
-        await planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             seen_rung = model.ladder_i;
             return true;
         });
@@ -106,7 +322,7 @@ describe('Planner warm-model scheduling', () => {
         client.setLiveSlots(['live conversation'], model.name);
         let seen_rung = -1;
 
-        await planner.serveModel({ tokens: 5000 }, model.name, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 5000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             seen_rung = model.ladder_i;
             return true;
         });
@@ -123,7 +339,7 @@ describe('Planner warm-model scheduling', () => {
         const { client, model, planner } = await createFixture(1);
         const started = deferred<void>();
         const finish = deferred<void>();
-        const busy = planner.serveModel({ tokens: 6000 }, model.name, new AbortController().signal, async () => {
+        const busy = planner.serveModel({ tokens: 6000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             started.resolve();
             await finish.promise;
             return true;
@@ -132,7 +348,7 @@ describe('Planner warm-model scheduling', () => {
         try {
             await started.promise;
             let seen_rung = -1;
-            await planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
+            await planner.serveModel({ tokens: 1000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
                 seen_rung = model.ladder_i;
                 return true;
             });
@@ -161,7 +377,7 @@ describe('Planner warm-model scheduling', () => {
         planner.dev_info.bytes_avail = memory.devices[0].free;
         client.clearOperations();
 
-        await planner.serveModel({ tokens: 1000 }, second.name, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, second.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             assert.equal(planner.active.model, second.name);
             assert.equal(client.hasKV(model.name), false);
             assert.equal(client.hasKV(second.name), true);
@@ -175,7 +391,7 @@ describe('Planner warm-model scheduling', () => {
         client.setLiveSlots(['second conversation'], second.name);
         client.clearOperations();
 
-        await planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             assert.equal(planner.active.model, model.name);
             assert.equal(client.hasKV(second.name), false);
             assert.equal(client.hasKV(model.name), true);
@@ -200,7 +416,7 @@ describe('Planner warm-model scheduling', () => {
         planner.dev_info.bytes_avail = (await model.getMemory(new AbortController().signal)).devices[0].free;
         client.clearOperations();
 
-        await planner.serveModel({ tokens: 1000 }, second.name, new AbortController().signal, async () => {
+        await planner.serveModel({ tokens: 1000 }, second.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             assert.equal(planner.active.model, second.name);
             assert.equal(client.hasKV(second.name), true);
             assert.equal(client.isLoaded(model.name), false);
@@ -226,7 +442,7 @@ describe('Planner warm-model scheduling', () => {
 
         const started = deferred<void>();
         const finish = deferred<void>();
-        const generating = planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async () => {
+        const generating = planner.serveModel({ tokens: 1000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => {
             started.resolve();
             await finish.promise;
             return true;
@@ -234,7 +450,7 @@ describe('Planner warm-model scheduling', () => {
 
         try {
             await started.promise;
-            const queued = planner.serveModel({ tokens: 1000 }, second.name, new AbortController().signal, async () => true);
+            const queued = planner.serveModel({ tokens: 1000 }, second.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => true);
             await waitFor(() => planner.waiting_load.length === 1);
 
             assert.equal(planner.active.model, model.name);
@@ -262,7 +478,7 @@ describe('Planner warm-model scheduling', () => {
         const finish = deferred<void>();
         const slow_rungs: number[] = [];
         const fast_rungs: number[] = [];
-        const slow = planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
+        const slow = planner.serveModel({ tokens: 1000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
             assert.equal(isFinal, false);
             slow_rungs.push(model.ladder_i);
             if (slow_rungs.length === 1) {
@@ -275,7 +491,7 @@ describe('Planner warm-model scheduling', () => {
 
         try {
             await started.promise;
-            const fast = planner.serveModel({ tokens: 1000 }, model.name, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
+            const fast = planner.serveModel({ tokens: 1000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async (_body, _client, _signal, isFinal) => {
                 assert.equal(isFinal, false);
                 fast_rungs.push(model.ladder_i);
                 return fast_rungs.length > 1;

@@ -4,6 +4,7 @@ import { SSERelay } from "./sse-relay.js";
 import type { CompletionChunk, CompletionRequest } from "./types.js";
 import type { ModelEntry } from "../planner/model-entry.js";
 import { logger } from "../logger.js";
+import { ModelTask } from "../planner/planner.js";
 
 const log = logger.withTag('api');
 
@@ -49,7 +50,7 @@ async function loadModel(server: ApiServer, req: Request, res: ExpressResponse):
     res.on('close', () => ac.abort());
     req.on('aborted', () => ac.abort());
 
-    await server.planner.serveModel({ messages: [] }, model_name, ac.signal, async (_b: unknown, model: ModelEntry, signal: AbortSignal, _isFinal: boolean) => {
+    await server.planner.serveModel({ messages: [] }, model_name, ModelTask.WAKE, ac.signal, async (_b: unknown, model: ModelEntry, signal: AbortSignal, _isFinal: boolean) => {
         res.json({ success: true });
         return true;
     });
@@ -77,7 +78,7 @@ async function countTokens(server: ApiServer, req: Request, res: ExpressResponse
     res.on('close', () => ac.abort());
     req.on('aborted', () => ac.abort());
 
-    await server.planner.serveModel(body, model_name, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, _isFinal: boolean) => {
+    await server.planner.serveModel(body, model_name, ModelTask.TOKENIZE, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, _isFinal: boolean) => {
         let tokens;
         try {
             tokens = await model.countTokens(body, signal);
@@ -127,7 +128,7 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         completion_tokens_total: 0,
         isFinal: false,
     };
-    await server.planner.serveModel(body, model_name, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => {
+    await server.planner.serveModel(body, model_name, ModelTask.COMPLETIONS, ac.signal, async (_body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => {
         if (res.writableEnded) return true;
 
         req_info.isFinal = isFinal;

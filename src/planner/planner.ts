@@ -35,6 +35,7 @@ type PausedReader = {
 type Waiter = {
     model: ModelId;
     body: unknown;
+    task: ModelTask;
     resolve: (handle: ReadHandle) => void;
     reject: (reason: any) => void;
 }
@@ -42,6 +43,18 @@ type Waiter = {
 type DeviceInfo = {
     bytes_total: number;
     bytes_avail: number;
+}
+
+export enum ModelTask {
+    WAKE,
+    TOKENIZE,
+    COMPLETIONS,
+}
+
+function taskString(t: ModelTask): string {
+    if (t === ModelTask.WAKE) return 'wake';
+    else if (t === ModelTask.TOKENIZE) return 'tokenization';
+    else return 'completions';
 }
 
 export class Planner {
@@ -116,20 +129,18 @@ export class Planner {
         this.#startIdleTimer();
     }
 
-    async serveModel(body: unknown, model_name: string, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
+    async serveModel(body: unknown, model_name: string, task: ModelTask, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const model = this.resolve(model_name);
         if (!model) throw new Error(`serveModel: unknown model ${model_name}`);
 
         this.#cancelIdleTimer();
 
         const signal = AbortSignal.any([client_signal, this.shutdown_ctrl.signal]);
-        const t = new Timer(`serveModel: ${model.name}`);
+        const t = new Timer(`serveModel: ${model.name} (task: ${taskString(task)})`);
 
         // stream from model when token requirement is met
-        await this.#withModel(model, body, signal, t, async (t?: Timer) => {
-            // TODO: this timer name is wrong when caller is from tokenize/input_tokens/etc
-            // FIX: allow caller to pass label.
-            t?.start('completions callback');
+        await this.#withModel(model, body, task, signal, t, async (t?: Timer) => {
+            t?.start(`callback (${taskString(task)})`);
             let success = await cb(body, model, signal, false);
             t?.stop();
 
@@ -155,7 +166,7 @@ export class Planner {
                     break;
                 }
 
-                t?.start('completions callback');
+                t?.start(`callback, retry (${taskString(task)})`);
                 success = await cb(body, model, signal, false);
                 t?.stop();
             }
@@ -165,17 +176,26 @@ export class Planner {
         });
     }
 
-    async #withModel<T>(model: ModelEntry, body: unknown, signal: AbortSignal, t: Timer, cb: (t?: Timer) => Promise<T>): Promise<T> {
+    async #withModel<T>(model: ModelEntry, body: unknown, task: ModelTask, signal: AbortSignal, t: Timer, cb: (t?: Timer) => Promise<T>): Promise<T> {
         let handle: ReadHandle;
 
         if (!this.modelIsActive(model)) {
             // load model
             handle = await new Promise((resolve, reject) => {
-                this.waiting_load.push({ model: model.name, body, resolve, reject });
+                this.waiting_load.push({ model: model.name, body, task, resolve, reject });
                 this.#maybeSwap(t.child(`maybeSwap (load)`));
             });
         } else {
             handle = this.#getHandle();
+        }
+
+        // Model is active. Short-circuit depending on task type:
+        if (task === ModelTask.WAKE || task === ModelTask.TOKENIZE) {
+            try {
+                return await cb(t);
+            } finally {
+                handle.release();
+            }
         }
 
         // Model is loaded and we have a read handle - count tokens
@@ -358,21 +378,31 @@ export class Planner {
 
         const to_flush: Waiter[] = [];
         const fulfill: Waiter[] = [];
+        const flush = (waiters: Waiter[]): void => {
+            for (const waiter of waiters) {
+                waiter.resolve(this.#getHandle());
+            }
+        };
+
+        const still_waiting: Waiter[] = [];
+        for (const w of this.waiting_load) {
+            if (w.model === target.name) {
+                to_flush.push(w);
+            } else {
+                still_waiting.push(w);
+            }
+        }
+
+        this.waiting_load = still_waiting;
+
+        // handle case where a swap request comes in when a reload is pending
+        if (this.modelIsActive(target)) {
+            flush(to_flush);
+            return;
+        }
 
         const handle = this.#getHandle();
         await handle.write(async () => {
-            // filter out load requests that want the head model
-            const still_waiting: Waiter[] = [];
-            for (const w of this.waiting_load) {
-                if (w.model === target.name) {
-                    to_flush.push(w);
-                } else {
-                    still_waiting.push(w);
-                }
-            }
-
-            this.waiting_load = still_waiting;
-
             // unload any other active models
             await this.#unloadAllModels(true, target.name, t?.child(`unloadAllModels`));
 
@@ -398,6 +428,12 @@ export class Planner {
             // count tokens and get minimum rung to satisfy all requests
             let rung_needed = 0;
             for (const waiter of to_flush) {
+                // don't need model at a specific rung for these tasks
+                if (waiter.task === ModelTask.WAKE || waiter.task === ModelTask.TOKENIZE) {
+                    fulfill.push(waiter);
+                    continue;
+                }
+
                 const tokens_in = await target.countTokens(waiter.body, signal, t);
                 if (tokens_in === null) {
                     waiter.reject(`failed to count tokens for request`);
@@ -420,10 +456,7 @@ export class Planner {
             this.active.model = target.name;
             this.weights_only.delete(target.name);
 
-            // resolve requests
-            for (const waiter of fulfill) {
-                waiter.resolve(this.#getHandle());
-            }
+            flush(fulfill);
         }).catch((err) => {
             // reject requests
             for (const waiter of to_flush) {

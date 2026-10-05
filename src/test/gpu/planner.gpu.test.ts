@@ -10,7 +10,7 @@ import type { LlamaAPI } from '../../client/llama-api.js';
 import { RouterProcess } from '../../client/router-process.js';
 import type { SlotRestore } from '../../client/types.js';
 import { ModelEntry } from '../../planner/model-entry.js';
-import { Planner } from '../../planner/planner.js';
+import { ModelTask, Planner } from '../../planner/planner.js';
 import { createStrategies } from '../../planner/strategies/index.js';
 import type { StrategyImpl } from '../../planner/types.js';
 import { walkBreakpoints } from '../../show-breakpoints.js';
@@ -152,7 +152,7 @@ let iter = 0;
 
 async function serve(planner: Planner, model: ModelEntry, messages: { role: string; content: string }[], min_ctx?: number): Promise<void> {
     const body = { model: model.name, messages, stream: false, max_tokens: 32, temperature: 0 };
-    await planner.serveModel(body, model.name, new AbortController().signal, async (_body, model, signal, isFinal) => {
+    await planner.serveModel(body, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async (_body, model, signal, isFinal) => {
         iter++;
         if (iter > 10) throw new Error(`max iter reached`);
         console.log(`${model.name} is at ctx: ${model.getCurCtx()}`);
