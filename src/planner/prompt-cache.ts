@@ -111,7 +111,10 @@ export class PromptCache {
 
                     // check that the file is not over budget on its own
                     const bytes = this.#getFileBytes(filename);
-                    if (saved.n_saved === 0 || bytes > this.budget_bytes) {
+                    if (saved.n_saved === 0) {
+                        await this.#deleteFiles(filename);
+                        continue;
+                    } else if (bytes > this.budget_bytes) {
                         await this.#deleteFiles(filename);
                         log.info(`${model.name}: slot save ${filename} exceeds total budget; skipping | size: ${fmtBytes(bytes)} | budget: ${fmtBytes(this.budget_bytes)}`);
                         continue;
