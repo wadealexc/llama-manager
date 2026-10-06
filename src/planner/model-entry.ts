@@ -161,24 +161,14 @@ export class ModelEntry {
     // save active slots to cache
     async saveSlots(signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status !== LoadStatus.LOADED || !this.cache) return;
-        t?.start('saveSlots');
-        try {
-            await this.cache.save(this, signal);
-        } finally {
-            t?.stop();
-        }
+        await this.cache.save(this, signal, t);
     }
 
     // restore prompts from cache into live slot state
     async restorePrompts(prompts: PromptMetadata[], signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status !== LoadStatus.LOADED) return;
         this.needs_restore = false;
-        t?.start('restorePrompts');
-        try {
-            await this.cache?.restore(this, prompts, signal);
-        } finally {
-            t?.stop();
-        }
+        await this.cache?.restore(this, prompts, signal, t);
     }
 
     async completions(body: unknown, signal: AbortSignal, t?: Timer): Promise<Response> {

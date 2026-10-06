@@ -4,6 +4,7 @@ import type { PromptMetadata, Slot, SlotSave } from '../client/types.js';
 import { hasMmproj, type ModelState } from '../config/types.js';
 import { logger } from '../logger.js';
 import type { ModelEntry } from './model-entry.js';
+import { Timer } from './timer.js';
 
 const log = logger.withTag('prompt-cache');
 
@@ -77,7 +78,7 @@ export class PromptCache {
     // NOTE: saving is provisional. we assume saves might push us over budget,
     // and rely on restore and subsequent calls to enforce to ensure we come back
     // under budget.
-    async save(model: ModelEntry, signal: AbortSignal): Promise<void> {
+    async save(model: ModelEntry, signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.stopped || this.budget_bytes === 0) return;
 
         await this.#queue(async () => {
@@ -152,13 +153,13 @@ export class PromptCache {
                     log.warn(`${model.name}: slot save ${filename} failed: ${err} | ${this.#sizeLabel()}`);
                 }
             }
-        });
+        }, t, 'saveSlots');
     }
 
     // Restore slots from the cache that best match the given prompts
     //
     // NOTE: Method assumes it is being called inside planner's write lock
-    async restore(model: ModelEntry, prompts: PromptMetadata[], signal: AbortSignal): Promise<void> {
+    async restore(model: ModelEntry, prompts: PromptMetadata[], signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.stopped || this.budget_bytes === 0) return;
 
         await this.#queue(async () => {
@@ -232,11 +233,17 @@ export class PromptCache {
                     log.warn(`${model.name}: restore ${entry.filename} failed: ${err} | ${this.#sizeLabel()}`);
                 }
             }
-        });
+        }, t, 'restorePrompts');
     }
 
-    async enforce(): Promise<void> {
-        await this.#queue(() => this.#enforceBudget());
+    async enforce(t?: Timer): Promise<void> {
+        const own_timer = t === undefined;
+        const timer = t ?? new Timer('prompt-cache enforcement');
+        try {
+            await this.#queue(() => this.#enforceBudget(), timer, 'enforceBudget');
+        } finally {
+            if (own_timer) log.info(timer.fmt());
+        }
     }
 
     bytesUsed(): number {
@@ -244,9 +251,15 @@ export class PromptCache {
             .reduce((total, bytes) => total + bytes, 0);
     }
 
-    async #queue(cb: () => Promise<void>): Promise<void> {
-        const pending = this.pending.then(cb)
-            .catch(err => log.warn(`cache operation failed: ${err} | ${this.#sizeLabel()}`));
+    async #queue(cb: () => Promise<void>, t?: Timer, label: string = 'cache'): Promise<void> {
+        const pending = this.pending.then(async () => {
+            t?.start(label);
+            try {
+                await cb();
+            } finally {
+                t?.stop();
+            }
+        }).catch(err => log.warn(`cache operation failed: ${err} | ${this.#sizeLabel()}`));
 
         this.pending = pending;
         await pending;

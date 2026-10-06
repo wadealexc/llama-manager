@@ -575,11 +575,15 @@ export class Planner {
 
         log.info(`idle timeout reached; unloading all models`);
 
+        const t = new Timer('idle unload');
         const handle = this.#getHandle();
         await handle.write(async () => {
-            await this.#unloadAllModels(true);
-            await this.cache.enforce();
-        }).finally(() => handle.release());
+            await this.#unloadAllModels(true, undefined, t.child('unloadAllModels'));
+            await this.cache.enforce(t);
+        }).finally(() => {
+            handle.release();
+            print(t);
+        });
     }
 
     #isIdle(): boolean {
