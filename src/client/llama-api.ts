@@ -33,7 +33,7 @@ export class LlamaAPI {
         });
     }
 
-    async countTokens(body: unknown, model: ModelId, signal?: AbortSignal): Promise<number> {
+    async renderPrompt(body: unknown, model: ModelId, signal?: AbortSignal): Promise<InputTokensResponse> {
         const url = this.#buildURL('/v1/chat/completions/input_tokens');
 
         const res = await fetch(url, {
@@ -48,7 +48,7 @@ export class LlamaAPI {
             throw new HttpError('POST /v1/chat/completions/input_tokens', msg, res.status);
         }
 
-        return (await res.json() as InputTokensResponse).input_tokens;
+        return await res.json() as InputTokensResponse;
     }
 
     async getSlots(model: ModelId, signal?: AbortSignal): Promise<Slot[]> {
@@ -68,47 +68,41 @@ export class LlamaAPI {
         return await res.json() as Slot[];
     }
 
+    async saveSlot(model: ModelId, slot_id: number, filename: string, signal?: AbortSignal): Promise<SlotSave> {
+        const slot_url = this.#buildURL(`/slots/${slot_id}`) + '?action=save';
+        const res = await fetch(slot_url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ filename, model }),
+            signal,
+        });
+        if (!res.ok) {
+            throw new HttpError('POST /slots?action=save', await res.text(), res.status);
+        }
+        return await res.json() as SlotSave;
+    }
+
     async saveAllSlots(model: ModelId, basename: string, signal?: AbortSignal): Promise<SlotSave[]> {
         const slots = await this.getSlots(model, signal);
+        return await Promise.all(slots.map(slot => this.saveSlot(model, slot.id, `${basename}-${slot.id}.bin`, signal)));
+    }
 
-        return await Promise.all(slots.map(async (slot) => {
-            const filename = `${basename}-${slot.id}.bin`;
-            const slot_url = this.#buildURL(`/slots/${slot.id}`) + '?action=save';
-
-            const res = await fetch(slot_url, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ filename, model: model }),
-                signal,
-            });
-
-            if (!res.ok) {
-                const msg = await res.text();
-                throw new HttpError('POST /slots?action=save', msg, res.status);
-            }
-
-            return await res.json() as SlotSave; 
-        }));
+    async restoreSlot(model: ModelId, slot_id: number, filename: string, signal?: AbortSignal): Promise<SlotRestore> {
+        const slot_url = this.#buildURL(`/slots/${slot_id}`) + '?action=restore';
+        const res = await fetch(slot_url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ filename, model }),
+            signal,
+        });
+        if (!res.ok) {
+            throw new HttpError('POST /slots?action=restore', await res.text(), res.status);
+        }
+        return await res.json() as SlotRestore;
     }
 
     async restoreAllSlots(model: ModelId, saves: SlotSave[], signal?: AbortSignal): Promise<SlotRestore[]> {
-        return await Promise.all(saves.map(async (save) => {
-            const slot_url = this.#buildURL(`/slots/${save.id_slot}`) + '?action=restore';
-
-            const res = await fetch(slot_url, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ filename: save.filename, model: model }),
-                signal,
-            });
-
-            if (!res.ok) {
-                const msg = await res.text();
-                throw new HttpError('POST /slots?action=restore', msg, res.status);
-            }
-
-            return await res.json() as SlotRestore; 
-        }));
+        return await Promise.all(saves.map(save => this.restoreSlot(model, save.id_slot, save.filename, signal)));
     }
 
     async reloadModel(params: ReloadParams, model: ModelId, signal?: AbortSignal): Promise<number> {

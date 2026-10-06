@@ -34,6 +34,7 @@ Flags:
     (steps: disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4, swap-model:<name>)
   --model-variant <n=path>   local GGUF weight variant for single-model mode (repeatable)
   --slot-save-path <path>    directory for kvcache save/restore files
+  --cache-disk-mib <n>       global prompt cache budget in MiB (default: 16384; 0 disables)
   --bin <path>               path to the llama-server binary
   --config <path>            supply a config file. router mode reads models from it;
                              single model mode takes all settings but ignores model entries

@@ -55,6 +55,7 @@ if (models.size === 0) {
 }
 
 planner = new Planner(llama_api, config, models);
+await planner.cache.start();
 api = new ApiServer(planner, config);
 
 // if `--calc-breakpoints`, load each model and pretty-print strategy breakpoints on startup

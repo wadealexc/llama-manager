@@ -11,8 +11,9 @@ import { buildConfig } from '../../config/build.js';
 import { parseArgs } from '../../config/parser.js';
 import { RouterProcess } from '../../client/router-process.js';
 import { ModelEntry } from '../../planner/model-entry.js';
-import { Planner } from '../../planner/planner.js';
+import { Planner, type PlannerResult } from '../../planner/planner.js';
 import { createStrategies } from '../../planner/strategies/index.js';
+import { GpuTestResources } from './resources.js';
 
 function requiredPath(key: string): string {
     const value = process.env[key]?.trim();
@@ -38,7 +39,7 @@ type UpstreamAttempt = {
 type CallbackAttempt = {
     rung: number;
     is_final: boolean;
-    success: boolean;
+    result: PlannerResult['kind'];
 };
 
 function parseFrames(text: string): StreamFrame[] {
@@ -58,7 +59,7 @@ function finishReasons(frames: StreamFrame[]): string[] {
     return frames.flatMap(frame => frame.choices?.flatMap(choice => choice.finish_reason ? [choice.finish_reason] : []) ?? []);
 }
 
-async function findBody(model: ModelEntry, base: Record<string, unknown>, payload: string, margin: number): Promise<{ body: CompletionRequest; tokens: number }> {
+async function findBody(model: ModelEntry, base: Record<string, unknown>, payload: string, margin: number, signal: AbortSignal): Promise<{ body: CompletionRequest; tokens: number }> {
     const target = 1024 - margin;
     let low = 0;
     let high = target * 2;
@@ -70,7 +71,7 @@ async function findBody(model: ModelEntry, base: Record<string, unknown>, payloa
             ...base,
             messages: [{ role: 'user', content: `Ignore this context filler: ${'hello '.repeat(mid)}\nUse the record_text tool to record this exact text without summarizing or shortening it: ${payload}` }],
         };
-        const tokens = await model.countTokens(body, new AbortController().signal);
+        const tokens = await model.countTokens(body, signal);
         assert.ok(tokens !== null, `countTokens failed for model: ${model.name}`);
         if (tokens <= target) {
             best = { body, tokens };
@@ -103,6 +104,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
     const artifacts_dir = join(root, 'logs', 'gpu-tests');
     await mkdir(artifacts_dir, { recursive: true });
     const directory = await mkdtemp(join(artifacts_dir, 'tool-continuation-'));
+    const resources = new GpuTestResources(directory);
     const config_path = join(directory, 'config.yaml');
     const preset_path = join(directory, 'preset.ini');
     const trace_path = join(directory, 'trace.json');
@@ -140,6 +142,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         config.sleep_idle_seconds = 0;
         config.port = 0;
         router = new RouterProcess(config.router, config.model_load);
+        resources.trackRouter(router);
         const client = await router.start(preset_path);
         const model_cfg = config.models[config.default_model];
         assert.ok(model_cfg);
@@ -154,7 +157,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
             strategies,
         );
         const rungs = entry.ladder;
-        const signal = new AbortController().signal;
+        const signal = resources.signal;
         await entry.loadWeights(signal);
         await entry.applyRung(0, signal);
         await entry.applyNextRung(signal);
@@ -162,12 +165,13 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         assert.ok(rungs[1].n_ctx_cap > 2048, `q8 rung needs enough room to complete a tool call: ${rungs[1].n_ctx_cap}`);
         await entry.unloadHard();
         await entry.loadWeights(signal);
-        await entry.moveToRung(0, signal);
+        await entry.applyRung(0, signal);
         entry.n_ctx = await client.reloadModel({ ...entry.paramsForRung(0), n_ctx: 1024 }, entry.name, signal);
         rungs[0].n_ctx_cap = (await entry.getSlots(signal))[0].n_ctx;
         assert.equal(rungs[0].n_ctx_cap, 1024);
 
         planner = new Planner(client, config, new Map([[entry.name, entry]]));
+        resources.trackPlanner(planner);
         const memory = await entry.getMemory(signal);
         const gpu = memory.devices.find(device => device.type !== 'cpu');
         assert.ok(gpu, 'no GPU memory reported');
@@ -190,12 +194,13 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         const serve_model = planner.serveModel.bind(planner);
         planner.serveModel = async (body, model, task, client_signal, cb) => serve_model(body, model, task, client_signal, async (request_body, request_client, request_signal, is_final) => {
             const rung = entry.ladder_i;
-            const success = await cb(request_body, request_client, request_signal, is_final);
-            current_attempt?.callbacks.push({ rung, is_final, success });
-            return success;
+            const result = await cb(request_body, request_client, request_signal, is_final);
+            current_attempt?.callbacks.push({ rung, is_final, result: result.kind });
+            return result;
         });
 
         api = new ApiServer(planner, config);
+        resources.trackApi(api);
         await api.start();
         const server = api.server!;
         if (!server.listening) await once(server, 'listening');
@@ -226,9 +231,13 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
 
         let covered = false;
         for (const margin of [96, 128, 160, 224, 64]) {
-            if (entry.ladder_i !== 0) await entry.moveToRung(0, signal);
+            if (entry.ladder_i !== 0) {
+                await entry.saveSlots(signal);
+                await entry.applyRung(0, signal);
+                await planner.cache.enforce();
+            }
             entry.n_ctx = await client.reloadModel({ ...entry.paramsForRung(0), n_ctx: 1024 }, entry.name, signal);
-            const { body, tokens } = await findBody(entry, base, payload, margin);
+            const { body, tokens } = await findBody(entry, base, payload, margin, signal);
             assert.ok(tokens < rungs[0].n_ctx_cap);
             const attempt = { margin, tokens, upstream: [] as UpstreamAttempt[], callbacks: [] as CallbackAttempt[], outward_status: 0, outward_text: '' };
             attempts.push(attempt);
@@ -238,6 +247,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify(body),
+                signal,
             });
             attempt.outward_status = response.status;
             attempt.outward_text = await response.text();
@@ -256,9 +266,9 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
 
             assert.equal(response.status, 200, attempt.outward_text);
             assert.equal(attempt.callbacks[0]?.rung, 0);
-            assert.equal(attempt.callbacks[0]?.success, false);
+            assert.equal(attempt.callbacks[0]?.result, 'grow');
             assert.equal(attempt.callbacks[1]?.rung, 1);
-            assert.equal(attempt.callbacks[1]?.success, true);
+            assert.equal(attempt.callbacks[1]?.result, 'done');
             assert.ok(attempt.callbacks.every(call => !call.is_final));
             assert.ok(!second.body.messages.at(-1)?.tool_calls, 'partial tool calls were included in the continuation request');
             assert.equal(second.body.tool_choice, 'required');
@@ -294,9 +304,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         succeeded = true;
     } finally {
         try {
-            await api?.shutdown();
-            await planner?.shutdown();
-            await router?.shutdown();
+            await resources.shutdown();
         } catch (err) {
             succeeded = false;
             throw err;

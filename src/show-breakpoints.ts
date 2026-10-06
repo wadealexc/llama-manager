@@ -2,8 +2,6 @@ import type { LlamaAPI } from "./client/llama-api.js";
 import { LoadStatus, type ManagerConfig, type ModelId } from "./config/types.js";
 import type { ModelEntry } from "./planner/model-entry.js";
 import type { MemoryResponse } from "./client/types.js";
-import { readdir, unlink } from "node:fs/promises";
-import { join } from "node:path";
 import { logger } from "./logger.js";
 import type { ConsolaInstance } from "consola";
 import type { Timer } from "./planner/timer.js";
@@ -141,10 +139,6 @@ export async function showBreakpoints(
         }
     }
 
-    await cleanupSlots(config.router.slot_save_path).catch(err => {
-        log.warn(`cleanupSlots error: ${err}`);
-    });
-
     printBreakpoints(results);
 }
 
@@ -250,16 +244,4 @@ export function printModelBreakpoints(model: ModelBreakpoints): string {
 
 function fmtNum(n: number): string {
     return n.toLocaleString("en-US");
-}
-
-async function cleanupSlots(dir: string): Promise<void> {
-    let names: string[];
-    try {
-        names = await readdir(dir);
-    } catch {
-        return;
-    }
-
-    const targets = names.filter(n => n.endsWith('.bin') || n.endsWith('.ckpt'));
-    await Promise.allSettled(targets.map(n => unlink(join(dir, n))));
 }

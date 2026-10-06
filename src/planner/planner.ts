@@ -2,17 +2,20 @@ import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
 import { LoadStatus, type ManagerConfig, type ModelId } from "../config/types.js";
 import { logger } from "../logger.js";
-import { readdir, unlink } from "node:fs/promises";
-import { join } from "node:path";
 import { Timer } from "./timer.js";
 import type { ModelEntry } from "./model-entry.js";
-import type { MemoryResponse } from "../client/types.js";
+import type { InputTokensResponse, MemoryResponse, PromptMetadata } from "../client/types.js";
+import { PromptCache } from "./prompt-cache.js";
 import { printModelBreakpoints, walkBreakpoints } from "../show-breakpoints.js";
 
 
 const log: ConsolaInstance = logger.withTag('planner');
 
-type PlannerCallback = (body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => Promise<boolean>;
+export type PlannerResult =
+    | { kind: 'done' }
+    | { kind: 'grow'; body: unknown };
+
+type PlannerCallback = (body: unknown, model: ModelEntry, signal: AbortSignal, isFinal: boolean) => Promise<PlannerResult>;
 
 type ActiveState = {
     pending: boolean;
@@ -21,6 +24,7 @@ type ActiveState = {
 }
 
 type ReadHandle = {
+    prompt?: InputTokensResponse;
     exclusive(): boolean;
     write(cb: () => Promise<void>): Promise<void>;
     release(): void;
@@ -28,6 +32,7 @@ type ReadHandle = {
 
 type PausedReader = {
     min_ctx: number;
+    prompt: PromptMetadata;
     resolve(): void;
     reject(err?: any): void;
 }
@@ -36,6 +41,7 @@ type Waiter = {
     model: ModelId;
     body: unknown;
     task: ModelTask;
+    prompt?: InputTokensResponse;
     resolve: (handle: ReadHandle) => void;
     reject: (reason: any) => void;
 }
@@ -64,6 +70,7 @@ export class Planner {
 
     models: Map<ModelId, ModelEntry> = new Map();
     bytes_needed_min: Map<ModelId, number> = new Map();
+    cache: PromptCache;
 
     active: ActiveState = {
         pending: false,
@@ -87,6 +94,10 @@ export class Planner {
         this.client = client;
         this.config = config;
         this.models = models;
+        this.cache = new PromptCache(config.router.slot_save_path, config.cache_disk_mib);
+        for (const model of models.values()) {
+            model.cache = this.cache;
+        }
     }
 
     // Note: not intended to be called twice
@@ -114,7 +125,7 @@ export class Planner {
         console.log(printModelBreakpoints(breakpoints));
 
         log.info(`serveDefault: loading kvcache for ${model.name}`);
-        const n_ctx = await model.moveToRung(0, this.shutdown_ctrl.signal, t?.child(`moveToRung(0)`));
+        const n_ctx = await model.applyRung(0, this.shutdown_ctrl.signal, t?.child(`applyRung(0)`));
         log.info(`serving ${model.name} with a context window of ${n_ctx} tokens`);
 
         await this.#updateMemory(model);
@@ -132,6 +143,7 @@ export class Planner {
     async serveModel(body: unknown, model_name: string, task: ModelTask, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const model = this.resolve(model_name);
         if (!model) throw new Error(`serveModel: unknown model ${model_name}`);
+        this.shutdown_ctrl.signal.throwIfAborted();
 
         this.#cancelIdleTimer();
 
@@ -140,35 +152,32 @@ export class Planner {
 
         // stream from model when token requirement is met
         await this.#withModel(model, body, task, signal, t, async (t?: Timer) => {
-            t?.start(`callback (${taskString(task)})`);
-            let success = await cb(body, model, signal, false);
-            t?.stop();
+            let current_body = body;
+            while (true) {
+                t?.start(`callback (${taskString(task)})`);
+                const result = await cb(current_body, model, signal, false);
+                t?.stop();
+                if (result.kind === 'done') return;
 
-            // failure indicates the response was truncated and we need to increase the ctx window
-            while (!success) {
                 try {
-                    // cur_ctx + 1 will ensure we free up memory by evicting models/applying strats
-                    const cur_ctx = model.getCurCtx();
-                    const min_ctx = cur_ctx + 1;
+                    const prompt = await model.renderPrompt(result.body, signal, t);
+                    if (!prompt) throw new Error('unable to render continuation prompt');
+                    const min_ctx = Math.max(model.getCurCtx() + 1, prompt.input_tokens);
 
                     if (model.getMinimumRung(min_ctx) === null) {
-                        throw new Error(`unable to increase context window for ${model.name} (cur: ${cur_ctx})`);
+                        throw new Error(`unable to increase context window for ${model.name} (cur: ${model.getCurCtx()})`);
                     }
 
-                    // queue model reload
                     await new Promise<void>((resolve, reject) => {
-                        this.waiting_reload.push({ min_ctx, resolve, reject });
+                        this.waiting_reload.push({ min_ctx, prompt, resolve, reject });
                         this.#maybeReload(t);
                     });
                 } catch {
-                    // if unable to grow, inform via callback
-                    success = await cb(body, model, signal, true);
-                    break;
+                    await cb(current_body, model, signal, true);
+                    return;
                 }
 
-                t?.start(`callback, retry (${taskString(task)})`);
-                success = await cb(body, model, signal, false);
-                t?.stop();
+                current_body = result.body;
             }
         }).finally(() => {
             print(t);
@@ -201,12 +210,15 @@ export class Planner {
         // Model is loaded and we have a read handle - count tokens
         let tokens_in;
         let rung;
+        let prompt: InputTokensResponse;
         try {
-            tokens_in = await model.countTokens(body, signal, t);
-            if (tokens_in === null) {
+            const rendered = handle.prompt ?? await model.renderPrompt(body, signal, t);
+            if (rendered === null) {
                 throw new Error(`#withModel: failed to count tokens for request to model ${model.name}`);
             }
 
+            prompt = rendered;
+            tokens_in = prompt.input_tokens;
             rung = model.getMinimumRung(tokens_in);
             if (rung === null) {
                 throw new Error(`#withModel: model ${model.name} cannot serve request (tokens_in: ${tokens_in} | max capacity: ${model.getMaxCtx()})`);
@@ -239,11 +251,21 @@ export class Planner {
 
                 // capacity change needed: reload model before serving
                 await new Promise<void>((resolve, reject) => {
-                    this.waiting_reload.push({ min_ctx: tokens_in, resolve, reject });
+                    this.waiting_reload.push({ min_ctx: tokens_in, prompt, resolve, reject });
                     this.#maybeReload(t);
                 });
             }
 
+            // if model still needs a cache restore, do it here if possible
+            if (model.needs_restore) {
+                if (handle.exclusive()) {
+                    await handle.write(async () => {
+                        await model.restorePrompts([prompt], signal, t);
+                    });
+                } else {
+                    model.needs_restore = false;
+                }
+            }
             return await cb(t);
         } finally {
             handle.release();
@@ -325,11 +347,14 @@ export class Planner {
 
             if (fulfill.length === 0) return;
 
+            // unload unrelated models and save live model's slots
             await this.#unloadAllModels(true, model.name, t?.child(`unloadAllModels`));
+            await model.saveSlots(signal, t);
 
+            // apply desired rung, retrying if ctx did not increase beyond the minimum needed
             let cur_ctx = model.getCurCtx();
             while (true) {
-                await model.moveToRung(rung_needed, signal, t.child(`moveToRung(${rung_needed})`));
+                await model.applyRung(rung_needed, signal, t.child(`applyRung(${rung_needed})`));
                 await this.#updateMemory(model);
 
                 cur_ctx = model.getCurCtx();
@@ -339,13 +364,21 @@ export class Planner {
                 rung_needed++;
             }
 
+            // restore model slots based on waiting prompts
+            const prompts = fulfill.filter(waiter => cur_ctx >= waiter.min_ctx).map(waiter => waiter.prompt);
+            await model.restorePrompts(prompts, signal, t);
+            
+            // enforce prompt cache budget
+            this.cache.enforce();
+
+            // flush waiters; continue generation
             for (const waiter of fulfill) {
                 if (cur_ctx >= waiter.min_ctx) {
                     waiter.resolve();
                 } else {
                     waiter.reject(`unable to expand to ctx ${waiter.min_ctx} (actual ctx: ${cur_ctx})`);
                 }
-            }
+            }            
         }).catch((err) => {
             // reject requests
             for (const waiter of waiting_reload) {
@@ -380,7 +413,9 @@ export class Planner {
         const fulfill: Waiter[] = [];
         const flush = (waiters: Waiter[]): void => {
             for (const waiter of waiters) {
-                waiter.resolve(this.#getHandle());
+                const reader = this.#getHandle();
+                reader.prompt = waiter.prompt;
+                waiter.resolve(reader);
             }
         };
 
@@ -414,7 +449,7 @@ export class Planner {
                 const breakpoints = await walkBreakpoints(this.client, target, signal, t?.child(`walkBreakpoints`));
                 console.log(printModelBreakpoints(breakpoints));
 
-                await target.moveToRung(0, signal, t?.child(`moveToRung(0)`));
+                await target.applyRung(0, signal, t?.child(`applyRung(0)`));
                 await this.#updateMemory(target);
             }
 
@@ -434,12 +469,14 @@ export class Planner {
                     continue;
                 }
 
-                const tokens_in = await target.countTokens(waiter.body, signal, t);
-                if (tokens_in === null) {
+                const prompt = await target.renderPrompt(waiter.body, signal, t);
+                if (prompt === null) {
                     waiter.reject(`failed to count tokens for request`);
                     continue;
                 }
 
+                waiter.prompt = prompt;
+                const tokens_in = prompt.input_tokens;
                 const min_rung = target.getMinimumRung(tokens_in);
                 if (min_rung === null) {
                     waiter.reject(`unable to serve at ctx ${tokens_in}`);
@@ -450,8 +487,19 @@ export class Planner {
                 fulfill.push(waiter);
             }
 
-            await target.moveToRung(rung_needed, signal, t.child(`moveToRung`));
+            await target.applyRung(rung_needed, signal, t.child(`applyRung`));
             await this.#updateMemory(target);
+
+            // restore model slots based on waiting prompts
+            const prompts = fulfill.flatMap(waiter => waiter.prompt ? [waiter.prompt] : []);
+            if (prompts.length) {
+                await target.restorePrompts(prompts, signal, t);
+            } else {
+                target.needs_restore = true;
+            }
+
+            // enforce prompt cache budget
+            this.cache.enforce();
 
             this.active.model = target.name;
             this.weights_only.delete(target.name);
@@ -465,20 +513,20 @@ export class Planner {
 
             // re-throw
             throw new Error(`maybeSwap: error swapping model: ${err}`);
-        }).finally(() => {
-            handle.release();
-        });
+        }).finally(() => handle.release());
     }
 
     async shutdown(): Promise<void> {
         this.#cancelIdleTimer();
 
         const t = new Timer(`Planner.shutdown`);
+        this.shutdown_ctrl.abort('shutdown request received');
+        t.start('cache shutdown');
+        await this.cache.shutdown();
+        t.stop();
 
         t.start('unloadAllModels');
-        await this.#unloadAllModels(false).catch(err => {
-            log.warn(`shutdown: unloadAllModels error: ${err}`);
-        });
+        await Promise.allSettled([...this.models.values()].map(model => model.unloadHard(t)));
         t.stop();
 
         t.start(`cancel ${this.waiting_load.length} load jobs`);
@@ -495,13 +543,6 @@ export class Planner {
         }
         t.stop();
 
-        t.start(`cleanupSlots`);
-        await this.#cleanupSlots().catch(err => {
-            log.warn(`shutdown: cleanupSlots error: ${err}`);
-        });
-        t.stop();
-
-        this.shutdown_ctrl.abort('shutdown request received');
         log.info(`shutdown: done`);
     }
 
@@ -537,6 +578,7 @@ export class Planner {
         const handle = this.#getHandle();
         await handle.write(async () => {
             await this.#unloadAllModels(true);
+            await this.cache.enforce();
         }).finally(() => handle.release());
     }
 
@@ -547,21 +589,6 @@ export class Planner {
             || this.waiting_load.length !== 0
             || this.waiting_reload.length !== 0
         );
-    }
-
-    async #cleanupSlots(): Promise<void> {
-        const dir = this.config.router.slot_save_path;
-        let names: string[];
-        try {
-            names = await readdir(dir);
-        } catch (err: any) {
-            log.warn(`#cleanupSlots: failed to read ${dir}: ${err}`);
-            return;
-        }
-
-        const targets = names.filter(n => n.endsWith('.bin') || n.endsWith('.ckpt'));
-
-        await Promise.allSettled(targets.map(n => unlink(join(dir, n))));
     }
 
     async #unloadAllModels(stash_kv: boolean, exclude?: ModelId, t?: Timer): Promise<void> {
@@ -618,7 +645,6 @@ export class Planner {
             const mem = await model.getMemory(this.shutdown_ctrl.signal);
             const bytes_used = calcTotalBytesForModel(mem);
 
-            // unload model and update restore point, if created
             await model.unloadWeights(this.shutdown_ctrl.signal, t);
 
             // remove model from tracking

@@ -1,6 +1,7 @@
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 8080;
 export const DEFAULT_SLEEP_IDLE_SECONDS = 600;
+export const DEFAULT_CACHE_DISK_MIB = 16384;
 
 export const DEFAULT_LOG_DIR = './logs/';
 export const DEFAULT_SLOT_SAVE_DIR = './slots/';

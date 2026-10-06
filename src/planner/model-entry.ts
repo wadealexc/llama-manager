@@ -1,11 +1,12 @@
 import type { ConsolaInstance } from "consola";
 import type { LlamaAPI } from "../client/llama-api.js";
-import type { MemoryResponse, ReloadParams, Slot, SlotSave } from "../client/types.js";
+import type { InputTokensResponse, MemoryResponse, PromptMetadata, ReloadParams, Slot, SlotRestore, SlotSave } from "../client/types.js";
 import { LoadStatus, type ModelId, type ModelState, type Strategy, type StrategyId, type Tokens } from "../config/types.js";
 import { MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { logger } from "../logger.js";
 import { Timer } from "./timer.js";
 import type { StrategyImpl } from "./types.js";
+import { isValid, type PromptCache } from "./prompt-cache.js";
 
 export interface Rung {
     strategy: StrategyId | 'swap-model' | 'baseline';
@@ -14,7 +15,6 @@ export interface Rung {
     state: ModelState;
     n_ctx_cap: Tokens;
     bytes_needed: number;
-    last_slots?: SlotSave[];
 }
 
 export class ModelEntry {
@@ -30,6 +30,8 @@ export class ModelEntry {
     ladder_i: number = -1;
     n_ctx: number = 0;
     status: LoadStatus = LoadStatus.UNLOADED;
+    cache?: PromptCache;
+    needs_restore: boolean = false;
 
     // TODO: clean up first-load semantics
     bytes_needed_no_kv?: number;
@@ -79,31 +81,11 @@ export class ModelEntry {
         this.#setWeightsOnly();
     }
 
-    async moveToRung(rung_i: number, signal: AbortSignal, t?: Timer): Promise<number> {
-        if (this.status === LoadStatus.UNLOADED) throw new Error(`moveToRung: model must be loaded`);
-        if (!this.hasRung(rung_i)) throw new Error(`moveToRung: rung index out of bounds`);
-
-        const cur_i = this.ladder_i;
-        this.#logTransition(rung_i);
-
-        // create a restore point at the current rung
-        await this.#createRestorePoint(signal, t);
-
-        await this.#applyRung(rung_i, signal, t);
-
-        // if we're increasing the rung or keeping the current rung, retain live kvcache
-        // otherwise, restore kvcache at new rung
-        const kv_restore_i = (rung_i >= cur_i && cur_i >= 0) ? cur_i : rung_i;
-        await this.#restoreSlots(signal, kv_restore_i, t);
-
-        return this.getCurCtx();
-    }
-
-    // identical to moveToRung, except without creating or using a restore point
     async applyRung(rung_i: number, signal: AbortSignal, t?: Timer): Promise<number> {
         if (this.status === LoadStatus.UNLOADED) throw new Error(`applyRung: model must be loaded`);
         if (!this.hasRung(rung_i)) throw new Error(`applyRung: rung index out of bounds`);
 
+        this.#logTransition(rung_i);
         await this.#applyRung(rung_i, signal, t);
         return this.getCurCtx();
     }
@@ -129,7 +111,7 @@ export class ModelEntry {
             t?.stop();
         }
 
-        const { model_variant, ...state } = structuredClone(dest_state);
+        const { model_variant, ...state } = dest_state;
         const params: ReloadParams = { ...state, n_ctx: 0 };
 
         t?.start('reloadModel');
@@ -143,8 +125,7 @@ export class ModelEntry {
     async unloadKV(signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status !== LoadStatus.LOADED) return;
 
-        // create a restore point at the current rung
-        await this.#createRestorePoint(signal, t);
+        await this.saveSlots(signal, t);
 
         // unload kv
         t?.start('reloadModel');
@@ -154,14 +135,10 @@ export class ModelEntry {
         this.#setWeightsOnly();
     }
 
-    // unload model, saving slots and returning a restore point if model was loaded
     async unloadWeights(signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status === LoadStatus.UNLOADED) return;
 
-        // if model is currently loaded, create restore point
-        if (this.status === LoadStatus.LOADED) {
-            await this.#createRestorePoint(signal, t)
-        }
+        await this.saveSlots(signal, t);
 
         t?.start('unloadModelAndWait');
         await this.client.unloadModelAndWait(this.curVariant());
@@ -181,43 +158,27 @@ export class ModelEntry {
         this.#setUnloaded();
     }
 
-    async #createRestorePoint(signal: AbortSignal, t?: Timer): Promise<void> {
-        if (this.status !== LoadStatus.LOADED) return;
-
-        const path_base = this.#getRestoreName();
-
+    // save active slots to cache
+    async saveSlots(signal: AbortSignal, t?: Timer): Promise<void> {
+        if (this.status !== LoadStatus.LOADED || !this.cache) return;
+        t?.start('saveSlots');
         try {
-            t?.start('saveAllSlots');
-            const slots = await this.client.saveAllSlots(this.curVariant(), path_base, signal);
-            this.ladder[this.ladder_i].last_slots = slots;
-            this.log.info(`saved slots at rung ${this.ladder_i} | ${slots.map(slot => `${slot.id_slot}=${slot.n_saved} tokens`).join(', ')}`);
-        } catch (err) {
-            this.log.error(`error creating restore point: ${err}`);
+            await this.cache.save(this, signal);
         } finally {
             t?.stop();
         }
     }
 
-    async #restoreSlots(signal: AbortSignal, src_rung: number, t?: Timer): Promise<void> {
+    // restore prompts from cache into live slot state
+    async restorePrompts(prompts: PromptMetadata[], signal: AbortSignal, t?: Timer): Promise<void> {
         if (this.status !== LoadStatus.LOADED) return;
-        if (src_rung >= this.ladder.length) throw new Error(`restoreSlots: bad src rung ${src_rung}`);
-
-        const slots = this.ladder[src_rung].last_slots;
-        if (!slots) return;
-
+        this.needs_restore = false;
+        t?.start('restorePrompts');
         try {
-            t?.start('restoreAllSlots');
-            const restored = await this.client.restoreAllSlots(this.curVariant(), slots, signal);
-            this.log.info(`restored rung ${src_rung} slots into rung ${this.ladder_i} | ${restored.map(slot => `${slot.id_slot}=${slot.n_restored} tokens`).join(', ')}`);
-        } catch (err) {
-            this.log.error(`error restoring last slots: ${err}`);
+            await this.cache?.restore(this, prompts, signal);
         } finally {
             t?.stop();
         }
-    }
-
-    #getRestoreName(): string {
-        return `${this.name}-rung-${this.ladder_i}`;
     }
 
     async completions(body: unknown, signal: AbortSignal, t?: Timer): Promise<Response> {
@@ -227,15 +188,33 @@ export class ModelEntry {
     async countTokens(body: unknown, signal: AbortSignal, t?: Timer): Promise<number | null> {
         if (this.status === LoadStatus.UNLOADED) throw new Error(`countTokens: model ${this.name} is not loaded`);
 
-        t?.start('countTokens');
+        return (await this.renderPrompt(body, signal, t))?.input_tokens ?? null;
+    }
+
+    async renderPrompt(body: unknown, signal: AbortSignal, t?: Timer): Promise<InputTokensResponse | null> {
+        if (this.status === LoadStatus.UNLOADED) throw new Error(`renderPrompt: model ${this.name} is not loaded`);
+        t?.start('renderPrompt');
         try {
-            return await this.client.countTokens(body, this.curVariant(), signal);
-        } catch (err: any) {
-            this.log.error(`countTokens error: ${err}`);
+            const prompt = await this.client.renderPrompt(body, this.curVariant(), signal);
+            if (!isValid(prompt) || prompt.tokens.length !== prompt.input_tokens) {
+                this.log.warn('invalid rendered prompt metadata; cache matching disabled for this request');
+                return { ...prompt, tokens: [], media: [] };
+            }
+            return prompt;
+        } catch (err) {
+            this.log.error(`renderPrompt error: ${err}`);
             return null;
         } finally {
             t?.stop();
         }
+    }
+
+    async saveSlot(slot_id: number, filename: string, signal?: AbortSignal): Promise<SlotSave> {
+        return await this.client.saveSlot(this.curVariant(), slot_id, filename, signal);
+    }
+
+    async restoreSlot(slot_id: number, filename: string, signal?: AbortSignal): Promise<SlotRestore> {
+        return await this.client.restoreSlot(this.curVariant(), slot_id, filename, signal);
     }
 
     async getMemory(signal: AbortSignal): Promise<MemoryResponse> {
@@ -275,15 +254,20 @@ export class ModelEntry {
         }
     }
 
+    curState(): ModelState | undefined {
+        if (this.ladder_i < 0) return undefined;
+        else return structuredClone(this.ladder[this.ladder_i].state);
+    }
+
     stateAtRung(i: number): ModelState | undefined {
-        return this.ladder[i]?.state;
+        return structuredClone(this.ladder[i]?.state);
     }
 
     paramsForRung(rung_i: number): ReloadParams | undefined {
         const state = this.ladder[rung_i]?.state;
         if (!state) return undefined;
 
-        const { model_variant, ...rest } = structuredClone(state);
+        const { model_variant, ...rest } = state;
         return {
             ...rest,
             n_ctx: 0,
@@ -345,12 +329,14 @@ export class ModelEntry {
     #setWeightsOnly() {
         this.status = LoadStatus.WEIGHTS_ONLY;
         this.n_ctx = MIN_ALLOWED_CTX;
+        this.needs_restore = true;
     }
 
     #setUnloaded() {
         this.status = LoadStatus.UNLOADED;
         this.n_ctx = 0;
         this.ladder_i = -1;
+        this.needs_restore = false;
     }
 
     #buildLadder(initial_state: ModelState, ladder: Strategy[], strats: Map<StrategyId, StrategyImpl>): Rung[] {

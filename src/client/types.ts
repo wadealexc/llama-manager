@@ -1,4 +1,13 @@
-export interface InputTokensResponse {
+export interface PromptMetadata {
+    tokens: number[];
+    media: { 
+        start: number; 
+        id: string; 
+        n_tokens: number 
+    }[];
+}
+
+export interface InputTokensResponse extends PromptMetadata {
     input_tokens: number;
     object: string;
 }
@@ -112,7 +121,7 @@ export interface Slot {
     }
 }
 
-export interface SlotSave {
+export interface SlotSave extends PromptMetadata {
     id_slot: number;
     filename: string;
     n_saved: number;

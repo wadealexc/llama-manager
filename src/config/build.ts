@@ -4,7 +4,7 @@ import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import type { ConsolaInstance } from "consola";
 import { logger } from "../logger.js";
-import { DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
+import { DEFAULT_CACHE_DISK_MIB, DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
 import { RESERVED_VARIANT_NAMES, STRATEGY_IDS, hasMmproj, isMmprojOnCPU, isSpecEnabled, type ConfigSource, type Strategy, type ManagerConfig, type ModelConfig, type ModelState, type ModelVariant, type RawModel, type StrategyId } from "./types.js";
 import type { ReloadParams, SpeculativeType } from "../client/types.js";
 import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
@@ -26,6 +26,7 @@ const MANAGER_FIELDS = new Set([
     "slot-save-path",
     "model-variants",
     "model-variant",
+    "cache-disk-mib",
 ]);
 
 const SUPPORTED_KV_PRECISION = ['f16', 'q8_0', 'q4_0'];
@@ -128,6 +129,7 @@ export async function buildConfig(
         host: source.host ?? DEFAULT_HOST,
         port: source.port ?? DEFAULT_PORT,
         sleep_idle_seconds: source.sleep_idle_seconds ?? DEFAULT_SLEEP_IDLE_SECONDS,
+        cache_disk_mib: source.cache_disk_mib ?? DEFAULT_CACHE_DISK_MIB,
         model_load: {
             poll_interval_ms: (raw_model_load['poll-interval-ms'] as number) ?? DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS,
             poll_timeout_ms: (raw_model_load['poll-timeout-ms'] as number) ?? DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS,
@@ -172,6 +174,7 @@ function buildSource(parsed: ParsedArgs, default_config_path: string): ConfigSou
             host: parsed.host ?? cfg?.host,
             port: parsed.port ?? cfg?.port,
             sleep_idle_seconds: parsed.sleep_idle_seconds ?? cfg?.sleep_idle_seconds,
+            cache_disk_mib: parsed.cache_disk_mib ?? cfg?.cache_disk_mib,
             default_model: Object.keys(parsed.raw_models ?? {})[0],
             ladder_override: parsed.ladder,
             bin_override: parsed.bin,
@@ -183,6 +186,7 @@ function buildSource(parsed: ParsedArgs, default_config_path: string): ConfigSou
             host: parsed.host ?? cfg.host,
             port: parsed.port ?? cfg.port,
             sleep_idle_seconds: parsed.sleep_idle_seconds ?? cfg.sleep_idle_seconds,
+            cache_disk_mib: parsed.cache_disk_mib ?? cfg.cache_disk_mib,
             ladder_override: parsed.ladder ?? cfg.ladder_override,
             bin_override: parsed.bin ?? cfg.bin_override,
         };

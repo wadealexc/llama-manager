@@ -1,14 +1,16 @@
 import { LlamaAPI } from '../client/llama-api.js';
-import type { MemoryResponse, ReloadParams, Slot, SlotRestore, SlotSave } from '../client/types.js';
+import type { InputTokensResponse, MemoryResponse, PromptMetadata, ReloadParams, Slot, SlotRestore, SlotSave } from '../client/types.js';
 import type { ModelId } from '../config/types.js';
 import { MIN_ALLOWED_CTX } from '../llama-cpp-constants.js';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 export type Operation =
     | { kind: 'load' | 'unload' | 'memory'; model: ModelId }
     | { kind: 'count'; model: ModelId; tokens: number }
     | { kind: 'save'; model: ModelId; basename: string }
     | { kind: 'reload'; model: ModelId; params: ReloadParams }
-    | { kind: 'restore'; model: ModelId; filenames: string[] };
+    | { kind: 'restore'; model: ModelId; filenames: string[]; slot_id?: number };
 
 type Failure = 'save' | 'restore' | 'reload';
 
@@ -25,6 +27,13 @@ export class LlamaAPIMock extends LlamaAPI {
     models: Map<ModelId, ModelRuntime> = new Map();
     total_bytes: number = 32768;
     next_failure?: Failure;
+    slot_directory?: string;
+    save_bytes: number = 32;
+    sidecar_bytes: number = 0;
+    live_metadata: Map<ModelId, PromptMetadata> = new Map();
+    saved_metadata: Map<string, PromptMetadata> = new Map();
+    capacities: Map<ModelId, number> = new Map();
+    slot_ids: number[] = [0];
 
     constructor() {
         super('http://127.0.0.1:0', { poll_interval_ms: 0, poll_timeout_ms: 0 });
@@ -70,7 +79,18 @@ export class LlamaAPIMock extends LlamaAPI {
 
     async getSlots(model: ModelId, _signal?: AbortSignal): Promise<Slot[]> {
         const runtime = this.#requireLoaded(model);
-        return [{ id: 0, n_ctx: runtime.n_ctx, speculative: false, is_processing: false }];
+        return this.slot_ids.map(id => ({ id, n_ctx: runtime.n_ctx, speculative: false, is_processing: false, n_prompt_tokens: id === 0 ? runtime.live_slots.length : 0 }));
+    }
+
+    async renderPrompt(body: unknown, model: ModelId, signal?: AbortSignal): Promise<InputTokensResponse> {
+        const input_tokens = await this.countTokens(body, model, signal);
+        const request = body as { prompt?: number[]; media?: PromptMetadata['media'] };
+        return {
+            input_tokens,
+            object: 'response.input_tokens',
+            tokens: request.prompt ?? Array(input_tokens).fill(1),
+            media: request.media ?? [],
+        };
     }
 
     async countTokens(body: unknown, model: ModelId, _signal?: AbortSignal): Promise<number> {
@@ -83,14 +103,22 @@ export class LlamaAPIMock extends LlamaAPI {
         return tokens;
     }
 
-    async saveAllSlots(model: ModelId, basename: string, _signal?: AbortSignal): Promise<SlotSave[]> {
+    async saveSlot(model: ModelId, slot_id: number, filename: string, _signal?: AbortSignal): Promise<SlotSave> {
         const runtime = this.#requireKV(model);
-        this.#record({ kind: 'save', model, basename });
+        this.#record({ kind: 'save', model, basename: filename.replace(/-\d+\.bin$/, '') });
         this.#maybeFail('save');
-
-        const filename = `${basename}-0.bin`;
+        const metadata = this.live_metadata.get(model) ?? { tokens: runtime.live_slots.map(() => 1), media: [] };
         this.snapshots.set(filename, [...runtime.live_slots]);
-        return [this.#makeSlotSave(filename)];
+        this.saved_metadata.set(filename, structuredClone(metadata));
+        if (this.slot_directory) {
+            await writeFile(join(this.slot_directory, filename), Buffer.alloc(this.save_bytes));
+            if (this.sidecar_bytes) await writeFile(join(this.slot_directory, `${filename}.ckpt`), Buffer.alloc(this.sidecar_bytes));
+        }
+        return { ...this.#makeSlotSave(filename), id_slot: slot_id };
+    }
+
+    async saveAllSlots(model: ModelId, basename: string, signal?: AbortSignal): Promise<SlotSave[]> {
+        return [await this.saveSlot(model, 0, `${basename}-0.bin`, signal)];
     }
 
     async reloadModel(params: ReloadParams, model: ModelId, _signal?: AbortSignal): Promise<number> {
@@ -111,50 +139,50 @@ export class LlamaAPIMock extends LlamaAPI {
             : params.cache_type_k === 'q4_0'
                 ? 16384
                 : 4096;
-        runtime.n_ctx = params.n_ctx === 0 ? capacity : params.n_ctx ?? runtime.n_ctx;
+        runtime.n_ctx = params.n_ctx === 0 ? this.capacities.get(model) ?? capacity : params.n_ctx ?? runtime.n_ctx;
         runtime.kv_loaded = runtime.n_ctx !== MIN_ALLOWED_CTX;
         runtime.live_slots = [];
+        this.live_metadata.delete(model);
         return runtime.n_ctx;
     }
 
-    async restoreAllSlots(model: ModelId, saves: SlotSave[], _signal?: AbortSignal): Promise<SlotRestore[]> {
+    async restoreSlot(model: ModelId, slot_id: number, filename: string, _signal?: AbortSignal): Promise<SlotRestore> {
         const runtime = this.#requireKV(model);
-        this.#record({ kind: 'restore', model, filenames: saves.map(save => save.filename) });
+        this.#record({ kind: 'restore', model, filenames: [filename], slot_id });
         this.#maybeFail('restore');
-
-        for (const save of saves) {
-            if (save.id_slot !== 0) throw new Error(`unknown slot ${save.id_slot}`);
-            const snapshot = this.snapshots.get(save.filename);
-            if (!snapshot) throw new Error(`snapshot not found: ${save.filename}`);
-            runtime.live_slots = [...snapshot];
-        }
-
-        return saves.map(save => ({
-            id_slot: save.id_slot,
-            filename: save.filename,
-            n_restored: runtime.live_slots.length,
-            n_read: runtime.live_slots.length,
+        if (!this.slot_ids.includes(slot_id)) throw new Error(`unknown slot ${slot_id}`);
+        const snapshot = this.snapshots.get(filename);
+        if (!snapshot) throw new Error(`snapshot not found: ${filename}`);
+        runtime.live_slots = [...snapshot];
+        const metadata = this.saved_metadata.get(filename);
+        if (metadata) this.live_metadata.set(model, structuredClone(metadata));
+        return {
+            id_slot: slot_id,
+            filename,
+            n_restored: metadata?.tokens.length ?? snapshot.length,
+            n_read: this.save_bytes,
             timings: { restore_ms: 0 },
-        }));
+        };
+    }
+
+    async restoreAllSlots(model: ModelId, saves: SlotSave[], signal?: AbortSignal): Promise<SlotRestore[]> {
+        return await Promise.all(saves.map(save => this.restoreSlot(model, save.id_slot, save.filename, signal)));
     }
 
     setLiveSlots(contents: string[], model: ModelId = 'model'): void {
         const runtime = this.#requireKV(model);
         runtime.live_slots = [...contents];
+        this.live_metadata.delete(model);
     }
 
     getLiveSlots(model: ModelId = 'model'): string[] {
         return [...this.#runtime(model).live_slots];
     }
 
-    seedSnapshot(model: ModelId, rung_i: number, contents: string[]): SlotSave[] {
-        const filename = `${model}-rung-${rung_i}-0.bin`;
-        this.snapshots.set(filename, [...contents]);
-        return [this.#makeSlotSave(filename)];
-    }
-
     getSnapshot(model: ModelId, rung_i: number): string[] | undefined {
-        const snapshot = this.snapshots.get(`${model}-rung-${rung_i}-0.bin`);
+        const saves = this.operations.filter(operation => operation.kind === 'save' && operation.model === model);
+        const save = saves[rung_i];
+        const snapshot = save?.kind === 'save' ? this.snapshots.get(`${save.basename}-0.bin`) : undefined;
         return snapshot ? [...snapshot] : undefined;
     }
 
@@ -179,11 +207,13 @@ export class LlamaAPIMock extends LlamaAPI {
     }
 
     #makeSlotSave(filename: string): SlotSave {
+        const metadata = this.saved_metadata.get(filename) ?? { tokens: [], media: [] };
         return {
+            ...metadata,
             id_slot: 0,
             filename,
-            n_saved: 0,
-            n_written: 0,
+            n_saved: metadata.tokens.length,
+            n_written: this.save_bytes,
             timings: { save_ms: 0 },
         };
     }

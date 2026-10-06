@@ -92,7 +92,7 @@ export function maybeReject(flag: string): string | undefined {
 }
 
 const MODEL_SOURCE_FLAGS = new Set(['model', 'model-url']);
-const MANAGER_VALUE_FLAGS = new Set(['bin', 'config', 'ladder', 'sleep-idle-seconds', 'host', 'port', 'slot-save-path', 'model-variant']);
+const MANAGER_VALUE_FLAGS = new Set(['bin', 'config', 'ladder', 'sleep-idle-seconds', 'host', 'port', 'slot-save-path', 'model-variant', 'cache-disk-mib']);
 const MANAGER_BOOL_FLAGS = new Set(['idle', 'calc-breakpoints', 'help', 'version']);
 
 // note: expects normalized flag as input

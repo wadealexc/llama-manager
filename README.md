@@ -75,14 +75,16 @@ See the [example config file](./config.example.yaml) for an example. Serve multi
 node dist/index.js --config './my-config.yaml'
 ```
 
-Models are swapped out in response to requests: when a request comes in for a model that isn't loaded, the current model's kvcache is saved, then the model is unloaded and swapped for the requested model. When the original model is requested again, the saved kvcache is restored.
+Models are swapped out in response to requests: when a request comes in for a model that isn't loaded, populated slots are saved before the current model is unloaded. On reactivation or configuration change, the manager restores the eligible saved prompt with the longest matching prefix. Prefix-length ties favor the lower source rung, then recent use.
+
+The prompt cache has one global disk budget across all models: `--cache-disk-mib <n>` or the top-level YAML `cache-disk-mib` setting. Cache files are cleaned at startup/shutdown, so conversations are not cached across restarts.
 
 #### Notes
 
 - Models are served using the **best-possible configuration**. If you pass the flag `cache-type-k/v: q8_0`, the model will initially be served at `f16` precision, and will degrade _to a minimum_ of `q8_0`. 
   - If you do not specify a precision argument, the minimum is set to `q4_0` (this will not be used unless space is needed).
 - When a model is loaded for the first time, llama-manager calculates strategy breakpoints and displays them as a printed table. Use `--calc-breakpoints` to do this on startup, instead.
-- Models unload after 10 minutes of idle by default, which also resets kvcache and strategies. Pass `--sleep-idle-seconds <n>` to change it (`0` disables).
+- Models unload after 10 minutes of idle by default, saving populated slots to the prompt cache for later reactivation. Pass `--sleep-idle-seconds <n>` to change it (`0` disables idle unloading).
 - `-c` is ignored: context is sized reactively as strategies are applied
 - CLI args take priority over YAML
 - Unknown YAML fields/CLI args are passed to llama-server
@@ -137,6 +139,8 @@ llama-manager uses [my fork of llama.cpp](https://github.com/wadealexc/llama.cpp
   - `?action=save`: adds an additional 'sidecar' save file that saves prompt checkpoints
   - `?action=restore`: reads the aforementioned sidecar to restore prompt checkpoints
   - (Here, I adapted a solution from [this issue](https://github.com/ggml-org/llama.cpp/issues/25913))
+- Modified: `POST /v1/chat/completions/input_tokens` and slot-save responses
+  - Always include rendered token IDs and media chunk identities/spans for manager-side prefix matching.
 - Modified: `POST /slots/:id-slot` (convert kvcache precision)
   - `?action=restore`: when restoring a slot, automatically convert between f16 / q8_0 / q4_0 precision, rather than rejecting. (Needs work)
 
