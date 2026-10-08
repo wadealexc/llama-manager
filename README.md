@@ -1,15 +1,33 @@
 ## llama-manager
 
-llama-manager runs your models using optimal configurations that degrade gracefully as context expands. This ensures that you are always serving the most capable version of your model possible by reactively adjusting model configuration as your context window grows.
+llama-manager runs your models using optimal configurations that evolve with context length.
 
-**Notes:**
-- **llama-manager is in beta** and may not be tested with your hardware/model. Please open an issue if you find any bugs, and include your OS, what model you were using, and any relevant logs!
-- **llama-manager assumes inference uses a single GPU**. It will not work for pure-CPU inference, and probably will not work for split inference. If this is something you want, please open an issue.
-- llama-manager uses a custom fork of llama.cpp. See ([llama.cpp changes](#llamacpp-changes)) for details on what the fork introduces.
+Models are initially served at the highest speed and precision available. As context expands, llama-manager applies strategies that scale model performance down to make room on your machine. This ensures you are always serving the most capable version of your model.
+
+llama-manager is built using a custom fork of llama.cpp. See ([llama.cpp changes](#llamacpp-changes)) for details on what the fork introduces.
+
+#### Features
+
+llama-manager exposes the features below over via a standard OpenAI chat completions interface. You can use it with your favorite harness or frontend.
+
+- **Always serve max context**: model configuration and context window are updated during inference, favoring performance at low context, and capacity at high context. llama-manager ensures you can always run your models up to their max supported context without impacting quality until it's absolutely necessary.
+- **Auto-swap models:** models are loaded/unloaded/swapped on demand, allowing you to serve multiple models from the same server.
+- **Session storage:** slots are cached between model swaps and reloads, keeping recent sessions ready to serve at any time.
+- **Configurable strategies:** specify what strategies you prefer and how they should be applied (see [Customizing](#customizing)). 
+
+Strategies are applied automatically as needed, sacrificing either _speed_ or _quality_ in exchange for a larger context window. All strategies maintain a persistent kvcache, meaning existing prefill does not need to be repeated:
+- **Speed:** 
+  - toggle speculative decoding on/off to increase context
+  - move the mmproj off the GPU in exchange for 
+- **Quality:**
+  - quantize your model's kvcache to q8 or q4
+  - quantize your model's weights
 
 ---
 
-### Build
+### Build & Run
+
+#### Build llama-manager
 
 Requires Node.js and npm.
 
@@ -20,7 +38,7 @@ npm install
 npm run build
 ```
 
-#### llama.cpp
+#### Build llama.cpp
 
 llama-manager drives `llama-server` via a custom fork of llama.cpp. To build the server binary, cd into the llama.cpp submodule and build llama-server for your platform. llama.cpp has detailed build instructions [here](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
 
@@ -30,31 +48,9 @@ If you're on Linux+CUDA like me, you can use this script:
 ./scripts/build-server.sh --gpu
 ```
 
----
+#### Quick Start
 
-### Run Tests 
-
-Basic unit tests do not require a model/GPU, and use mocked llama-server calls to test llama-manager internals:
-
-```
-npm run test
-```
-
-GPU tests start a llama-server process, load models, and perform inference while testing more comprehensive llama-manager workflows. GPU tests can be configured by copying `.env.gpu-test.example` to `.env.gpu-test`, and adding paths to models on your machine.
-
-When your env is set up, you can run gpu tests with this command:
-
-```
-npm run test:gpu
-```
-
-### Run
-
-Supply args/config as either/both CLI args, or YAML.
-
-#### Single Model
-
-Serve a model directly from the command line using the same syntax as `llama-server`:
+After building, serve a model directly from the command line using the same syntax as `llama-server`. llama-manager will apply default performance strategies and serve your model at the best possible speed and precision.
 
 ```sh
 node dist/index.js \
@@ -67,45 +63,38 @@ node dist/index.js \
   -ngl 999
 ```
 
-#### Multiple Models
+Note that this requires models on your machine already; llama-manager does not resolve huggingface or other remote options.
 
-See the [example config file](./config.example.yaml) for an example. Serve multiple models and swap between them automatically using a `config.yaml` file:
+#### Customizing
+
+See [config.example.yaml](./config.example.yaml) for an example.
+
+Run with a config file to:
+- Serve multiple models (llama-manager will swap between them as needed)
+- Specify which strategies should/should not be applied
+- Customize strategy order
+- Use strategies like `swap-model` to quantize model weights on demand
+- Configure other server parameters (endpoint, idle timeout, disk cache usage, ...)
 
 ```sh
 node dist/index.js --config './my-config.yaml'
 ```
 
-Models are swapped out in response to requests: when a request comes in for a model that isn't loaded, populated slots are saved before the current model is unloaded. On reactivation or configuration change, the manager restores the eligible saved prompt with the longest matching prefix. Prefix-length ties favor the lower source rung, then recent use.
-
-The prompt cache has one global disk budget across all models: `--cache-disk-mib <n>` or the top-level YAML `cache-disk-mib` setting. Cache files are cleaned at startup/shutdown, so conversations are not cached across restarts.
-
-#### Notes
-
-- Models are served using the **best-possible configuration**. If you pass the flag `cache-type-k/v: q8_0`, the model will initially be served at `f16` precision, and will degrade _to a minimum_ of `q8_0`. 
-  - If you do not specify a precision argument, the minimum is set to `q4_0` (this will not be used unless space is needed).
-- When a model is loaded for the first time, llama-manager calculates strategy breakpoints and displays them as a printed table. Use `--calc-breakpoints` to do this on startup, instead.
-- Models unload after 10 minutes of idle by default, saving populated slots to the prompt cache for later reactivation. Pass `--sleep-idle-seconds <n>` to change it (`0` disables idle unloading).
-- `-c` is ignored: context is sized reactively as strategies are applied
-- CLI args take priority over YAML
-- Unknown YAML fields/CLI args are passed to llama-server
-
-See `--help` for the full flag list.
-
 ---
 
 ## About
 
-### Reactive context growth
+### Strategies
 
-When serving a model, llama-manager reactively applies strategies to free up device space, expanding the context window on-demand. llama-manager recognizes the following strategies:
+llama-manager reactively applies strategies to free up device space, expanding the context window on-demand. By default, strategies are applied in the following order:
 - `disable-spec`: Disable speculative decoding
 - `mmproj-to-cpu`: Move mmproj to CPU
 - `quantize-kv-q8`: Quantize kvcache to q8_0
 - `quantize-kv-q4`: Quantize kvcache to q4_0
 
-By default, strategies are applied in the following order: [`disable-spec`, `mmproj-to-cpu`, `quantize-kv-q8`, `quantize-kv-q4`]. This order can be changed via the CLI flag `--ladder` (or by editing your config.yaml. See [the example](./config.example.yaml)).
+Strategies are applied only at measured context thresholds, so including `quantize-kv-q4` will not actually quantize your kvcache until the corresponding threshold is reached. Additionally, strategies are only applied if they actually increase your context capacity.
 
-Strategies are displayed when a model is loaded for the first time:
+These thresholds are printed out when a model is loaded for the first time. For example:
 
 ```sh
 ════════════════════════════════════════════════════════════════════════════
@@ -119,6 +108,38 @@ Strategies are displayed when a model is loaded for the first time:
   3  quantize-kv-q8       262,144        (+43,264)           16.02 / 10.40
  ──────────────────────────────────────────────────────────────────────────
  final ctx:      262,144 tokens
+```
+
+llama-manager also supports swapping between model quantizations mid-generation. By including a `model-variants` field, you can define quantizations for use with the `swap-model` strategy. 
+
+For example, the following config uses Qwen3.8-27B `UD-Q6_K_XL` at low context, then swaps to `UD-Q4_K_XL` at medium context:
+
+```yaml
+# (from config.example.yaml)
+models:
+    qwen-dynamic-model:
+        # main model, loaded first (Q6_K_XL)
+        model: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q6_K_XL.gguf
+        mmproj: /home/models/qwen3.8-27b/mmproj-BF16.gguf
+
+        # lower-precision quant(s) to swap in as context grows
+        model-variants:
+            q4: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+
+        spec-type: draft-mtp
+        spec-draft-n-max: 2
+
+        fit-target: 512
+        n-gpu-layers: 99
+
+        # model variants can be referenced in ladder via swap-model:${VARIANT_NAME}
+        # I chose to degrade the Q6 model a little before swapping in the smaller model
+        ladder:
+            - quantize-kv-q8
+            - mmproj-to-cpu
+            - swap-model:q4  # swap to Q4_K_XL
+            - disable-spec
+            - quantize-kv-q8 # (swapping model quant resets kv precision to f16)
 ```
 
 ### llama.cpp changes
@@ -146,26 +167,21 @@ llama-manager uses [my fork of llama.cpp](https://github.com/wadealexc/llama.cpp
 
 The llama.cpp work is admittedly a little messy in places. I'm still working on cleaning/polishing it, as I think these features are genuinely useful and would like to contribute upstream. I'm releasing it now to get feedback from the community, as getting llama.cpp maintainer eyes on PRs has proved quite challenging so far!
 
-### Known Issues
+### Limitations and Known Issues
 
-- Expects inference to be performed on a single GPU; does not support CPU inference. If you want support for CPU/multi-device, please open an issue.
-- Hadamard rotation is disabled to simplify llama.cpp-side slot restore code.
-- I've only tested this extensively on my server. YMMV; please open an issue if you find bugs or crashes. My specs:
-  - Ubuntu Server
-  - RTX 5090
-  - CUDA v13.1
-- Models I've tested:
-  - Qwen3
-  - Qwen3.8
-  - Gemma4
+I built llama-manager for my personal workflows and hardware. I did not go out of my way to support 'every possible workflow' because I only have so much time. I'm continuing to prioritize my needs - but if you want to use llama-manager and find it doesn't work for you, please open an issue!
 
-### Future Work
+Here are the major limitations I'm aware of:
 
-- Smarter kv growth and model swapping (to reduce swap time and allow inference to multiple models at once)
-- Better kvcache management:
-  - Attach kvc to consumer via api key
-  - Serve model based on input tokens / cache hit rate (each request is served at precisely the config it needs, rather than having model-wide config)
-- Additional degradation strategies:
-  - Move layers between GPU/CPU
-  - Mmproj "on demand" (bring mmproj to GPU temporarily/as-needed to process an image, then evict it and carry result into prompt processing)
-  - kvu/batching/parallelization strategies
+- *Single-GPU only:* llama-manager does not support running on the CPU (or running across multiple GPUs).
+- *Only one active model:* while llama-manager will swap between models as needed, it is currently geared towards a "one big model" workflow. It does not support parallel generation from multiple models (even if they fit on your GPU at the same time). Requests to different models are queued and served roughly in order of request.
+    - (Note that parallel generation from the _same_ model is supported!)
+- *Session storage:* is somewhat brittle and is not highly optimized. The current version does a decent job of keeping repeated-prefill minimal even with multiple users/workflows, but there's lots of room for improvement.
+- *Sluggish kvcache save/restore at very high context:* "Sluggish" is relative. On my machine, applying a strategy at 200k+ context can take upwards of 20-30 seconds (while strategies < 150k are hardly noticable). This is still much faster than having the model repeat prefill (~80 seconds at 200k), but there is lots of room for optimization.
+
+### LLM Usage Disclosure
+
+I use a mixture of human coding and LLM coding + human review. In particular, there are a few parts of the codebase that are more LLM-heavy:
+- Stream/SSE handling in the API routes
+- Config parsing/building
+- Tests/scripts

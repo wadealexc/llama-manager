@@ -9,10 +9,24 @@ import { ModelTask, type PlannerResult } from "../planner/planner.js";
 const log = logger.withTag('api');
 
 export function registerRoutes(app: Express, server: ApiServer): void {
+    app.get('/health', (req, res) => getHealth(server, req, res));
+    app.get('/v1/health', (req, res) => getHealth(server, req, res));
+
+    app.get('/models', (req, res) => listModels(server, req, res));
     app.get('/v1/models', (req, res) => listModels(server, req, res));
+
+    app.post('/models/load', (req, res) => loadModel(server, req, res));
     app.post('/v1/models/load', (req, res) => loadModel(server, req, res));
+
+    app.post('/chat/completions', (req, res) => completions(server, req, res));
     app.post('/v1/chat/completions', (req, res) => completions(server, req, res));
+
+    app.post('/chat/completions/input_tokens', (req, res) => countTokens(server, req, res));
     app.post('/v1/chat/completions/input_tokens', (req, res) => countTokens(server, req, res));
+}
+
+async function getHealth(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
+    res.json({ status: 'ok' });
 }
 
 // TODO - clean up status return

@@ -4,16 +4,43 @@ router:
     
 # External listen address. OAI interface is exposed here.
 host: 127.0.0.1
-port: 8080
+port: 10003
 
-# Seconds of idle after which current models are unloaded
+# Seconds of idle after which active models are unloaded
 sleep-idle-seconds: 3000
+
+# Size in MiB of disk space used to keep recently-used slots available for restore
+# The default is set to 16 GiB to avoid clobbering anyone's machine, but I recommend
+# setting this much higher!
 cache-disk-mib: 16384
 
 models:
-    qwen3.8-27b:
-        model: /home/user/models/qwen3.8/Qwen3.8-27B-UD-Q4_K_XL.gguf
-        mmproj: /home/user/models/qwen3.8/mmproj-BF16.gguf
+
+    # Static model quant, default ladder
+    #
+    # Serves Q4_K_XL at full kv precision.
+    # Then disables MTP, moves mmproj to cpu, and finally quantizes kvcache to q8.
+    # 
+    # No ladder is specified in the config, so the default is applied - resulting
+    # in the strategy order above. The q4 strategy is automatically excluded because
+    # (on my machine) the final q8 strategy allows for the full 262k context.
+    #
+    # Context thresholds (32 GiB GPU):
+    #
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  qwen-default-ladder   baseline: 167,680 tokens                      device: 31 GiB
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  i  strategy                 ctx (tokens)    gain (tokens)       weights / ctx GiB
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  0  baseline                      167,680                            17.13 / 13.14
+    #  1  disable-spec                  200,960        (+33,280)           17.13 / 13.16
+    #  2  mmproj-to-cpu                 218,880        (+17,920)           16.02 / 14.27
+    #  3  quantize-kv-q8                262,144        (+43,264)           16.02 / 10.40
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  final ctx:      262,144 tokens
+    qwen-default-ladder:
+        model: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+        mmproj: /home/models/qwen3.8-27b/mmproj-BF16.gguf
 
         spec-type: draft-mtp
         spec-draft-n-max: 2
@@ -21,12 +48,30 @@ models:
         fit-target: 512
         n-gpu-layers: 99
 
-        # qwen3.8-27b doesn't specify a ladder, meaning it will use the default
-        # strategy order. this is equivalent to:
-        # ladder: [disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4]
-    qwen3.6-27b:
-        model: /home/user/models/qwen3.6/Qwen3.6-27B-UD-Q4_K_XL.gguf
-        mmproj: /home/user/models/qwen3.6/mmproj-BF16.gguf
+    # Static model quant, custom ladder
+    #
+    # Serves Q4_K_XL at full kv precision. Then moves mmproj to cpu.
+    # Finally, quantizes kvcache to q8.
+    #
+    # The custom ladder does not include disable-spec, so this config keeps
+    # MTP enabled at all times. Additionally, quantize-kv-q4 is automatically
+    # excluded because the model reaches max context at q8.
+    # 
+    # Context thresholds (32 GiB GPU):
+    #
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  qwen-custom-always-mtp   baseline: 167,680 tokens                   device: 31 GiB
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  i  strategy                 ctx (tokens)    gain (tokens)       weights / ctx GiB
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  0  baseline                      167,680                            17.13 / 13.14
+    #  1  mmproj-to-cpu                 184,320        (+16,640)           16.02 / 14.25
+    #  2  quantize-kv-q8                262,144        (+77,824)           16.02 / 12.89
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  final ctx:      262,144 tokens
+    qwen-custom-always-mtp:
+        model: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+        mmproj: /home/models/qwen3.8-27b/mmproj-BF16.gguf
 
         spec-type: draft-mtp
         spec-draft-n-max: 2
@@ -34,17 +79,83 @@ models:
         fit-target: 512
         n-gpu-layers: 99
 
-        # reorder default strategies
-        # note that quantize-kv-q4 will never be applied due to its exclusion
-        ladder: [mmproj-to-cpu, quantize-kv-q8, disable-spec]
-    qwen3.5-9b:
-        model: /home/user/models/qwen3.5-9b/Qwen3.5-9B-Q4_K_M.gguf
-        mmproj: /home/user/models/qwen3.5-9b/mmproj-BF16.gguf
+        ladder:
+            - mmproj-to-cpu
+            - quantize-kv-q8
+            - quantize-kv-q4
+
+    # Dynamic model quant, custom ladder
+    #
+    # Starts by serving Q6_K_XL, then quantizes kvcache to q8 and moves mmproj to cpu
+    # Then swaps in the Q4_K_XL model (resetting kvc precision to f16)
+    # Finally, disables MTP and quantizes the Q4 model's kvcache to q8
+    #
+    # Context thresholds (32 GiB GPU):
+    #
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    # qwen-dynamic-model   baseline: 69,120 tokens                          device: 31 GiB
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  i  strategy                 ctx (tokens)    gain (tokens)       weights / ctx GiB
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  0  baseline                       69,120                             23.69 / 6.56
+    #  1  quantize-kv-q8                111,104        (+41,984)            23.69 / 6.55
+    #  2  mmproj-to-cpu                 137,728        (+26,624)            22.58 / 7.67
+    #  3  swap-model:q4                 184,320        (+46,592)           16.02 / 14.25
+    #  4  disable-spec                  218,880        (+34,560)           16.02 / 14.27
+    #  5  quantize-kv-q8                262,144        (+43,264)           16.02 / 10.40
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  final ctx:      262,144 tokens
+    qwen-dynamic-model:
+        # main model, loaded first (Q6_K_XL)
+        model: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q6_K_XL.gguf
+        mmproj: /home/models/qwen3.8-27b/mmproj-BF16.gguf
+
+        # lower-precision quant(s) to swap in as context grows
+        model-variants:
+            q4: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+
+        spec-type: draft-mtp
+        spec-draft-n-max: 2
 
         fit-target: 512
         n-gpu-layers: 99
 
-        # empty ladder: no strategies will be applied (mmproj stays on GPU, kvcache stays f16)
+        # model variants can be referenced in ladder via swap-model:${VARIANT_NAME}
+        # I chose to degrade the Q6 model a little before swapping in the smaller model
+        ladder:
+            - quantize-kv-q8
+            - mmproj-to-cpu
+            - swap-model:q4  # swap to Q4_K_XL
+            - disable-spec
+            - quantize-kv-q8 # (swapping model quant resets kv precision to f16)
+
+    # Static model quant and no degradation strategies
+    #
+    # Specifying an empty ladder prevents any runtime strategies from being applied
+    # (This is basically like running the model on stock llama.cpp)
+    #
+    # With no strategies available, the model is only able to reach ~167k context.
+    #
+    # Context thresholds (32 GiB GPU):
+    #
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  qwen-no-ladder     baseline: 167,680 tokens                         device: 31 GiB
+    # ═════════════════════════════════════════════════════════════════════════════════════
+    #  i  strategy                 ctx (tokens)    gain (tokens)       weights / ctx GiB
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  0  baseline                      167,680                            17.13 / 13.14
+    #  ───────────────────────────────────────────────────────────────────────────────────
+    #  final ctx:      167,680 tokens
+    qwen-no-ladder:
+        model: /home/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+        mmproj: /home/models/qwen3.8-27b/mmproj-BF16.gguf
+
+        spec-type: draft-mtp
+        spec-draft-n-max: 2
+
+        fit-target: 512
+        n-gpu-layers: 99
+
         ladder: []
 
-default-model: qwen3.8-27b
+default-model: qwen-dynamic-model
