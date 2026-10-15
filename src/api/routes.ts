@@ -12,6 +12,9 @@ export function registerRoutes(app: Express, server: ApiServer): void {
     app.get('/health', (req, res) => getHealth(server, req, res));
     app.get('/v1/health', (req, res) => getHealth(server, req, res));
 
+    app.post(`/idle`, (req, res) => postIdle(server, req, res));
+    app.post(`/v1/idle`, (req, res) => postIdle(server, req, res));
+
     app.get('/models', (req, res) => listModels(server, req, res));
     app.get('/v1/models', (req, res) => listModels(server, req, res));
 
@@ -27,6 +30,15 @@ export function registerRoutes(app: Express, server: ApiServer): void {
 
 async function getHealth(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
     res.json({ status: 'ok' });
+}
+
+async function postIdle(server: ApiServer, req: Request, res: ExpressResponse): Promise<void> {
+    try {
+        const status = await server.planner.idle();
+        res.json({ status: status });
+    } catch (err) {
+        sendError(res, 500, 'internal error', `planner.idle error: ${err}`);
+    }
 }
 
 // TODO - clean up status return

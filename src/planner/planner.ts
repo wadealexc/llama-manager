@@ -546,6 +546,16 @@ export class Planner {
         log.info(`shutdown: done`);
     }
 
+    async idle(): Promise<'busy' | 'success'> {
+        if (!this.#isIdle()) {
+            return 'busy';
+        }
+
+        this.#cancelIdleTimer();
+        await this.#onIdle('request');
+        return 'success';
+    }
+
     #startIdleTimer(): void {
         this.#cancelIdleTimer();
 
@@ -557,7 +567,7 @@ export class Planner {
         if (ms <= 0) return;
 
         this.idle_timer = setTimeout(() => {
-            this.#onIdle().catch(err => log.error(`idle unload error: ${err}`));
+            this.#onIdle('timer').catch(err => log.error(`idle unload error: ${err}`));
         }, ms);
     }
 
@@ -568,12 +578,12 @@ export class Planner {
         }
     }
 
-    async #onIdle(): Promise<void> {
+    async #onIdle(source: string): Promise<void> {
         if (!this.#isIdle()) {
             return;
         }
 
-        log.info(`idle timeout reached; unloading all models`);
+        log.info(`idle (${source}): unloading all models`);
 
         const t = new Timer('idle unload');
         const handle = this.#getHandle();
