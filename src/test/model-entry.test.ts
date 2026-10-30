@@ -149,4 +149,56 @@ describe('ModelEntry cache lifecycle', () => {
             assert.equal(client.operations.some(operation => operation.kind === 'save'), false);
         });
     });
+
+    test('completion activity survives context, variant, and KV-only transitions but not full unloads', async () => {
+        await withFixture(async (entry) => {
+            entry.downshift_grace_seconds = -1;
+            await entry.loadWeights(signal);
+            await entry.applyRung(1, signal);
+            assert.equal(entry.canDownshift(), true);
+            entry.recordCompletion();
+            await entry.applyRung(0, signal);
+            assert.equal(entry.canDownshift(), false);
+            entry.ladder.push({
+                strategy: 'swap-model',
+                variant_name: 'q4',
+                state: { ...entry.ladder[0].state, model_variant: 'model__q4' },
+                n_ctx_cap: 16384,
+                bytes_needed: 0,
+            });
+            await entry.applyRung(2, signal);
+            assert.equal(entry.canDownshift(), false);
+            await entry.unloadKV(signal);
+            assert.equal(entry.canDownshift(), false);
+            await entry.applyRung(2, signal);
+            await entry.unloadWeights(signal);
+            assert.equal(entry.canDownshift(), true);
+            await entry.loadWeights(signal);
+            await entry.applyRung(0, signal);
+            entry.recordCompletion();
+            await entry.unloadHard();
+            assert.equal(entry.canDownshift(), true);
+        });
+    });
+
+    test('canDownshift uses the last completion timestamp and the configured grace period', async () => {
+        await withFixture(async (entry) => {
+            let now = 0;
+            entry.now = () => now;
+            entry.downshift_grace_seconds = 120;
+            assert.equal(entry.canDownshift(), true);
+            entry.recordCompletion();
+            now = 119999;
+            assert.equal(entry.canDownshift(), false);
+            now = 120000;
+            assert.equal(entry.canDownshift(), true);
+            entry.recordCompletion();
+            assert.equal(entry.canDownshift(), false);
+            entry.downshift_grace_seconds = 0;
+            assert.equal(entry.canDownshift(), true);
+            entry.downshift_grace_seconds = -1;
+            now = Number.MAX_SAFE_INTEGER;
+            assert.equal(entry.canDownshift(), false);
+        });
+    });
 });

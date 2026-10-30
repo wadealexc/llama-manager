@@ -87,6 +87,7 @@ export interface ConfigSource {
     host?: string;
     port?: number;
     sleep_idle_seconds?: number;
+    downshift_grace_seconds?: number;
     cache_disk_mib?: number;
     default_model?: ModelId;
     ladder_override?: Strategy[];
@@ -99,6 +100,7 @@ export interface ManagerConfig {
     host: string;
     port: number;
     sleep_idle_seconds: number;
+    downshift_grace_seconds: number;
     cache_disk_mib: number;
     model_load: ModelLoadConfig;
     models: Record<ModelId, ModelConfig>;

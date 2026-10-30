@@ -140,6 +140,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         config.router.poll_timeout_ms = 30000;
         config.model_load.poll_timeout_ms = 180000;
         config.sleep_idle_seconds = 0;
+        config.downshift_grace_seconds = 0;
         config.port = 0;
         router = new RouterProcess(config.router, config.model_load);
         resources.trackRouter(router);

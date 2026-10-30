@@ -56,7 +56,7 @@ function createModel(client: LlamaAPIMock, name: string): ModelEntry {
     return entry;
 }
 
-async function createFixture(rung_i: number = 0) {
+async function createFixture(rung_i: number = 0, grace_seconds: number = 0) {
     const client = new LlamaAPIMock();
     const model = createModel(client, 'model');
     const directory = await mkdtemp(join(tmpdir(), 'llama-cache-planner-'));
@@ -75,6 +75,7 @@ async function createFixture(rung_i: number = 0) {
         host: '127.0.0.1',
         port: 0,
         sleep_idle_seconds: 0,
+        downshift_grace_seconds: grace_seconds,
         cache_disk_mib: 1,
         model_load: { poll_interval_ms: 0, poll_timeout_ms: 0 },
         models: {},
@@ -673,4 +674,135 @@ describe('Planner warm-model scheduling', () => {
         assert.equal(planner.active.readers, 0);
         assert.equal(planner.waiting_reload.length, 0);
     });
+});
+
+describe('Planner rung downshift grace', () => {
+    const signal = new AbortController().signal;
+
+    async function complete(planner: Planner, tokens: number, name: string = planner.config.default_model): Promise<number> {
+        let rung = -1;
+        await planner.serveModel({ tokens }, name, ModelTask.COMPLETIONS, signal, async (_body, model) => {
+            rung = model.ladder_i;
+            return { kind: 'done' };
+        });
+        return rung;
+    }
+
+    test('short turns refresh the current rung until there is a full idle gap', async () => {
+        const { client, model, planner } = await createFixture(0, 120);
+        model.ladder.push({
+            strategy: 'quantize-kv-q4',
+            variant_name: 'baseline',
+            state: { ...model.ladder[0].state, cache_type_k: 'q4_0', cache_type_v: 'q4_0' },
+            n_ctx_cap: 16384,
+            bytes_needed: 20480,
+        });
+        let now = 0;
+        model.now = () => now;
+        assert.equal(await complete(planner, 10000), 2);
+        client.clearOperations();
+        now = 60000;
+        assert.equal(await complete(planner, 5000), 2);
+        now = 120000;
+        assert.equal(await complete(planner, 1000), 2);
+        assert.equal(model.last_completion, 120000);
+        assert.deepEqual(client.operations.map(operation => operation.kind), ['count', 'count']);
+        now = 239999;
+        assert.equal(model.canDownshift(), false);
+        now = 240000;
+        assert.equal(model.ladder_i, 2);
+        assert.equal(await complete(planner, 1000), 0);
+    });
+
+    test('long generations refresh the grace period on release', async () => {
+        const { model, planner } = await createFixture(0, 120);
+        let now = 0;
+        model.now = () => now;
+        const started = deferred<void>();
+        const finish = deferred<void>();
+        const generating = planner.serveModel({ tokens: 5000 }, model.name, ModelTask.COMPLETIONS, signal, async () => {
+            started.resolve();
+            await finish.promise;
+            return { kind: 'done' };
+        });
+        try {
+            await started.promise;
+            now = 200000;
+            assert.equal(await complete(planner, 1000), 1);
+            now = 250000;
+        } finally {
+            finish.resolve();
+            await generating;
+        }
+        assert.equal(model.last_completion, 250000);
+        now = 369999;
+        assert.equal(model.canDownshift(), false);
+        now = 370000;
+        assert.equal(await complete(planner, 1000), 0);
+    });
+
+    test('zero disables stickiness and infinite grace lasts until full unload', async () => {
+        for (const grace_seconds of [0, -1]) {
+            const { model, planner } = await createFixture(0, grace_seconds);
+            assert.equal(await complete(planner, 5000), 1);
+            assert.equal(await complete(planner, 1000), grace_seconds === 0 ? 0 : 1);
+            assert.equal(await planner.idle(), 'success');
+            assert.equal(model.last_completion, undefined);
+            assert.equal(await complete(planner, 1000), 0);
+        }
+    });
+
+    test('requests queued during a transition retain the rung used by earlier completions', async () => {
+        const { client, model, planner } = await createFixture(0, 120);
+        const release_reload = deferred<void>();
+        const reload_model = client.reloadModel.bind(client);
+        let entered = false;
+        client.reloadModel = async (params, name, request_signal) => {
+            entered = true;
+            await release_reload.promise;
+            return await reload_model(params, name, request_signal);
+        };
+        const long = complete(planner, 5000);
+        let short: Promise<number> | undefined;
+        try {
+            await waitFor(() => entered);
+            assert.equal(model.last_completion, undefined);
+            short = complete(planner, 1000);
+            await waitFor(() => planner.waiting_load.length === 1);
+        } finally {
+            release_reload.resolve();
+        }
+        assert.deepEqual(await Promise.all([long, short!]), [1, 1]);
+        assert.equal(client.operations.filter(operation => operation.kind === 'reload').length, 1);
+    });
+
+    test('wake and token counting do not refresh completion activity', async () => {
+        const { model, planner } = await createFixture(1, -1);
+        for (const task of [ModelTask.WAKE, ModelTask.TOKENIZE]) {
+            await planner.serveModel({ tokens: 10000 }, model.name, task, signal, async (body, active_model, request_signal) => {
+                if (task === ModelTask.TOKENIZE) assert.equal(await active_model.countTokens(body, request_signal), 10000);
+                return { kind: 'done' };
+            });
+        }
+        assert.equal(model.last_completion, undefined);
+        assert.equal(await complete(planner, 1000), 0);
+    });
+
+    test('aliases share history, KV-only unload preserves it, and full swaps clear it', async () => {
+        const { client, model, planner } = await createFixture(0, -1);
+        model.aliases.push('alias');
+        assert.equal(await complete(planner, 5000, 'alias'), 1);
+        await model.unloadKV(signal);
+        planner.active.model = undefined;
+        planner.weights_only.add(model.name);
+        assert.equal(await complete(planner, 1000), 0);
+        const second = createModel(client, 'second');
+        second.cache = planner.cache;
+        second.downshift_grace_seconds = planner.config.downshift_grace_seconds;
+        planner.models.set(second.name, second);
+        assert.equal(await complete(planner, 1000, second.name), 0);
+        assert.equal(model.last_completion, undefined);
+        assert.equal(await complete(planner, 1000, 'alias'), 0);
+    });
+
 });

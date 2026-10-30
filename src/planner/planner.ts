@@ -97,6 +97,14 @@ export class Planner {
         this.cache = new PromptCache(config.router.slot_save_path, config.cache_disk_mib);
         for (const model of models.values()) {
             model.cache = this.cache;
+            model.downshift_grace_seconds = config.downshift_grace_seconds;
+        }
+
+        const grace_seconds = config.downshift_grace_seconds;
+        if (grace_seconds === -1) {
+            log.info(`downshift-grace-seconds: -1 (highest-capacity rung is sticky until model unload)`);
+        } else if (grace_seconds === 0) {
+            log.info(`downshift-grace-seconds: disabled (models are always served at highest quality)`);
         }
     }
 
@@ -207,9 +215,9 @@ export class Planner {
             }
         }
 
-        // Model is loaded and we have a read handle - count tokens
-        let tokens_in;
-        let rung;
+        // Model is loaded and we have a read handle - count tokens and select rung
+        let tokens_in: number;
+        let best_rung: number | null;
         let prompt: InputTokensResponse;
         try {
             const rendered = handle.prompt ?? await model.renderPrompt(body, signal, t);
@@ -219,8 +227,8 @@ export class Planner {
 
             prompt = rendered;
             tokens_in = prompt.input_tokens;
-            rung = model.getMinimumRung(tokens_in);
-            if (rung === null) {
+            best_rung = model.getMinimumRung(tokens_in);
+            if (best_rung === null) {
                 throw new Error(`#withModel: model ${model.name} cannot serve request (tokens_in: ${tokens_in} | max capacity: ${model.getMaxCtx()})`);
             }
         } catch (err) {
@@ -229,18 +237,20 @@ export class Planner {
         }
 
         try {
+            const can_downshift = handle.exclusive() && model.canDownshift();
+
             // model is active. serve immediately if:
             // - model is already at optimal rung for input, OR
-            // - model is at a valid rung for input and is currently generating
+            // - model is at a valid rung for input and the rung cannot currently be updated
             //
             // otherwise, reload model to optimal rung
-            if (model.ladder_i === rung) {
+            if (model.ladder_i === best_rung) {
                 // done
-            } else if (model.ladder_i > rung && !handle.exclusive()) {
+            } else if (model.ladder_i > best_rung && !can_downshift) {
                 // done
             } else {
                 const cur_ctx = model.getCurCtx();
-                const new_ctx = model.getCtxCap(rung)!;
+                const new_ctx = model.getCtxCap(best_rung)!;
                 const ctx_str = `(cur ctx: ${cur_ctx} | new ctx: ${new_ctx})`;
 
                 if (cur_ctx >= new_ctx) {
@@ -266,8 +276,11 @@ export class Planner {
                     model.needs_restore = false;
                 }
             }
+
+            model.recordCompletion();
             return await cb(t);
         } finally {
+            model.recordCompletion();
             handle.release();
         }
     }
@@ -367,7 +380,7 @@ export class Planner {
             // restore model slots based on waiting prompts
             const prompts = fulfill.filter(waiter => cur_ctx >= waiter.min_ctx).map(waiter => waiter.prompt);
             await model.restorePrompts(prompts, signal, t);
-            
+
             // enforce prompt cache budget
             this.cache.enforce();
 
@@ -378,7 +391,7 @@ export class Planner {
                 } else {
                     waiter.reject(`unable to expand to ctx ${waiter.min_ctx} (actual ctx: ${cur_ctx})`);
                 }
-            }            
+            }
         }).catch((err) => {
             // reject requests
             for (const waiter of waiting_reload) {

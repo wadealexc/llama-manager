@@ -32,6 +32,9 @@ export class ModelEntry {
     status: LoadStatus = LoadStatus.UNLOADED;
     cache?: PromptCache;
     needs_restore: boolean = false;
+    downshift_grace_seconds?: number;
+    last_completion?: number;
+    now = () => performance.now();
 
     // TODO: clean up first-load semantics
     bytes_needed_no_kv?: number;
@@ -264,6 +267,17 @@ export class ModelEntry {
         }
     }
 
+    recordCompletion(): void {
+        this.last_completion = this.now();
+    }
+
+    canDownshift(): boolean {
+        return this.last_completion === undefined
+            || this.downshift_grace_seconds === 0
+            || (this.downshift_grace_seconds! > 0
+                && (this.now() - this.last_completion) / 1000 >= this.downshift_grace_seconds!);
+    }
+
     getMinimumRung(tokens: Tokens): number | null {
         const i = this.ladder.findIndex(rung => rung.n_ctx_cap >= tokens);
         return i === -1 ? null : i;
@@ -327,6 +341,7 @@ export class ModelEntry {
         this.n_ctx = 0;
         this.ladder_i = -1;
         this.needs_restore = false;
+        this.last_completion = undefined;
     }
 
     #buildLadder(initial_state: ModelState, ladder: Strategy[], strats: Map<StrategyId, StrategyImpl>): Rung[] {

@@ -15,6 +15,7 @@ interface ManagerFlags {
     host?: string;
     port?: number;
     sleep_idle_seconds?: number;
+    downshift_grace_seconds?: number;
     cache_disk_mib?: number;
     ladder?: Strategy[];
     model_variants?: Record<string, string>;
@@ -115,6 +116,7 @@ function parseServerArgs(argv: string[]): ParsedArgs {
         host: state.host,
         port: state.port,
         sleep_idle_seconds: state.sleep_idle_seconds,
+        downshift_grace_seconds: state.downshift_grace_seconds,
         cache_disk_mib: state.cache_disk_mib,
         ladder: state.ladder,
         slot_save_path: state.slot_save_path,
@@ -190,6 +192,9 @@ function handleManagerValue(state: ManagerFlags, name: string, value: string): v
             state.sleep_idle_seconds = n > 0 ? n : 0;
             return;
         }
+        case 'downshift-grace-seconds':
+            state.downshift_grace_seconds = toInt(value, '--downshift-grace-seconds');
+            return;
         case 'cache-disk-mib':
             state.cache_disk_mib = toInt(value, '--cache-disk-mib');
             return;
@@ -367,6 +372,7 @@ export function parseRouterConfig(path: string): ConfigSource {
         host: raw.host as string | undefined,
         port: raw.port as number | undefined,
         sleep_idle_seconds: raw['sleep-idle-seconds'] as number | undefined,
+        downshift_grace_seconds: raw['downshift-grace-seconds'] as number | undefined,
         cache_disk_mib: raw['cache-disk-mib'] as number | undefined,
         default_model: raw['default-model'] as string | undefined,
     };

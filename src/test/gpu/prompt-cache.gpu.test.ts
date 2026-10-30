@@ -108,6 +108,7 @@ test('GPU: long conversation survives a baseline title detour with main-model ca
         config.router.poll_timeout_ms = 30000;
         config.model_load.poll_timeout_ms = 180000;
         config.sleep_idle_seconds = 0;
+        config.downshift_grace_seconds = 0;
         config.port = 0;
 
         const router = new RouterProcess(config.router, config.model_load);

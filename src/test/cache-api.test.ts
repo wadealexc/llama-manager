@@ -34,6 +34,7 @@ async function checkContinuation(stream: boolean, can_grow: boolean): Promise<vo
         host: '127.0.0.1',
         port: 0,
         sleep_idle_seconds: 0,
+        downshift_grace_seconds: 0,
         cache_disk_mib: 1,
         model_load: { poll_interval_ms: 0, poll_timeout_ms: 0 },
         models: {},

@@ -9,6 +9,16 @@ port: 10003
 # Seconds of idle after which active models are unloaded
 sleep-idle-seconds: 3000
 
+# Seconds of idle after which a model is eligible to downshift to a higher quality rung
+# This parameter prevents frequent parallel requests at different context sizes from
+# repeatedly reconfiguring the model, ensuring that the highest capacity strategy is
+# "sticky" for a period of time.
+# 
+# - Set to `0` to disable this feature and always use the highest quality rung for each request
+# - Set to `-1` to keep the highest-capacity rung active until the model is unloaded (via idle)
+#   or model swap.
+downshift-grace-seconds: 120
+
 # Size in MiB of disk space used to keep recently-used slots available for restore
 # The default is set to 16 GiB to avoid clobbering anyone's machine, but I recommend
 # setting this much higher!
