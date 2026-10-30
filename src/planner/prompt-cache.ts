@@ -8,7 +8,7 @@ import { Timer } from './timer.js';
 
 const log = logger.withTag('prompt-cache');
 
-const CACHE_FILENAME = /^lm-cache-\d+-\d+\.bin(?:\.ckpt)?$/;
+const CACHE_FILENAME = /^lm-cache-\d+-\d+\.bin$/;
 const MEDIA_MARKER = -1;
 
 export interface CacheEntry extends PromptMetadata {
@@ -113,10 +113,10 @@ export class PromptCache {
                     // check that the file is not over budget on its own
                     const bytes = this.#getFileBytes(filename);
                     if (saved.n_saved === 0) {
-                        await this.#deleteFiles(filename);
+                        await this.#deleteFile(filename);
                         continue;
                     } else if (bytes > this.budget_bytes) {
-                        await this.#deleteFiles(filename);
+                        await this.#deleteFile(filename);
                         log.info(`${model.name}: slot save ${filename} exceeds total budget; skipping | size: ${fmtBytes(bytes)} | budget: ${fmtBytes(this.budget_bytes)}`);
                         continue;
                     }
@@ -149,7 +149,7 @@ export class PromptCache {
                 } catch (err) {
                     await this.#syncSize(filename)
                         .catch(err => log.warn(`syncSize ${filename}: ${err}`));
-                    await this.#deleteFiles(filename);
+                    await this.#deleteFile(filename);
                     log.warn(`${model.name}: slot save ${filename} failed: ${err} | ${this.#sizeLabel()}`);
                 }
             }
@@ -267,46 +267,41 @@ export class PromptCache {
 
     async #remove(entry: CacheEntry): Promise<void> {
         this.entries = this.entries.filter(candidate => candidate !== entry);
-        await this.#deleteFiles(entry.filename);
+        await this.#deleteFile(entry.filename);
     }
 
-    async #deleteFiles(filename: string): Promise<void> {
-        for (const name of [filename, `${filename}.ckpt`]) {
-            try {
-                await unlink(join(this.directory, name));
-                this.files.delete(name);
-            } catch (err: any) {
-                if (err.code === 'ENOENT') this.files.delete(name);
-                else log.warn(`delete ${name} failed: ${err} | ${this.#sizeLabel()}`);
-            }
+    async #deleteFile(filename: string): Promise<void> {
+        try {
+            await unlink(join(this.directory, filename));
+            this.files.delete(filename);
+        } catch (err: any) {
+            if (err.code === 'ENOENT') this.files.delete(filename);
+            else log.warn(`delete ${filename} failed: ${err} | ${this.#sizeLabel()}`);
         }
     }
 
     #getFileBytes(filename: string): number {
-        return (this.files.get(filename) ?? 0) + (this.files.get(`${filename}.ckpt`) ?? 0);
+        return this.files.get(filename) ?? 0;
     }
 
-    // get the size of a cache file (incl checkpoint)
     async #syncSize(filename: string): Promise<void> {
-        for (const name of [filename, `${filename}.ckpt`]) {
-            try {
-                this.files.set(name, (await stat(join(this.directory, name))).size);
-            } catch (err: any) {
-                if (err.code !== 'ENOENT') throw err;
-                this.files.delete(name);
-            }
+        try {
+            this.files.set(filename, (await stat(join(this.directory, filename))).size);
+        } catch (err: any) {
+            if (err.code !== 'ENOENT') throw err;
+            this.files.delete(filename);
         }
     }
 
     // ensure we are not exceeding our size budget
     // evict entries until we are under-budget, starting with the LRU
     async #enforceBudget(): Promise<void> {
-        const index = new Set(this.entries.flatMap(entry => [entry.filename, `${entry.filename}.ckpt`]));
+        const index = new Set(this.entries.map(entry => entry.filename));
 
         // TODO: ?
         for (const filename of [...this.files.keys()]) {
             if (!index.has(filename)) {
-                await this.#deleteFiles(filename.replace(/\.ckpt$/, ''));
+                await this.#deleteFile(filename);
             }
         }
 
@@ -342,7 +337,7 @@ export class PromptCache {
         }
 
         for (const name of names.filter(name => CACHE_FILENAME.test(name))) {
-            await this.#deleteFiles(name.replace(/\.ckpt$/, ''));
+            await this.#deleteFile(name);
         }
     }
 

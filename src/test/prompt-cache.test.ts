@@ -103,10 +103,9 @@ test('filters full saved state by actual slot capacity and remaps destination sl
     });
 });
 
-test('enforces one LRU budget across models and accounts for checkpoint sidecars', async () => {
+test('enforces one LRU budget across models using complete state-file sizes', async () => {
     await withFixture(async (cache, client, model) => {
-        client.save_bytes = 40;
-        client.sidecar_bytes = 20;
+        client.save_bytes = 60;
         cache.budget_bytes = 100;
         await save(cache, client, model, [1, 2]);
         await cache.enforce();
@@ -124,7 +123,6 @@ test('enforces one LRU budget across models and accounts for checkpoint sidecars
         assert.equal(cache.bytesUsed(), 60);
         assert.equal(cache.entries[0].model, 'b');
         assert.equal((await readdir(client.slot_directory!)).includes(first), false);
-        assert.equal((await readdir(client.slot_directory!)).includes(`${first}.ckpt`), false);
     });
 });
 
@@ -275,13 +273,13 @@ test('zero budget disables saves and restores', async () => {
 test('startup and shutdown cleanup leave unrelated slot files untouched', async () => {
     await withFixture(async (cache, client, model, directory) => {
         await writeFile(join(directory, 'user.bin'), 'user');
-        await writeFile(join(directory, 'user.bin.ckpt'), 'checkpoint');
+        await writeFile(join(directory, 'user.txt'), 'notes');
         await writeFile(join(directory, 'lm-cache-55-0.bin'), 'stale');
         await cache.start();
-        assert.deepEqual((await readdir(directory)).sort(), ['user.bin', 'user.bin.ckpt']);
+        assert.deepEqual((await readdir(directory)).sort(), ['user.bin', 'user.txt']);
         await save(cache, client, model, [1]);
         await cache.enforce();
         await cache.shutdown();
-        assert.deepEqual((await readdir(directory)).sort(), ['user.bin', 'user.bin.ckpt']);
+        assert.deepEqual((await readdir(directory)).sort(), ['user.bin', 'user.txt']);
     });
 });

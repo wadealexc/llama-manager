@@ -29,7 +29,6 @@ export class LlamaAPIMock extends LlamaAPI {
     next_failure?: Failure;
     slot_directory?: string;
     save_bytes: number = 32;
-    sidecar_bytes: number = 0;
     live_metadata: Map<ModelId, PromptMetadata> = new Map();
     saved_metadata: Map<string, PromptMetadata> = new Map();
     capacities: Map<ModelId, number> = new Map();
@@ -112,7 +111,6 @@ export class LlamaAPIMock extends LlamaAPI {
         this.saved_metadata.set(filename, structuredClone(metadata));
         if (this.slot_directory) {
             await writeFile(join(this.slot_directory, filename), Buffer.alloc(this.save_bytes));
-            if (this.sidecar_bytes) await writeFile(join(this.slot_directory, `${filename}.ckpt`), Buffer.alloc(this.sidecar_bytes));
         }
         return { ...this.#makeSlotSave(filename), id_slot: slot_id };
     }

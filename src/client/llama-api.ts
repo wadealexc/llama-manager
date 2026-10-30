@@ -1,4 +1,5 @@
 import type { ConsolaInstance } from "consola";
+import { inspect } from "node:util";
 import type { ModelId, ModelLoadConfig } from "../config/types.js";
 import { HttpError, type ModelInfo, type StatusResponse, type Slot, type HealthResponse, type MemoryResponse, type RouterModelStatus, type ReloadParams, type SlotSave, type SlotRestore, type InputTokensResponse, type ReloadResponse } from "./types.js";
 import { logger } from "../logger.js";
@@ -107,13 +108,25 @@ export class LlamaAPI {
 
     async reloadModel(params: ReloadParams, model: ModelId, signal?: AbortSignal): Promise<number> {
         const url = this.#buildURL('/reload');
+        const started_at = performance.now();
+        log.info(`POST ${url}: model ${model} | n_ctx ${params.n_ctx ?? 'unchanged'} | kv ${params.cache_type_k ?? 'unchanged'}/${params.cache_type_v ?? 'unchanged'}`);
 
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ ...params, model: model }),
-            signal: signal,
-        });
+        let res: Response;
+        try {
+            res = await fetch(url, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ...params, model: model }),
+                signal: signal,
+            });
+        } catch (err) {
+            const elapsed_ms = Math.round(performance.now() - started_at);
+            log.error(`POST ${url}: reload request failed for model ${model} after ${elapsed_ms} ms | aborted ${signal?.aborted ?? false}`, inspect(err, { depth: null, colors: false }));
+            if (signal?.aborted) {
+                log.error('reload abort reason:', inspect(signal.reason, { depth: null, colors: false }));
+            }
+            throw new Error(`POST ${url}: reload request failed for model ${model}: ${err}`, { cause: err });
+        }
 
         if (!res.ok) {
             const msg = await res.text();
