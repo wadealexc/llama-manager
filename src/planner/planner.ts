@@ -300,7 +300,7 @@ export class Planner {
                     await cb();
                     return Promise.resolve();
                 } catch (err) {
-                    return Promise.reject(`handle.write: callback failed: ${err}`);
+                    return Promise.reject(new Error(`handle.write: callback failed: ${err}`, { cause: err }));
                 } finally {
                     this.active.pending = false;
                 }
@@ -395,11 +395,11 @@ export class Planner {
         }).catch((err) => {
             // reject requests
             for (const waiter of waiting_reload) {
-                waiter.reject(`maybeReload error: ${err}`);
+                waiter.reject(new Error(`maybeReload error: ${err}`, { cause: err }));
             }
 
             // re-throw
-            throw new Error(`maybeReload: error reloading model: ${err}`);
+            throw new Error(`maybeReload: error reloading model: ${err}`, { cause: err });
         }).finally(() => handle.release());
     }
 
@@ -521,11 +521,11 @@ export class Planner {
         }).catch((err) => {
             // reject requests
             for (const waiter of to_flush) {
-                waiter.reject(`maybeSwap error: ${err}`);
+                waiter.reject(new Error(`maybeSwap error: ${err}`, { cause: err }));
             }
 
             // re-throw
-            throw new Error(`maybeSwap: error swapping model: ${err}`);
+            throw new Error(`maybeSwap: error swapping model: ${err}`, { cause: err });
         }).finally(() => handle.release());
     }
 
