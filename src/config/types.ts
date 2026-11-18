@@ -73,6 +73,7 @@ export interface ModelConfig {
     variants: Record<string, ModelVariant>;
     ladder: Strategy[];
     initial_state: ModelState;
+    fit_target_mib: number;
 }
 
 export type Mode = 'server' | 'router';

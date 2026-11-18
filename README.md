@@ -97,16 +97,15 @@ Strategies are applied only at measured context thresholds, so including `quanti
 These thresholds are printed out when a model is loaded for the first time. For example:
 
 ```sh
-════════════════════════════════════════════════════════════════════════════
- qwen3.8-27b        baseline: 167,680 tokens                device: 31 GiB
-════════════════════════════════════════════════════════════════════════════
-  i  strategy        ctx (tokens)    gain (tokens)       weights / ctx GiB
- ──────────────────────────────────────────────────────────────────────────
-  0  baseline             167,680                            17.13 / 13.14
-  1  disable-spec         200,960        (+33,280)           17.13 / 13.16
-  2  mmproj-to-cpu        218,880        (+17,920)           16.02 / 14.27
-  3  quantize-kv-q8       262,144        (+43,264)           16.02 / 10.40
- ──────────────────────────────────────────────────────────────────────────
+═══════════════════════════════════════════════════════════════╤═══════════════╤═══════════════
+ qwen3.8-flash-next                                            │   gpu: 31 GiB │  cpu: 115 GiB
+═══════════════════════════════════════════════════════════════╪═══════════════╪═══════════════
+  i  strategy                 ctx (tokens)    gain (tokens)    │ weights / ctx │ weights / ctx
+ ──────────────────────────────────────────────────────────────┼───────────────┼───────────────
+  0  baseline                       90,624                     │  24.12 / 5.62 │  86.43 / 0.31
+  1  disable-spec                  246,784       (+156,160)    │  20.91 / 9.22 │  86.43 / 0.30
+  2  quantize-kv-q8                262,144        (+15,360)    │  20.91 / 6.79 │  86.43 / 0.30
+ ──────────────────────────────────────────────────────────────┴───────────────┴───────────────
  final ctx:      262,144 tokens
 ```
 
@@ -169,11 +168,11 @@ I built llama-manager for my personal workflows and hardware. I did not go out o
 
 Here are the major limitations I'm aware of:
 
-- *Single-GPU only:* llama-manager does not support running on the CPU (or running across multiple GPUs).
+- *Single-GPU only:* llama-manager does not support running across multiple GPUs. Large MoE models can run split across GPU+CPU, but the implementation for this is not optimized. Config is a little trial and error; check config.example.yaml for an example.
 - *Only one active model:* while llama-manager will swap between models as needed, it is currently geared towards a "one big model" workflow. It does not support parallel generation from multiple models (even if they fit on your GPU at the same time). Requests to different models are queued and served roughly in order of request.
     - (Note that parallel generation from the _same_ model is supported!)
 - *Session storage:* is somewhat brittle and is not highly optimized. The current version does a decent job of keeping repeated-prefill minimal even with multiple users/workflows, but there's lots of room for improvement.
-- *Sluggish kvcache save/restore at very high context:* "Sluggish" is relative. On my machine, applying a strategy at 200k+ context can take upwards of 20-30 seconds (while strategies < 150k are hardly noticable). This is still much faster than having the model repeat prefill (~80 seconds at 200k), but there is lots of room for optimization.
+- *Sluggish kvcache save/restore when quantizing kvcache:* "Sluggish" is relative. On my machine, applying a quantize-kv-q8 strategy at 200k+ context can take upwards of 20-30 seconds. This is still much faster than having the model repeat prefill (~80 seconds at 200k), but there is lots of room for optimization.
 
 ### LLM Usage Disclosure
 

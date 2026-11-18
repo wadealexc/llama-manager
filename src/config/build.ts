@@ -7,7 +7,7 @@ import { logger } from "../logger.js";
 import { DEFAULT_CACHE_DISK_MIB, DEFAULT_HOST, DEFAULT_LOG_DIR, DEFAULT_LLAMA_BIN, DEFAULT_LLAMA_BIN_WIN32, DEFAULT_MODEL_LOAD_POLL_INTERVAL_MS, DEFAULT_MODEL_LOAD_POLL_TIMEOUT_MS, DEFAULT_PORT, DEFAULT_ROUTER_POLL_INTERVAL_MS, DEFAULT_ROUTER_POLL_TIMEOUT_MS, DEFAULT_ROUTER_SHUTDOWN_GRACE_MS, DEFAULT_DOWNSHIFT_GRACE_SECONDS, DEFAULT_SLEEP_IDLE_SECONDS, DEFAULT_SLOT_SAVE_DIR } from "./defaults.js";
 import { RESERVED_VARIANT_NAMES, STRATEGY_IDS, hasMmproj, isMmprojOnCPU, isSpecEnabled, type ConfigSource, type Strategy, type ManagerConfig, type ModelConfig, type ModelState, type ModelVariant, type RawModel, type StrategyId } from "./types.js";
 import type { ReloadParams, SpeculativeType } from "../client/types.js";
-import { DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
+import { DEFAULT_FIT_OVERHEAD_MIB, DEFAULT_KV_PRECISION, MIN_ALLOWED_CTX } from "../llama-cpp-constants.js";
 import { maybeReject, normalizeFlag } from "./flags.js";
 import { parseLadderStep, parseRouterConfig, validateVariantPath, type ParsedArgs } from "./parser.js";
 
@@ -27,6 +27,7 @@ const MANAGER_FIELDS = new Set([
     "model-variants",
     "model-variant",
     "cache-disk-mib",
+    "min-baseline-ctx",
 ]);
 
 const SUPPORTED_KV_PRECISION = ['f16', 'q8_0', 'q4_0'];
@@ -462,7 +463,18 @@ function buildEntry(name: string, raw: RawModel, aliases: string[], variants: Re
         variants,
         ladder: (raw['ladder'] as Strategy[]) ?? [],
         initial_state: buildInitialState(name, raw),
+        fit_target_mib: getFitTargetMib(raw),
     };
+}
+
+function getFitTargetMib(entry: RawModel): number {
+    const value = entry['fit-target'];
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') {
+        const first = Number(value.split(',')[0].trim());
+        if (value.trim() !== '' && Number.isFinite(first)) return first;
+    }
+    return DEFAULT_FIT_OVERHEAD_MIB;
 }
 
 function buildInitialState(name: string, raw: RawModel): ModelState {
@@ -546,7 +558,7 @@ function buildIni(models: Record<string, PresetModel>, slot_save_path: string): 
 function presetSection(id: string, entry: RawModel, slot_save_path: string): string {
     const lines = [
         `[${id}]`,
-        `${CTX_KEY} = ${MIN_ALLOWED_CTX}`,
+        `${CTX_KEY} = ${entry['min-baseline-ctx'] ?? MIN_ALLOWED_CTX}`,
         `cache-type-k = ${DEFAULT_KV_PRECISION}`,
         `cache-type-v = ${DEFAULT_KV_PRECISION}`,
         `slot-save-path = ${slot_save_path}`,

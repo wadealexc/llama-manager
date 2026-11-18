@@ -3,7 +3,7 @@ import { showBreakpoints } from "./show-breakpoints.js";
 import { RouterProcess } from "./client/router-process.js";
 import type { ConsolaInstance } from "consola";
 import { logger } from "./logger.js";
-import { Planner } from "./planner/planner.js";
+import { ModelTask, Planner } from "./planner/planner.js";
 import { ApiServer } from "./api/server.js";
 import { ModelEntry } from "./planner/model-entry.js";
 import type { ModelId } from "./config/types.js";
@@ -62,6 +62,9 @@ api = new ApiServer(planner, config);
 if (parsed.calc_breakpoints) {
     try {
         await showBreakpoints(llama_api, config, models);
+        if (parsed.idle) {
+            await planner.idle();
+        }
     } catch (err) {
         log.error(`startup error (showBreakpoints): ${err}`);
         await shutdown('error');
@@ -72,7 +75,7 @@ if (parsed.calc_breakpoints) {
 // start HTTP API and serve default model (unless `--idle` is set)
 try {
     if (!parsed.idle) {
-        await planner.serveDefault();
+        await planner.serveModel({ messages: [] }, config.default_model, ModelTask.WAKE, new AbortController().signal, async () => ({ kind: 'done' }));
     }
     await api.start();
 

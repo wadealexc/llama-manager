@@ -9,6 +9,16 @@ export interface CompletionChunk {
             cached_tokens?: number;
         };
     };
+    timings?: CompletionTimings;
+}
+
+export interface CompletionTimings {
+    prompt_n: number;
+    prompt_ms: number;
+    predicted_n: number;
+    predicted_ms: number;
+    draft_n?: number;
+    draft_n_accepted?: number;
 }
 
 export interface CompletionChoice {

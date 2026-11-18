@@ -4,10 +4,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ManagerConfig, ModelState } from '../config/types.js';
+import type { ManagerConfig, ModelConfig, ModelState } from '../config/types.js';
 import { ModelEntry } from '../planner/model-entry.js';
 import { ModelTask, Planner } from '../planner/planner.js';
 import { LlamaAPIMock } from './llama-api-mock.js';
+import { captureOutput } from './capture-output.js';
 
 const fixtures: { directory: string; planner: Planner }[] = [];
 after(async () => {
@@ -805,4 +806,25 @@ describe('Planner rung downshift grace', () => {
         assert.equal(await complete(planner, 1000, 'alias'), 0);
     });
 
+});
+
+describe('Planner fit-target warning', () => {
+    async function upshiftWithFitTarget(fit_target_bytes: number): Promise<string[]> {
+        const { model, planner } = await createFixture();
+        planner.config.models[model.name] = { fit_target_mib: fit_target_bytes / 1024 ** 2 } as ModelConfig;
+        const output = await captureOutput(() => planner.serveModel({ tokens: 5000 }, model.name, ModelTask.COMPLETIONS, new AbortController().signal, async () => ({ kind: 'done' })));
+
+        assert.equal(model.ladder_i, 1);
+        return output.split('\n');
+    }
+
+    test('warns when free device memory drops below the model fit-target after a reload', async () => {
+        const warnings = await upshiftWithFitTarget(30000);
+        assert.equal(warnings.filter(w => w.includes('below fit-target')).length, 1);
+    });
+
+    test('does not warn when free device memory stays above the model fit-target', async () => {
+        const warnings = await upshiftWithFitTarget(10000);
+        assert.equal(warnings.filter(w => w.includes('below fit-target')).length, 0);
+    });
 });

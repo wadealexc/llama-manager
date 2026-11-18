@@ -168,4 +168,56 @@ models:
 
         ladder: []
 
+    # Large MoE model with CPU expert offload
+    #
+    # Qwen3.8-Flash-Next (UD-Q4_K_XL, ~104 GiB) does not fit on a 32 GiB GPU, so llama.cpp's
+    # fit places some MoE experts on the CPU when the model is first loaded. That placement
+    # is fixed once loaded - later strategies can only grow the context, not move experts.
+    #
+    # min-baseline-ctx sets the context used for that first load, so fit leaves room for at
+    # least that much context instead of filling the GPU with experts. The baseline row below
+    # can land somewhat under it, since rung 0 re-fits the context after loading.
+    #
+    # Unfortunately, with the current implementation, finding a good value for min-baseline-ctx
+    # is a little trial-and-error. Eventually, I'd like to support dynamically moving experts
+    # between devices.
+    #
+    # Context thresholds (32 GiB GPU, 115 GiB RAM):
+    #
+    # ═══════════════════════════════════════════════════════════════╤═══════════════╤═══════════════
+    #  qwen3.8-flash-next                                            │   gpu: 31 GiB │  cpu: 115 GiB
+    # ═══════════════════════════════════════════════════════════════╪═══════════════╪═══════════════
+    #   i  strategy                 ctx (tokens)    gain (tokens)    │ weights / ctx │ weights / ctx
+    #  ──────────────────────────────────────────────────────────────┼───────────────┼───────────────
+    #   0  baseline                       90,624                     │  24.12 / 5.62 │  84.51 / 0.37
+    #   1  disable-spec                  246,784       (+156,160)    │  20.91 / 9.22 │  83.88 / 0.34
+    #   2  quantize-kv-q8                262,144        (+15,360)    │  20.91 / 6.79 │  83.88 / 0.35
+    #  ──────────────────────────────────────────────────────────────┴───────────────┴───────────────
+    #  final ctx:      262,144 tokens
+    qwen3.8-flash-next:
+        model: /home/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+        mmproj: /home/models/qwen3.8-flash-next/mmproj-BF16.gguf
+        md: /home/models/qwen3.8-flash-next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf
+
+        # initial load context; experts are split across devices based on this value
+        min-baseline-ctx: 100000
+
+        spec-type: draft-mtp
+        spec-draft-n-max: 3
+
+        fit-target: 512
+        parallel: 1
+
+        # load CPU-side weights into pinned RAM (faster prompt processing than mmap)
+        load-mode: none
+
+        # thread/batch config that worked well on my setup
+        t: 16
+        b: 2048
+        ub: 2048
+
+        ladder:
+            - disable-spec
+            - quantize-kv-q8
+
 default-model: qwen-dynamic-model

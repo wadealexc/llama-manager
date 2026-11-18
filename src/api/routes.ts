@@ -1,7 +1,7 @@
 import type { Express, Request, Response as ExpressResponse } from "express";
 import type { ApiServer } from "./server.js";
 import { SSERelay } from "./sse-relay.js";
-import type { CompletionChunk, CompletionRequest } from "./types.js";
+import type { CompletionChunk, CompletionRequest, CompletionTimings } from "./types.js";
 import type { ModelEntry } from "../planner/model-entry.js";
 import { logger } from "../logger.js";
 import { ModelTask, type PlannerResult } from "../planner/planner.js";
@@ -184,6 +184,8 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
         }
 
         req_info.upstream_usage = undefined;
+        req_info.timings_total = addTimings(req_info.timings_total, req_info.upstream_timings);
+        req_info.upstream_timings = undefined;
         req_info.finish_reason = undefined;
         req_info.physical_model = model.curVariant();
 
@@ -233,6 +235,8 @@ async function completions(server: ApiServer, req: Request, res: ExpressResponse
     }).finally(() => {
         const outcome = !res.writableEnded && ac.signal.aborted ? 'aborted' : req_info.outcome;
         logCompletion(req_info, req_info.finish_reason ?? outcome, true);
+        const timings = addTimings(req_info.timings_total, req_info.upstream_timings);
+        if (timings) log.info(`${req_info.physical_model ?? req_info.logical_model}: ${fmtSpeed(timings)}`);
     });
 }
 
@@ -243,6 +247,8 @@ type ReqInfo = {
     input_tokens?: number;
     upstream_usage?: CompletionChunk['usage'];
     final_usage?: CompletionChunk['usage'];
+    upstream_timings?: CompletionTimings;
+    timings_total?: CompletionTimings;
     finish_reason?: string;
     outcome: 'completed' | 'error';
     completion_tokens_total: number;
@@ -409,6 +415,7 @@ async function nonStreamCompletion(
 
 function captureUsage(req: ReqInfo, chunk: CompletionChunk, finish_reason?: string): void {
     req.finish_reason = chunk.choices[0]?.finish_reason ?? finish_reason ?? req.finish_reason;
+    if (chunk.timings) req.upstream_timings = structuredClone(chunk.timings);
     if (!chunk.usage || req.upstream_usage) return;
 
     req.upstream_usage = structuredClone(chunk.usage);
@@ -423,6 +430,35 @@ function logCompletion(req: ReqInfo, finish_reason: string, is_final: boolean = 
         : usage?.completion_tokens;
     const cached_tokens = usage?.prompt_tokens_details?.cached_tokens;
     log.info(`${req.physical_model ?? req.logical_model}: finish (${finish_reason}) | input ${input_tokens ?? 'unknown'} toks (${cached_tokens ?? 'unknown'} cached) | output ${output_tokens ?? 'unknown'} toks`);
+}
+
+export function addTimings(a?: CompletionTimings, b?: CompletionTimings): CompletionTimings | undefined {
+    if (!a) return b && structuredClone(b);
+    if (!b) return a;
+
+    const sum: CompletionTimings = {
+        prompt_n: a.prompt_n + b.prompt_n,
+        prompt_ms: a.prompt_ms + b.prompt_ms,
+        predicted_n: a.predicted_n + b.predicted_n,
+        predicted_ms: a.predicted_ms + b.predicted_ms,
+    };
+    if (a.draft_n !== undefined || b.draft_n !== undefined) {
+        sum.draft_n = (a.draft_n ?? 0) + (b.draft_n ?? 0);
+        sum.draft_n_accepted = (a.draft_n_accepted ?? 0) + (b.draft_n_accepted ?? 0);
+    }
+    return sum;
+}
+
+export function fmtSpeed(timings: CompletionTimings): string {
+    const rate = (n: number, ms: number): string => ms > 0 ? `${(n / ms * 1000).toFixed(1)} t/s` : 'n/a';
+    const parts = [
+        `prompt ${timings.prompt_n} toks @ ${rate(timings.prompt_n, timings.prompt_ms)}`,
+        `gen ${timings.predicted_n} toks @ ${rate(timings.predicted_n, timings.predicted_ms)}`,
+    ];
+    if (timings.draft_n) {
+        parts.push(`draft ${Math.round((timings.draft_n_accepted ?? 0) / timings.draft_n * 100)}%`);
+    }
+    return `speed | ${parts.join(' | ')}`;
 }
 
 function logDiscardedToolCalls(req: ReqInfo, pending: PendingAttempt): void {

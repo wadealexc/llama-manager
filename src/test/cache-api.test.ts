@@ -11,6 +11,7 @@ import type { ManagerConfig, ModelState } from '../config/types.js';
 import { ModelEntry } from '../planner/model-entry.js';
 import { Planner } from '../planner/planner.js';
 import { LlamaAPIMock } from './llama-api-mock.js';
+import { captureOutput } from './capture-output.js';
 
 async function checkContinuation(stream: boolean, can_grow: boolean): Promise<void> {
     const directory = await mkdtemp(join(tmpdir(), 'llama-cache-api-'));
@@ -50,15 +51,16 @@ async function checkContinuation(stream: boolean, can_grow: boolean): Promise<vo
         const tokens = continued ? [1, 2, 4] : [1, 2];
         return { input_tokens: tokens.length, object: 'response.input_tokens', tokens, media: [] };
     };
-    const completionResponse = (content: string, finish_reason: string, prompt_tokens: number, completion_tokens: number): Response => {
+    const completionResponse = (content: string, finish_reason: string, prompt_tokens: number, completion_tokens: number, draft_n_accepted: number): Response => {
         const usage = { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
+        const timings = { prompt_n: prompt_tokens, prompt_ms: 10, predicted_n: completion_tokens, predicted_ms: 50, draft_n: 4, draft_n_accepted };
         if (!stream) {
-            return Response.json({ choices: [{ index: 0, finish_reason, message: { role: 'assistant', content } }], usage });
+            return Response.json({ choices: [{ index: 0, finish_reason, message: { role: 'assistant', content } }], usage, timings });
         }
         const frames = [
             { choices: [{ index: 0, delta: { role: 'assistant', content } }] },
             { choices: [{ index: 0, delta: {}, finish_reason }] },
-            { choices: [], usage },
+            { choices: [], usage, timings },
         ];
         return new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', {
             headers: { 'content-type': 'text/event-stream' },
@@ -70,11 +72,11 @@ async function checkContinuation(stream: boolean, can_grow: boolean): Promise<vo
         if (attempts.length === 1) {
             client.setLiveSlots(['current partial']);
             client.live_metadata.set('model', { tokens: [1, 2, 4], media: [] });
-            return completionResponse('partial', 'length', 2, 1);
+            return completionResponse('partial', 'length', 2, 1, 3);
         }
         assert.deepEqual(client.getLiveSlots(), ['current partial']);
         assert.equal(model.ladder_i, 1);
-        return completionResponse(' final', 'stop', 3, 2);
+        return completionResponse(' final', 'stop', 1, 2, 1);
     };
     try {
         await model.loadWeights(signal);
@@ -87,13 +89,23 @@ async function checkContinuation(stream: boolean, can_grow: boolean): Promise<vo
         await api.start();
         if (!api.server!.listening) await once(api.server!, 'listening');
         const port = (api.server!.address() as AddressInfo).port;
-        const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ model: 'model', messages: [{ role: 'user', content: 'question' }], max_tokens: 100, stream }),
+        let status = 0;
+        let text = '';
+        const output = await captureOutput(async () => {
+            const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ model: 'model', messages: [{ role: 'user', content: 'question' }], max_tokens: 100, stream }),
+            });
+            status = response.status;
+            text = await response.text();
+            await new Promise(resolve => setImmediate(resolve));
         });
-        assert.equal(response.status, 200);
-        const text = await response.text();
+        assert.equal(status, 200);
+        const expected_speed = can_grow
+            ? 'speed | prompt 3 toks @ 150.0 t/s | gen 3 toks @ 30.0 t/s | draft 50%'
+            : 'speed | prompt 2 toks @ 200.0 t/s | gen 1 toks @ 20.0 t/s | draft 75%';
+        assert.ok(output.includes(`model: ${expected_speed}`), output);
         const expected_content = can_grow ? 'partial final' : 'partial';
         const expected_finish = can_grow ? 'stop' : 'length';
         const expected_usage = can_grow

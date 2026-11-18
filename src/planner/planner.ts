@@ -108,46 +108,6 @@ export class Planner {
         }
     }
 
-    // Note: not intended to be called twice
-    async serveDefault(): Promise<void> {
-        const t = new Timer('serveDefault');
-
-        this.active.pending = true;
-
-        const model = this.models.get(this.config.default_model);
-        if (!model) {
-            throw new Error(`serveDefault: default model '${this.config.default_model}' not found`);
-        }
-
-        try {
-            log.info(`serveDefault: loading weights for ${model.name}`);
-            await model.loadWeights(this.shutdown_ctrl.signal, t);
-        } catch (err) {
-            throw new Error(`serveDefault: unable to load weights for model ${model.name}: ${err}`);
-        }
-
-        await this.#updateMemory(model);
-
-        // first load: calculate breakpoints
-        const breakpoints = await walkBreakpoints(this.client, model, this.shutdown_ctrl.signal, t?.child(`walkBreakpoints`));
-        console.log(printModelBreakpoints(breakpoints));
-
-        log.info(`serveDefault: loading kvcache for ${model.name}`);
-        const n_ctx = await model.applyRung(0, this.shutdown_ctrl.signal, t?.child(`applyRung(0)`));
-        log.info(`serving ${model.name} with a context window of ${n_ctx} tokens`);
-
-        await this.#updateMemory(model);
-
-        this.active = {
-            pending: false,
-            model: model.name,
-            readers: 0,
-        };
-
-        print(t);
-        this.#startIdleTimer();
-    }
-
     async serveModel(body: unknown, model_name: string, task: ModelTask, client_signal: AbortSignal, cb: PlannerCallback): Promise<void> {
         const model = this.resolve(model_name);
         if (!model) throw new Error(`serveModel: unknown model ${model_name}`);
@@ -461,9 +421,6 @@ export class Planner {
 
                 const breakpoints = await walkBreakpoints(this.client, target, signal, t?.child(`walkBreakpoints`));
                 console.log(printModelBreakpoints(breakpoints));
-
-                await target.applyRung(0, signal, t?.child(`applyRung(0)`));
-                await this.#updateMemory(target);
             }
 
             // load model weights if needed
@@ -500,7 +457,8 @@ export class Planner {
                 fulfill.push(waiter);
             }
 
-            await target.applyRung(rung_needed, signal, t.child(`applyRung`));
+            const n_ctx = await target.applyRung(rung_needed, signal, t.child(`applyRung`));
+            log.info(`serving ${target.name} with a context window of ${n_ctx} tokens`);
             await this.#updateMemory(target);
 
             // restore model slots based on waiting prompts
@@ -621,23 +579,14 @@ export class Planner {
     async #unloadAllModels(stash_kv: boolean, exclude?: ModelId, t?: Timer): Promise<void> {
         let promises: Promise<void>[] = [];
 
-        const active = this.activeModel();
-        if (active && active.name !== exclude) {
-            if (!stash_kv) {
-                promises.push(this.#unloadNoRestore(active, t));
-            } else {
-                promises.push(this.#unloadWithRestore(active, t));
-            }
-        }
-
-        for (const id of [...this.weights_only.keys()]) {
+        for (const [id, entry] of [...this.models.entries()]) {
             if (id === exclude) continue;
+            if (entry.status === LoadStatus.UNLOADED) continue;
 
-            const model = this.models.get(id)!;
             if (!stash_kv) {
-                promises.push(this.#unloadNoRestore(model, t));
+                promises.push(this.#unloadNoRestore(entry, t));
             } else {
-                promises.push(this.#unloadWithRestore(model, t));
+                promises.push(this.#unloadWithRestore(entry, t));
             }
         }
 
@@ -725,7 +674,12 @@ export class Planner {
             this.dev_info.bytes_avail = this.dev_info.bytes_total;
         }
 
-        log.info(`available memory: (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)})`);
+        log.info(`available memory: gpu (${fmtBytes(this.dev_info.bytes_avail)} / ${fmtBytes(this.dev_info.bytes_total)}) | cpu (${fmtBytes(calcCpuFreeBytes(mem))} / ${fmtBytes(calcCpuTotalBytes(mem))})`);
+
+        const fit_target_mib = this.config.models[model.name]?.fit_target_mib;
+        if (fit_target_mib !== undefined && this.dev_info.bytes_avail < fit_target_mib * 1024 ** 2) {
+            log.warn(`free device memory (${fmtBytes(this.dev_info.bytes_avail)}) is below fit-target (${fit_target_mib} MiB); runtime allocations may fail`);
+        }
     }
 
     // server mode: return the only model we're serving, regardless of input
@@ -780,6 +734,14 @@ function calcTotalBytesOnDevice(mem: MemoryResponse): number {
         if (dev.type !== "cpu") return dev.total;
     }
     return 0;
+}
+
+function calcCpuFreeBytes(mem: MemoryResponse): number {
+    return mem.devices.find(dev => dev.type === "cpu")?.free ?? 0;
+}
+
+function calcCpuTotalBytes(mem: MemoryResponse): number {
+    return mem.devices.find(dev => dev.type === "cpu")?.total ?? 0;
 }
 
 function calcTotalBytesForModel(mem: MemoryResponse): number {

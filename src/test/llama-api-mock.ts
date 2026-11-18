@@ -1,5 +1,5 @@
 import { LlamaAPI } from '../client/llama-api.js';
-import type { InputTokensResponse, MemoryResponse, PromptMetadata, ReloadParams, Slot, SlotRestore, SlotSave } from '../client/types.js';
+import type { InputTokensResponse, MemoryResponse, ModelInfo, PromptMetadata, ReloadParams, Slot, SlotRestore, SlotSave } from '../client/types.js';
 import type { ModelId } from '../config/types.js';
 import { MIN_ALLOWED_CTX } from '../llama-cpp-constants.js';
 import { writeFile } from 'node:fs/promises';
@@ -26,6 +26,7 @@ export class LlamaAPIMock extends LlamaAPI {
     snapshots: Map<string, string[]> = new Map();
     models: Map<ModelId, ModelRuntime> = new Map();
     total_bytes: number = 32768;
+    cpu_total_bytes: number = 65536;
     next_failure?: Failure;
     slot_directory?: string;
     save_bytes: number = 32;
@@ -72,8 +73,20 @@ export class LlamaAPIMock extends LlamaAPI {
                 components: {
                     main: { model: 4096, context: runtime.n_ctx, compute: 0 },
                 },
+            }, {
+                name: 'fake-cpu',
+                type: 'cpu',
+                total: this.cpu_total_bytes,
+                free: this.cpu_total_bytes - 2048,
+                components: {
+                    main: { model: 1024, context: 512, compute: 512 },
+                },
             }],
         };
+    }
+
+    async getModels(_signal?: AbortSignal): Promise<ModelInfo[]> {
+        return [];
     }
 
     async getSlots(model: ModelId, _signal?: AbortSignal): Promise<Slot[]> {

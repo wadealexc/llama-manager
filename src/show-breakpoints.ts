@@ -8,18 +8,24 @@ import type { Timer } from "./planner/timer.js";
 
 const log: ConsolaInstance = logger.withTag('show-breakpoints');
 
+type DeviceMemory = {
+    weight_gib: number;
+    context_gib: number;
+};
+
 type RungBreakpoint = {
     i: number;
     strategy_name: string;
     n_ctx: number;
     gain: number;
-    weight_gib: number;
-    context_gib: number;
+    gpu: DeviceMemory;
+    cpu: DeviceMemory;
 };
 
 type ModelBreakpoints = {
     name: string;
-    device_total_gib: number;
+    gpu_total_gib: number;
+    cpu_total_gib: number;
     rungs: RungBreakpoint[];
 };
 
@@ -34,17 +40,19 @@ export async function walkBreakpoints(
     await entry.loadWeights(signal, t);
     let prev = await entry.applyRung(0, signal, t);
     let mem = await entry.getMemory(signal);
-    const { weight_bytes: w0, context_bytes: c0 } = getModelMemory(mem);
+    const { gpu: gpu0, cpu: cpu0 } = getModelMemory(mem);
+    const w0 = gpu0.weight_bytes;
+    const c0 = gpu0.context_bytes;
     rungs.push({ 
         i: 0, 
         strategy_name: "baseline", 
         n_ctx: prev, 
         gain: 0, 
-        weight_gib: w0 / (1024 ** 3), 
-        context_gib: c0 / (1024 ** 3) 
+        gpu: toGiB(gpu0),
+        cpu: toGiB(cpu0),
     });
 
-    const device_total_gib = getDeviceTotalBytes(mem) / (1024 ** 3);
+    const { gpu: gpu_total, cpu: cpu_total } = getDeviceTotalBytes(mem);
 
     const infos = await client.getModels(signal);
     const n_ctx_train = infos.find(info => info.id === entry.name)?.meta?.n_ctx_train;
@@ -71,14 +79,15 @@ export async function walkBreakpoints(
         log.info(`${entry.name}: applying ${entry.rungLabel(entry.ladder_i + 1)}`);
         const n_ctx = await entry.applyNextRung(signal, t);
         mem = await entry.getMemory(signal);
-        const { weight_bytes, context_bytes } = getModelMemory(mem);
+        const { gpu, cpu } = getModelMemory(mem);
+        const { weight_bytes, context_bytes } = gpu;
         rungs.push({
             i: rungs.length,
             strategy_name: entry.rungLabel(entry.ladder_i),
             n_ctx: n_ctx,
             gain: n_ctx - prev,
-            weight_gib: weight_bytes / (1024 ** 3),
-            context_gib: context_bytes / (1024 ** 3),
+            gpu: toGiB(gpu),
+            cpu: toGiB(cpu),
         });
         prev = n_ctx;
 
@@ -112,7 +121,8 @@ export async function walkBreakpoints(
 
     return { 
         name: entry.name, 
-        device_total_gib,
+        gpu_total_gib: gpu_total / (1024 ** 3),
+        cpu_total_gib: cpu_total / (1024 ** 3),
         rungs 
     };
 }
@@ -128,13 +138,21 @@ export async function showBreakpoints(
 
     const results: ModelBreakpoints[] = [];
 
-    for (const [name, entry] of models.entries()) {
+    const ordered = [...models.entries()].sort(([a], [b]) =>
+        Number(a === config.default_model) - Number(b === config.default_model));
+
+    for (const [name, entry] of ordered) {
         try {
             const result = await walkBreakpoints(client, entry, signal);
             results.push(result);
             record?.(name, result.rungs.at(-1)!.n_ctx);
             log.info(`${name}: done`);
-        } finally {
+        } catch (err) {
+            try { await entry.unloadHard(); } catch { }
+            throw err;
+        }
+
+        if (name !== config.default_model) {
             try { await entry.unloadHard(); } catch { }
         }
     }
@@ -142,26 +160,34 @@ export async function showBreakpoints(
     printBreakpoints(results);
 }
 
-function getModelMemory(mem: MemoryResponse): { weight_bytes: number; context_bytes: number } {
-    let weight_bytes = 0;
-    let context_bytes = 0;
+type DeviceBytes = { weight_bytes: number; context_bytes: number };
+
+function getModelMemory(mem: MemoryResponse): { gpu: DeviceBytes; cpu: DeviceBytes } {
+    const gpu: DeviceBytes = { weight_bytes: 0, context_bytes: 0 };
+    const cpu: DeviceBytes = { weight_bytes: 0, context_bytes: 0 };
     for (const dev of mem.devices) {
-        if (dev.type === "cpu") continue;
+        const out = dev.type === "cpu" ? cpu : gpu;
         for (const name of ["main", "spec", "mmproj"] as const) {
             const c = dev.components[name];
             if (!c) continue;
-            weight_bytes += c.model;
-            context_bytes += c.context + c.compute;
+            out.weight_bytes += c.model;
+            out.context_bytes += c.context + c.compute;
         }
     }
-    return { weight_bytes, context_bytes };
+    return { gpu, cpu };
 }
 
-function getDeviceTotalBytes(mem: MemoryResponse): number {
-    for (const dev of mem.devices) {
-        if (dev.type !== "cpu") return dev.total;
-    }
-    return 0;
+function toGiB(bytes: DeviceBytes): DeviceMemory {
+    return {
+        weight_gib: bytes.weight_bytes / (1024 ** 3),
+        context_gib: bytes.context_bytes / (1024 ** 3),
+    };
+}
+
+function getDeviceTotalBytes(mem: MemoryResponse): { gpu: number; cpu: number } {
+    const gpu = mem.devices.find(dev => dev.type !== "cpu")?.total ?? 0;
+    const cpu = mem.devices.find(dev => dev.type === "cpu")?.total ?? 0;
+    return { gpu, cpu };
 }
 
 function printBreakpoints(results: ModelBreakpoints[]): void {
@@ -178,31 +204,45 @@ function printBreakpoints(results: ModelBreakpoints[]): void {
 
 Stringify a model's strategy ladder for printing:
 
-════════════════════════════════════════════════════════════════════════════
- qwen3.8-27b        baseline: 150,784 tokens                device: 31 GiB
-════════════════════════════════════════════════════════════════════════════
-  i  strategy        ctx (tokens)    gain (tokens)       weights / ctx GiB
- ──────────────────────────────────────────────────────────────────────────
-  0  baseline             150,784                            17.13 / 12.01
-  1  disable-spec         182,784        (+32,000)           17.13 / 12.03
-  2  mmproj-to-cpu        200,960        (+18,176)           16.02 / 13.16
-  3  quantize-kv-q8       262,144        (+61,184)           16.02 / 10.40
- ──────────────────────────────────────────────────────────────────────────
+═══════════════════════════════════════════════════════════════╤═══════════════╤═══════════════
+ qwen3.8-flash-next                                            │   gpu: 31 GiB │  cpu: 115 GiB
+═══════════════════════════════════════════════════════════════╪═══════════════╪═══════════════
+  i  strategy                 ctx (tokens)    gain (tokens)    │ weights / ctx │ weights / ctx
+ ──────────────────────────────────────────────────────────────┼───────────────┼───────────────
+  0  baseline                       90,624                     │  24.12 / 5.62 │  86.43 / 0.31
+  1  disable-spec                  246,784       (+156,160)    │  20.91 / 9.22 │  86.43 / 0.30
+  2  quantize-kv-q8                262,144        (+15,360)    │  20.91 / 6.79 │  86.43 / 0.30
+ ──────────────────────────────────────────────────────────────┴───────────────┴───────────────
  final ctx:      262,144 tokens
 
 */
 export function printModelBreakpoints(model: ModelBreakpoints): string {
     const PAD = " ";
     const strategy_width = 24;
+    const mem_header = "weights / ctx";
 
-    let out = "";
+    const devices = [
+        { label: `gpu: ${model.gpu_total_gib.toFixed(0)} GiB`, cells: model.rungs.map(rung => fmtMem(rung.gpu)) },
+        { label: `cpu: ${model.cpu_total_gib.toFixed(0)} GiB`, cells: model.rungs.map(rung => fmtMem(rung.cpu)) },
+    ];
+    const col_width = Math.max(mem_header.length, ...devices.flatMap(dev => [dev.label.length, ...dev.cells.map(cell => cell.length)]));
 
-    const baseline = model.rungs[0].n_ctx;
-    const baseline_str = fmtNum(baseline);
-    const device_str = `device: ${model.device_total_gib.toFixed(0)} GiB`;
+    const left_header = PAD + "i".padStart(2) + "  " + "strategy".padEnd(strategy_width) + " " + "ctx (tokens)".padStart(12) + "  " + "gain (tokens)".padStart(15) + "    ";
+    const left_width = left_header.length;
+    const withDevices = (left: string, cells: string[]): string =>
+        (left.padEnd(left_width) + cells.map(cell => "│ " + cell.padStart(col_width) + " ").join("")).trimEnd();
 
-    const rows = [PAD + "i".padStart(2) + "  " + "strategy".padEnd(strategy_width) + " " + "ctx (tokens)".padStart(12) + "  " + "gain (tokens)".padStart(15) + "       " + "weights / ctx GiB".padStart(17)];
-    for (const rung of model.rungs) {
+    const name_width = left_width - PAD.length - 1;
+    const name_chars = Array.from(model.name);
+    const name = name_chars.length > name_width
+        ? name_chars.slice(0, name_width - 1).join('') + '…'
+        : model.name;
+
+    const banner = withDevices(PAD + name, devices.map(dev => dev.label));
+    const header = withDevices(left_header, devices.map(() => mem_header));
+
+    const rows: string[] = [];
+    for (const [idx, rung] of model.rungs.entries()) {
         const i_str = String(rung.i).padStart(2);
         const label = Array.from(rung.strategy_name);
         const strat = (label.length > strategy_width
@@ -211,35 +251,34 @@ export function printModelBreakpoints(model: ModelBreakpoints): string {
         const ctx = fmtNum(rung.n_ctx).padStart(12);
         const gain = rung.gain > 0 ? `(+${fmtNum(rung.gain)})` : "";
         const gain_padded = gain.padStart(15);
-        const wc = `${rung.weight_gib.toFixed(2)} / ${rung.context_gib.toFixed(2)}`;
-        const wc_padded = wc.padStart(17);
-        rows.push(PAD + i_str + "  " + strat + " " + ctx + "  " + gain_padded + "       " + wc_padded);
+        rows.push(withDevices(PAD + i_str + "  " + strat + " " + ctx + "  " + gain_padded, devices.map(dev => dev.cells[idx])));
     }
     const final = model.rungs.at(-1)!.n_ctx;
-    rows.push(PAD + "final ctx: " + fmtNum(final).padStart(12) + " tokens");
+    const footer = PAD + "final ctx: " + fmtNum(final).padStart(12) + " tokens";
 
-    // Rule extends 1 char past the rightmost table value; the bar overhangs the rule by 1.
-    const tableW = Math.max(...rows.map(r => r.length));
-    const rule = PAD + "─".repeat(tableW - PAD.length + 1);
-    const bar = "═".repeat(rule.length + 1);
+    // Rule extends 1 char past the rightmost table value; the bar overhangs the rule by 1 on the left.
+    const width = left_width + devices.length * (col_width + 3);
+    const dividers = devices.map((_, i) => left_width + i * (col_width + 3));
+    const line = (fill: string, junction: string, first: string): string =>
+        Array.from({ length: width }, (_, i) => dividers.includes(i) ? junction : i === 0 ? first : fill).join("");
 
-    // Banner content sits inside the bar with a 2-char inset on the right.
-    const lhs = PAD + model.name.padEnd(16) + "   baseline: " + baseline_str + " tokens";
-    const rhs = device_str;
-    const gap = Math.max(1, bar.length - 2 - lhs.length - rhs.length);
+    // Banner shows each device's capacity above its column.
+    const out = [
+        line("═", "╤", "═"),
+        banner,
+        line("═", "╪", "═"),
+        header,
+        line("─", "┼", PAD),
+        ...rows,
+        line("─", "┴", PAD),
+        footer,
+    ];
 
-    out += bar + "\n";
-    out += lhs + " ".repeat(gap) + rhs + "\n";
-    out += bar + "\n";
-    out += rows[0] + "\n";
-    out += rule + "\n";
-    for (const row of rows.slice(1, -1)) {
-        out += row + "\n";
-    }
-    out += rule + "\n";
-    out += rows.at(-1) + "\n";
+    return out.join("\n") + "\n";
+}
 
-    return out;
+function fmtMem(mem: DeviceMemory): string {
+    return `${mem.weight_gib.toFixed(2)} / ${mem.context_gib.toFixed(2)}`;
 }
 
 function fmtNum(n: number): string {
