@@ -63,7 +63,7 @@ if (parsed.calc_breakpoints) {
     try {
         await showBreakpoints(llama_api, config, models);
         if (parsed.idle) {
-            await planner.idle();
+            await planner.unloadAll();
         }
     } catch (err) {
         log.error(`startup error (showBreakpoints): ${err}`);

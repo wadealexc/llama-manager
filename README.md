@@ -74,7 +74,7 @@ Run with a config file to:
 - Specify which strategies should/should not be applied
 - Customize strategy order
 - Use strategies like `swap-model` to quantize model weights on demand
-- Configure other server parameters (endpoint, idle timeout, disk cache usage, ...)
+- Configure other server parameters (endpoint, idle swap, disk cache usage, ...)
 
 ```sh
 node dist/index.js --config './my-config.yaml'

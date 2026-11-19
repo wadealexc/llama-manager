@@ -296,14 +296,25 @@ export class Planner {
 
         if (!t) t = new Timer(`maybeReload`);
 
-        let waiting_reload: PausedReader[];
+        let waiting_reload: PausedReader[] = [];
+        const fulfill: PausedReader[] = [];
+        let cur_ctx = 0;
+
+        const flush = (waiters: PausedReader[]): void => {
+            for (const waiter of waiters) {
+                if (cur_ctx >= waiter.min_ctx) {
+                    waiter.resolve();
+                } else {
+                    waiter.reject(`unable to expand to ctx ${waiter.min_ctx} (actual ctx: ${cur_ctx})`);
+                }
+            }
+        };
 
         const signal = this.shutdown_ctrl.signal;
         const handle = this.#getHandle();
         await handle.write(async () => {
             const model = this.activeModel()!;
             waiting_reload = this.waiting_reload.splice(0);
-            const fulfill: PausedReader[] = [];
             let rung_needed = 0;
             let min_ctx = 0;
             for (const waiter of waiting_reload) {
@@ -325,7 +336,7 @@ export class Planner {
             await model.saveSlots(signal, t);
 
             // apply desired rung, retrying if ctx did not increase beyond the minimum needed
-            let cur_ctx = model.getCurCtx();
+            cur_ctx = model.getCurCtx();
             while (true) {
                 await model.applyRung(rung_needed, signal, t.child(`applyRung(${rung_needed})`));
                 await this.#updateMemory(model);
@@ -343,24 +354,24 @@ export class Planner {
 
             // enforce prompt cache budget
             this.cache.enforce();
-
-            // flush waiters; continue generation
-            for (const waiter of fulfill) {
-                if (cur_ctx >= waiter.min_ctx) {
-                    waiter.resolve();
-                } else {
-                    waiter.reject(`unable to expand to ctx ${waiter.min_ctx} (actual ctx: ${cur_ctx})`);
-                }
-            }
         }).catch((err) => {
             // reject requests
             for (const waiter of waiting_reload) {
                 waiter.reject(new Error(`maybeReload error: ${err}`, { cause: err }));
             }
 
+            handle.release();
+
             // re-throw
             throw new Error(`maybeReload: error reloading model: ${err}`, { cause: err });
-        }).finally(() => handle.release());
+        });
+
+        // flush waiters and release handle
+        //
+        // NOTE: Handle release needs to happen after flush, so that waiters
+        // have time to get their own read handles before we release the write lock.
+        flush(fulfill);
+        handle.release();
     }
 
     // NOTE: failures/crashes in this method are uncaught and result in the server shutting down
@@ -474,17 +485,24 @@ export class Planner {
 
             this.active.model = target.name;
             this.weights_only.delete(target.name);
-
-            flush(fulfill);
         }).catch((err) => {
             // reject requests
             for (const waiter of to_flush) {
                 waiter.reject(new Error(`maybeSwap error: ${err}`, { cause: err }));
             }
 
+            handle.release();
+
             // re-throw
             throw new Error(`maybeSwap: error swapping model: ${err}`, { cause: err });
-        }).finally(() => handle.release());
+        });
+
+        // flush waiters and release handle
+        //
+        // NOTE: Handle release needs to happen after flush, so that waiters
+        // have time to get their own read handles before we release the write lock.
+        flush(fulfill);
+        handle.release();
     }
 
     async shutdown(): Promise<void> {
@@ -517,13 +535,24 @@ export class Planner {
         log.info(`shutdown: done`);
     }
 
-    async idle(): Promise<'busy' | 'success'> {
+    // unloads every model. nothing is reloaded until the next request
+    async unloadAll(): Promise<'busy' | 'success'> {
         if (!this.#isIdle()) {
             return 'busy';
         }
 
         this.#cancelIdleTimer();
-        await this.#onIdle('request');
+        log.info(`unloading all models`);
+
+        const t = new Timer('unload all');
+        const handle = this.#getHandle();
+        await handle.write(async () => {
+            await this.#unloadAllModels(true, undefined, t.child('unloadAllModels'));
+            await this.cache.enforce(t);
+        }).finally(() => {
+            handle.release();
+            print(t);
+        });
         return 'success';
     }
 
@@ -534,11 +563,12 @@ export class Planner {
             return;
         }
 
-        const ms = this.config.sleep_idle_seconds * 1000;
+        const ms = this.config.idle_load_default_seconds * 1000;
         if (ms <= 0) return;
 
         this.idle_timer = setTimeout(() => {
-            this.#onIdle('timer').catch(err => log.error(`idle unload error: ${err}`));
+            this.idle_timer = undefined;
+            this.#loadDefaultModel().catch(err => log.error(`idle load-default error: ${err}`));
         }, ms);
     }
 
@@ -549,22 +579,24 @@ export class Planner {
         }
     }
 
-    async #onIdle(source: string): Promise<void> {
+    // after a full idle period, swap back to the default model so it is ready for the next request
+    async #loadDefaultModel(): Promise<void> {
         if (!this.#isIdle()) {
             return;
         }
 
-        log.info(`idle (${source}): unloading all models`);
+        // do nothing; models were explicitly unloaded via `/unload-all`
+        if (this.active.model === undefined) {
+            return;
+        }
 
-        const t = new Timer('idle unload');
-        const handle = this.#getHandle();
-        await handle.write(async () => {
-            await this.#unloadAllModels(true, undefined, t.child('unloadAllModels'));
-            await this.cache.enforce(t);
-        }).finally(() => {
-            handle.release();
-            print(t);
-        });
+        const model = this.models.get(this.config.default_model);
+        if (!model || this.modelIsActive(model)) {
+            return;
+        }
+
+        log.info(`idle: swapping to default model ${model.name}`);
+        await this.serveModel({ messages: [] }, model.name, ModelTask.WAKE, new AbortController().signal, async () => ({ kind: 'done' }));
     }
 
     #isIdle(): boolean {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { after, describe, test } from 'node:test';
+import { after, describe, mock, test } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -75,7 +75,7 @@ async function createFixture(rung_i: number = 0, grace_seconds: number = 0) {
         },
         host: '127.0.0.1',
         port: 0,
-        sleep_idle_seconds: 0,
+        idle_load_default_seconds: 0,
         downshift_grace_seconds: grace_seconds,
         cache_disk_mib: 1,
         model_load: { poll_interval_ms: 0, poll_timeout_ms: 0 },
@@ -747,7 +747,7 @@ describe('Planner rung downshift grace', () => {
             const { model, planner } = await createFixture(0, grace_seconds);
             assert.equal(await complete(planner, 5000), 1);
             assert.equal(await complete(planner, 1000), grace_seconds === 0 ? 0 : 1);
-            assert.equal(await planner.idle(), 'success');
+            assert.equal(await planner.unloadAll(), 'success');
             assert.equal(model.last_completion, undefined);
             assert.equal(await complete(planner, 1000), 0);
         }
@@ -806,6 +806,96 @@ describe('Planner rung downshift grace', () => {
         assert.equal(await complete(planner, 1000, 'alias'), 0);
     });
 
+});
+
+describe('Planner idle load-default', () => {
+    const signal = new AbortController().signal;
+    const IDLE_SECONDS = 60;
+
+    async function createIdleFixture() {
+        const fixture = await createFixture();
+        fixture.planner.config.idle_load_default_seconds = IDLE_SECONDS;
+        const second = createModel(fixture.client, 'second');
+        second.cache = fixture.planner.cache;
+        fixture.planner.models.set(second.name, second);
+        return { ...fixture, second };
+    }
+
+    async function complete(planner: Planner, name: string): Promise<void> {
+        await planner.serveModel({ tokens: 1000 }, name, ModelTask.COMPLETIONS, signal, async () => ({ kind: 'done' }));
+    }
+
+    // swaps do real file I/O (KV stash), so wait on wall-clock time rather than a fixed number of turns.
+    // Date is not mocked; only setTimeout is
+    async function settle(condition: () => boolean = () => false, ms: number = 200): Promise<boolean> {
+        const deadline = Date.now() + ms;
+        while (Date.now() < deadline) {
+            if (condition()) return true;
+            await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        return condition();
+    }
+
+    test('swaps back to the default model after the idle period', async () => {
+        mock.timers.enable({ apis: ['setTimeout'] });
+        try {
+            const { client, model, second, planner } = await createIdleFixture();
+            await captureOutput(() => complete(planner, second.name));
+            assert.equal(planner.active.model, second.name);
+
+            mock.timers.tick(IDLE_SECONDS * 1000 - 1);
+            await settle();
+            assert.equal(planner.active.model, second.name);
+
+            let reached = false;
+            const output = await captureOutput(async () => {
+                mock.timers.tick(1);
+                reached = await settle(() => planner.active.model === model.name && !planner.active.pending && planner.active.readers === 0, 2000);
+            });
+            assert.ok(reached, `default model was not swapped in; active: ${JSON.stringify(planner.active)}\n${output}`);
+            assert.equal(client.isLoaded(model.name), true);
+            assert.match(output, /idle: swapping to default model model/);
+        } finally {
+            mock.timers.reset();
+        }
+    });
+
+    test('does nothing when the default model is already active', async () => {
+        mock.timers.enable({ apis: ['setTimeout'] });
+        try {
+            const { client, model, planner } = await createIdleFixture();
+            await complete(planner, model.name);
+            client.clearOperations();
+
+            mock.timers.tick(IDLE_SECONDS * 1000);
+            await settle();
+
+            assert.equal(planner.active.model, model.name);
+            assert.deepEqual(client.operations, []);
+        } finally {
+            mock.timers.reset();
+        }
+    });
+
+    test('unload-all cancels the pending swap and leaves everything unloaded', async () => {
+        mock.timers.enable({ apis: ['setTimeout'] });
+        try {
+            const { client, model, second, planner } = await createIdleFixture();
+            await captureOutput(() => complete(planner, second.name));
+            await captureOutput(async () => { assert.equal(await planner.unloadAll(), 'success'); });
+            client.clearOperations();
+
+            mock.timers.tick(IDLE_SECONDS * 1000);
+            await settle();
+
+            assert.equal(planner.active.model, undefined);
+            assert.equal(client.isLoaded(model.name), false);
+            assert.equal(client.isLoaded(second.name), false);
+            assert.deepEqual(client.operations, []);
+        } finally {
+            mock.timers.reset();
+        }
+    });
 });
 
 describe('Planner fit-target warning', () => {

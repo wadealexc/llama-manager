@@ -101,7 +101,7 @@ async function createFixture(): Promise<Fixture> {
                 'gpu-test-b': modelFields(second_model, second_mmproj),
             },
             'default-model': 'gpu-test-a',
-            'sleep-idle-seconds': 0,
+            'idle-load-default-seconds': 0,
         }));
         const config = await buildConfig(parseArgs(['--config', config_path]), root, preset_path, config_path);
         config.router.poll_timeout_ms = 30000;

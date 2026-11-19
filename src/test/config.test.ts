@@ -160,3 +160,18 @@ describe('fit-target', () => {
         assert.equal(config.models['a'].fit_target_mib, 2048);
     });
 });
+
+describe('idle-load-default-seconds', () => {
+    const models = [
+        '    plain:',
+        '        model: /models/plain.gguf',
+    ].join('\n');
+
+    test('reads the yaml key and the cli flag', async () => {
+        const yaml = await buildFromYaml(`${models}\nidle-load-default-seconds: 900`);
+        assert.equal(yaml.config.idle_load_default_seconds, 900);
+
+        const args = await buildFromArgs(['--model', '/models/plain.gguf', '--idle-load-default-seconds', '30']);
+        assert.equal(args.config.idle_load_default_seconds, 30);
+    });
+});

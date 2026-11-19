@@ -48,7 +48,7 @@ async function createFixture(names: string[], default_model: string) {
         router: { bin: '', llama_log_dir: '', slot_save_path: directory, listen: '', poll_interval_ms: 0, poll_timeout_ms: 0, shutdown_grace_period_ms: 0 },
         host: '127.0.0.1',
         port: 0,
-        sleep_idle_seconds: 0,
+        idle_load_default_seconds: 0,
         downshift_grace_seconds: 0,
         cache_disk_mib: 1,
         model_load: { poll_interval_ms: 0, poll_timeout_ms: 0 },
@@ -78,12 +78,12 @@ describe('startup', () => {
         assert.equal(models.get('other')!.getMaxCtx(), 8192);
     });
 
-    test('idling after calc-breakpoints unloads the default model left loaded by the walk', async () => {
+    test('unload-all after calc-breakpoints unloads the default model left loaded by the walk', async () => {
         const { client, config, models, planner } = await createFixture(['default', 'other'], 'default');
         await captureOutput(() => showBreakpoints(client, config, models));
         client.clearOperations();
 
-        const output = await captureOutput(async () => { assert.equal(await planner.idle(), 'success'); });
+        const output = await captureOutput(async () => { assert.equal(await planner.unloadAll(), 'success'); });
 
         assert.deepEqual(client.operations.filter(op => op.kind === 'unload').map(op => op.model), ['default']);
         assert.equal(models.get('default')!.status, LoadStatus.UNLOADED);

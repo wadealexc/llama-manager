@@ -139,7 +139,7 @@ test('GPU: manager discards an interrupted tool call and streams the regenerated
         const config = await buildConfig(parseArgs(argv), root, preset_path, config_path);
         config.router.poll_timeout_ms = 30000;
         config.model_load.poll_timeout_ms = 180000;
-        config.sleep_idle_seconds = 0;
+        config.idle_load_default_seconds = 0;
         config.downshift_grace_seconds = 0;
         config.port = 0;
         router = new RouterProcess(config.router, config.model_load);

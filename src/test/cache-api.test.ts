@@ -34,7 +34,7 @@ async function checkContinuation(stream: boolean, can_grow: boolean): Promise<vo
         router: { bin: '', listen: '', llama_log_dir: '', slot_save_path: directory, poll_interval_ms: 0, poll_timeout_ms: 0, shutdown_grace_period_ms: 0 },
         host: '127.0.0.1',
         port: 0,
-        sleep_idle_seconds: 0,
+        idle_load_default_seconds: 0,
         downshift_grace_seconds: 0,
         cache_disk_mib: 1,
         model_load: { poll_interval_ms: 0, poll_timeout_ms: 0 },

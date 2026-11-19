@@ -87,7 +87,7 @@ export interface ConfigSource {
     raw_model_load: Record<string, unknown>;
     host?: string;
     port?: number;
-    sleep_idle_seconds?: number;
+    idle_load_default_seconds?: number;
     downshift_grace_seconds?: number;
     cache_disk_mib?: number;
     default_model?: ModelId;
@@ -100,7 +100,7 @@ export interface ManagerConfig {
     router: LlamaConfig;
     host: string;
     port: number;
-    sleep_idle_seconds: number;
+    idle_load_default_seconds: number;
     downshift_grace_seconds: number;
     cache_disk_mib: number;
     model_load: ModelLoadConfig;

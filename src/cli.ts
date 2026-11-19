@@ -29,7 +29,9 @@ Flags:
   --idle                     start without loading any models
   --host <host>              external listen host (default: 127.0.0.1)
   --port <port>              external listen port (default: 8080)
-  --sleep-idle-seconds <n>   unload all models after n idle seconds (default: 600)
+  --idle-load-default-seconds <n>
+                             swap back to the default model after n idle seconds
+                             (default: 600; 0 disables)
   --downshift-grace-seconds <n>
                              retain the current rung between completions (default: 120;
                              0 disables; -1 retains until model unload)
